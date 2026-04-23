@@ -45,6 +45,10 @@ test("installScopedCodexPlugin writes project-scoped marketplace, cache, and act
   assert.match(config, /\[marketplaces\.agmo-local\]/);
   assert.match(config, /\[plugins\."agmo@agmo-local"\]/);
   assert.match(config, /enabled = true/);
+  assert.match(
+    config,
+    /\[tui\]\nstatus_line = \["model-with-reasoning", "current-dir", "context-usage", "five-hour-limit", "weekly-limit"\]/
+  );
 });
 
 test("installScopedCodexPlugin strips legacy runtime config before writing Agmo plugin settings", async () => {
@@ -76,4 +80,26 @@ trust_level = "trusted"
   assert.doesNotMatch(config, /USE_LEGACY_EXPLORE_CMD|mcp_servers\.legacy_state|notify-hook\.js|AGENTS\.md is your orchestration brain/);
   assert.match(config, /\[projects\./);
   assert.match(config, /\[marketplaces\.agmo-local\]/);
+});
+
+test("installScopedCodexPlugin preserves an existing tui status_line", async () => {
+  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-setup-existing-status-line-"));
+  const configPath = join(tempProject, ".codex", "config.toml");
+  mkdirSync(join(tempProject, ".codex"), { recursive: true });
+  writeFileSync(
+    configPath,
+    `[tui]
+status_line = ["custom-status", "branch"]
+theme = "amber"
+
+[projects."${tempProject}"]
+trust_level = "trusted"
+`
+  );
+
+  await installScopedCodexPlugin("project", tempProject);
+
+  const config = await readFile(configPath, "utf8");
+  assert.match(config, /\[tui\]\nstatus_line = \["custom-status", "branch"\]\ntheme = "amber"/);
+  assert.doesNotMatch(config, /model-with-reasoning", "current-dir", "context-usage"/);
 });

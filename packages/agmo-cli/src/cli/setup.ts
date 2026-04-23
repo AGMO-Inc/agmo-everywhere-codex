@@ -12,6 +12,8 @@ import { agmoCliPackageRoot, type InstallScope, resolveInstallPaths } from "../u
 
 const AGMO_CODEX_PLUGIN_MARKETPLACE = "agmo-local";
 const AGMO_CODEX_PLUGIN_NAME = "agmo";
+const AGMO_DEFAULT_TUI_STATUS_LINE =
+  'status_line = ["model-with-reasoning", "current-dir", "context-usage", "five-hour-limit", "weekly-limit"]';
 
 export type SetupScopePrompt = () => Promise<InstallScope>;
 
@@ -137,6 +139,23 @@ function appendTomlTable(content: string, tableName: string, body: string): stri
   const cleaned = stripTomlTable(content, tableName).trimEnd();
   const prefix = cleaned.length > 0 ? `${cleaned}\n\n` : "";
   return `${prefix}[${tableName}]\n${body.trimEnd()}\n`;
+}
+
+function ensureTomlTableSetting(content: string, tableName: string, settingName: string, settingLine: string): string {
+  const pattern = new RegExp(`(^|\\n)(\\[${escapeRegExp(tableName)}\\]\\n)([\\s\\S]*?)(?=(?:\\n\\[)|$)`);
+  const match = pattern.exec(content);
+
+  if (!match) {
+    return appendTomlTable(content, tableName, settingLine);
+  }
+
+  if (new RegExp(`^${escapeRegExp(settingName)}\\s*=`, "m").test(match[3])) {
+    return content;
+  }
+
+  const body = match[3].trimEnd();
+  const replacement = `${match[1]}${match[2]}${body.length > 0 ? `${body}\n` : ""}${settingLine}\n`;
+  return `${content.slice(0, match.index)}${replacement}${content.slice(match.index + match[0].length)}`;
 }
 
 
@@ -299,6 +318,7 @@ async function writeScopedCodexPluginConfig(args: {
     `plugins.${JSON.stringify(args.pluginKey)}`,
     'enabled = true'
   );
+  next = ensureTomlTableSetting(next, "tui", "status_line", AGMO_DEFAULT_TUI_STATUS_LINE);
 
   await ensureDir(dirname(args.configPath));
   await writeFile(args.configPath, next);
