@@ -1,7 +1,10 @@
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { AGMO_AGENT_DEFINITIONS, type AgmoAgentDefinition } from "./definitions.js";
+import {
+  AGMO_AGENT_DEFINITIONS,
+  type AgmoAgentDefinition,
+} from "./definitions.js";
 import { agmoCliPackageRoot } from "../utils/paths.js";
 
 export const MANAGED_PROMPT_MIRROR_FILES = new Set<string>([
@@ -10,14 +13,60 @@ export const MANAGED_PROMPT_MIRROR_FILES = new Set<string>([
   "agmo-explore.md",
   "executor.md",
   "planner.md",
-  "verifier.md"
+  "verifier.md",
 ]);
+
+function managedSkillSourceDir(): string {
+  const packageRoot = agmoCliPackageRoot();
+  const candidates = [
+    join(packageRoot, "..", "agmo-plugin", "skills"),
+    join(packageRoot, "dist", "plugin", "skills"),
+  ];
+
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
+}
+
+export async function listManagedSkillMirrorNames(): Promise<string[]> {
+  const sourceDir = managedSkillSourceDir();
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+
+  return entries
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        existsSync(join(sourceDir, entry.name, "SKILL.md")),
+    )
+    .map((entry) => entry.name)
+    .sort();
+}
+
+export function skillSourcePath(skillName: string): string {
+  return join(managedSkillSourceDir(), skillName, "SKILL.md");
+}
+
+export async function readSkillContent(skillName: string): Promise<string> {
+  return await readFile(skillSourcePath(skillName), "utf-8");
+}
+
+export async function buildManagedSkillMirrorMap(): Promise<
+  Record<string, string>
+> {
+  const skillNames = await listManagedSkillMirrorNames();
+  const mirroredEntries = await Promise.all(
+    skillNames.map(
+      async (skillName) =>
+        [skillName, await readSkillContent(skillName)] as const,
+    ),
+  );
+
+  return Object.fromEntries(mirroredEntries);
+}
 
 export function promptSourcePath(fileName: string): string {
   const packageRoot = agmoCliPackageRoot();
   const candidates = [
     join(packageRoot, "src", "prompts", fileName),
-    join(packageRoot, "dist", "prompts", fileName)
+    join(packageRoot, "dist", "prompts", fileName),
   ];
 
   return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
@@ -39,7 +88,7 @@ export function generateStandaloneAgentToml(input: {
       : null,
     'developer_instructions = """',
     input.developerInstructions.trim(),
-    '"""'
+    '"""',
   ].filter(Boolean);
 
   return `${lines.join("\n")}\n`;
@@ -56,7 +105,7 @@ export function stripFrontmatter(content: string): string {
 
 function composeDeveloperInstructions(
   agent: AgmoAgentDefinition,
-  promptContent: string
+  promptContent: string,
 ): string {
   const instructions = stripFrontmatter(promptContent);
 
@@ -67,7 +116,7 @@ function composeDeveloperInstructions(
     `- role: ${agent.name}`,
     `- posture: ${agent.posture}`,
     `- model_class: ${agent.modelClass}`,
-    `- reasoning_effort: ${agent.reasoningEffort}`
+    `- reasoning_effort: ${agent.reasoningEffort}`,
   ].join("\n");
 }
 
@@ -75,17 +124,24 @@ export async function readPromptContent(fileName: string): Promise<string> {
   return await readFile(promptSourcePath(fileName), "utf-8");
 }
 
-export async function buildManagedPromptMirrorMap(): Promise<Record<string, string>> {
+export async function buildManagedPromptMirrorMap(): Promise<
+  Record<string, string>
+> {
   const mirroredEntries = await Promise.all(
     AGMO_AGENT_DEFINITIONS.filter((agent) =>
-      MANAGED_PROMPT_MIRROR_FILES.has(agent.promptFile)
-    ).map(async (agent) => [agent.promptFile, await readPromptContent(agent.promptFile)] as const)
+      MANAGED_PROMPT_MIRROR_FILES.has(agent.promptFile),
+    ).map(
+      async (agent) =>
+        [agent.promptFile, await readPromptContent(agent.promptFile)] as const,
+    ),
   );
 
   return Object.fromEntries(mirroredEntries);
 }
 
-export async function buildInitialAgentTomlMap(): Promise<Record<string, string>> {
+export async function buildInitialAgentTomlMap(): Promise<
+  Record<string, string>
+> {
   return Object.fromEntries(
     await Promise.all(
       AGMO_AGENT_DEFINITIONS.map(async (agent) => {
@@ -100,11 +156,11 @@ export async function buildInitialAgentTomlMap(): Promise<Record<string, string>
             reasoningEffort: agent.reasoningEffort,
             developerInstructions: composeDeveloperInstructions(
               agent,
-              promptContent
-            )
-          })
+              promptContent,
+            ),
+          }),
         ];
-      })
-    )
+      }),
+    ),
   );
 }

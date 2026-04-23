@@ -6,7 +6,9 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   MANAGED_PROMPT_MIRROR_FILES,
-  readPromptContent
+  listManagedSkillMirrorNames,
+  readPromptContent,
+  readSkillContent,
 } from "../agents/native-config.js";
 import { buildAgmoRuntimeConfig } from "../config/generator.js";
 import { syncAgents } from "./agents.js";
@@ -18,10 +20,18 @@ test("syncAgents writes agmo-prefixed managed agents and removes renamed legacy 
   await mkdir(agentsDir, { recursive: true });
 
   await Promise.all([
-    writeFile(join(agentsDir, "architect.toml"), 'name = "architect"\n', "utf-8"),
+    writeFile(
+      join(agentsDir, "architect.toml"),
+      'name = "architect"\n',
+      "utf-8",
+    ),
     writeFile(join(agentsDir, "critic.toml"), 'name = "critic"\n', "utf-8"),
     writeFile(join(agentsDir, "explore.toml"), 'name = "explore"\n', "utf-8"),
-    writeFile(join(agentsDir, "custom-agent.toml"), 'name = "custom-agent"\n', "utf-8")
+    writeFile(
+      join(agentsDir, "custom-agent.toml"),
+      'name = "custom-agent"\n',
+      "utf-8",
+    ),
   ]);
 
   const result = await syncAgents("project", tempProject);
@@ -30,7 +40,7 @@ test("syncAgents writes agmo-prefixed managed agents and removes renamed legacy 
   assert.deepEqual(result.removed_legacy_files, [
     join(agentsDir, "architect.toml"),
     join(agentsDir, "critic.toml"),
-    join(agentsDir, "explore.toml")
+    join(agentsDir, "explore.toml"),
   ]);
 
   assert.equal(existsSync(join(agentsDir, "agmo-architect.toml")), true);
@@ -50,7 +60,10 @@ test("syncAgents embeds expanded managed prompt contracts into generated agent T
   await syncAgents("project", tempProject);
 
   const readAgent = (name: string) =>
-    readFileSync(join(tempProject, ".codex", "agents", `${name}.toml`), "utf-8");
+    readFileSync(
+      join(tempProject, ".codex", "agents", `${name}.toml`),
+      "utf-8",
+    );
 
   const architect = readAgent("agmo-architect");
   assert.match(architect, /<identity>/);
@@ -71,17 +84,23 @@ test("syncAgents embeds expanded managed prompt contracts into generated agent T
 });
 
 test("syncAgents mirrors shared managed prompt files into project .codex/prompts", async () => {
-  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-agent-prompt-mirror-"));
+  const tempProject = await mkdtemp(
+    join(os.tmpdir(), "agmo-agent-prompt-mirror-"),
+  );
 
   await syncAgents("project", tempProject);
 
   for (const fileName of MANAGED_PROMPT_MIRROR_FILES) {
     const mirrored = readFileSync(
       join(tempProject, ".codex", "prompts", fileName),
-      "utf-8"
+      "utf-8",
     );
     const source = await readPromptContent(fileName);
-    assert.equal(mirrored, source, `${fileName} should mirror the package prompt source`);
+    assert.equal(
+      mirrored,
+      source,
+      `${fileName} should mirror the package prompt source`,
+    );
   }
 });
 
@@ -91,22 +110,62 @@ test("checked-in .codex prompt mirrors stay aligned with package prompt sources"
   for (const fileName of MANAGED_PROMPT_MIRROR_FILES) {
     const checkedInMirror = readFileSync(
       join(repoRoot, ".codex", "prompts", fileName),
-      "utf-8"
+      "utf-8",
     );
     const source = await readPromptContent(fileName);
     assert.equal(
       checkedInMirror,
       source,
-      `${fileName} in .codex/prompts drifted from packages/agmo-cli/src/prompts`
+      `${fileName} in .codex/prompts drifted from packages/agmo-cli/src/prompts`,
     );
   }
 });
 
-test("runtime config publishes the managed prompts directory", () => {
+test("syncAgents mirrors managed Agmo skills into project .codex/skills", async () => {
+  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-skill-mirror-"));
+
+  await syncAgents("project", tempProject);
+
+  for (const skillName of await listManagedSkillMirrorNames()) {
+    const mirrored = readFileSync(
+      join(tempProject, ".codex", "skills", skillName, "SKILL.md"),
+      "utf-8",
+    );
+    const source = await readSkillContent(skillName);
+    assert.equal(
+      mirrored,
+      source,
+      `${skillName} should mirror the packaged skill source`,
+    );
+  }
+});
+
+test("checked-in .codex skill mirrors stay aligned with packaged Agmo skill sources", async () => {
+  const repoRoot = resolve(agmoCliPackageRoot(), "..", "..");
+
+  for (const skillName of await listManagedSkillMirrorNames()) {
+    const checkedInMirror = readFileSync(
+      join(repoRoot, ".codex", "skills", skillName, "SKILL.md"),
+      "utf-8",
+    );
+    const source = await readSkillContent(skillName);
+    assert.equal(
+      checkedInMirror,
+      source,
+      `${skillName} in .codex/skills drifted from packages/agmo-plugin/skills`,
+    );
+  }
+});
+
+test("runtime config publishes the managed prompt and skill directories", () => {
   const tempProject = "/tmp/agmo-runtime-config-prompts";
   const paths = resolveInstallPaths("project", tempProject);
   const config = buildAgmoRuntimeConfig("project", paths);
   const runtimePaths = config.paths as Record<string, unknown>;
 
-  assert.equal(runtimePaths.prompts_dir, join(tempProject, ".codex", "prompts"));
+  assert.equal(
+    runtimePaths.prompts_dir,
+    join(tempProject, ".codex", "prompts"),
+  );
+  assert.equal(runtimePaths.skills_dir, join(tempProject, ".codex", "skills"));
 });

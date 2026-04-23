@@ -1,10 +1,9 @@
 import { rm } from "node:fs/promises";
-import {
-  AGMO_AGENT_DEFINITIONS
-} from "../agents/definitions.js";
+import { AGMO_AGENT_DEFINITIONS } from "../agents/definitions.js";
 import {
   buildInitialAgentTomlMap,
-  buildManagedPromptMirrorMap
+  buildManagedPromptMirrorMap,
+  buildManagedSkillMirrorMap,
 } from "../agents/native-config.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { ensureDir, writeTextFile } from "../utils/fs.js";
@@ -12,13 +11,16 @@ import { type InstallScope, resolveInstallPaths } from "../utils/paths.js";
 
 export async function syncAgents(
   scope: InstallScope,
-  cwd = process.cwd()
+  cwd = process.cwd(),
 ): Promise<Record<string, unknown>> {
   const paths = resolveInstallPaths(scope, cwd);
   await Promise.all([ensureDir(paths.agentsDir), ensureDir(paths.promptsDir)]);
-  const [agentTomls, promptMirrors] = await Promise.all([
+  const [agentTomls, promptMirrors, skillMirrors] = await Promise.all([
     buildInitialAgentTomlMap(),
-    buildManagedPromptMirrorMap()
+    buildManagedPromptMirrorMap(),
+    scope === "project"
+      ? buildManagedSkillMirrorMap()
+      : Promise.resolve({} as Record<string, string>),
   ]);
   const removedLegacyFiles = await Promise.all(
     AGMO_AGENT_DEFINITIONS.flatMap((agent) =>
@@ -37,8 +39,8 @@ export async function syncAgents(
           }
           throw error;
         }
-      })
-    )
+      }),
+    ),
   );
 
   const writes = await Promise.all(
@@ -47,9 +49,9 @@ export async function syncAgents(
       return {
         name,
         path,
-        write: await writeTextFile(path, content)
+        write: await writeTextFile(path, content),
       };
-    })
+    }),
   );
 
   const mirroredPrompts = await Promise.all(
@@ -58,20 +60,36 @@ export async function syncAgents(
       return {
         file: fileName,
         path,
-        write: await writeTextFile(path, content)
+        write: await writeTextFile(path, content),
       };
-    })
+    }),
+  );
+
+  const mirroredSkills = await Promise.all(
+    Object.entries(skillMirrors).map(async ([skillName, content]) => {
+      const path = `${paths.skillsDir}/${skillName}/SKILL.md`;
+      return {
+        name: skillName,
+        path,
+        write: await writeTextFile(path, content),
+      };
+    }),
   );
 
   return {
     scope,
     target_dir: paths.agentsDir,
     prompts_target_dir: paths.promptsDir,
+    skills_target_dir: scope === "project" ? paths.skillsDir : null,
     count: writes.length,
     mirrored_prompt_count: mirroredPrompts.length,
-    removed_legacy_files: removedLegacyFiles.filter((path): path is string => path !== null),
+    mirrored_skill_count: mirroredSkills.length,
+    removed_legacy_files: removedLegacyFiles.filter(
+      (path): path is string => path !== null,
+    ),
     files: writes,
-    mirrored_prompts: mirroredPrompts
+    mirrored_prompts: mirroredPrompts,
+    mirrored_skills: mirroredSkills,
   };
 }
 
@@ -87,11 +105,11 @@ export async function runAgentsCommand(args: string[]): Promise<void> {
         {
           command: "agents sync",
           agents: AGMO_AGENT_DEFINITIONS.map((agent) => agent.name),
-          summary
+          summary,
         },
         null,
-        2
-      )
+        2,
+      ),
     );
     return;
   }

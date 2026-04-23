@@ -10,6 +10,7 @@ export type InstallPaths = {
   codexDir: string;
   agentsDir: string;
   promptsDir: string;
+  skillsDir: string;
   hooksFile: string;
   agentsMdFile: string;
   agmoDir: string;
@@ -35,7 +36,10 @@ export function agmoCliDistEntryPath(): string {
 
 export function agmoCliTemplateCandidatePaths(...parts: string[]): string[] {
   const root = agmoCliPackageRoot();
-  return [join(root, "src", "templates", ...parts), join(root, "dist", "templates", ...parts)];
+  return [
+    join(root, "src", "templates", ...parts),
+    join(root, "dist", "templates", ...parts),
+  ];
 }
 
 export function codexHomeDir(): string {
@@ -44,12 +48,15 @@ export function codexHomeDir(): string {
 
 export function resolveInstallPaths(
   scope: InstallScope,
-  cwd = process.cwd()
+  cwd = process.cwd(),
 ): InstallPaths {
   const projectRoot = resolve(cwd);
-  const codexDir = scope === "project" ? join(projectRoot, ".codex") : codexHomeDir();
+  const codexDir =
+    scope === "project" ? join(projectRoot, ".codex") : codexHomeDir();
   const agmoDir =
-    scope === "project" ? join(projectRoot, ".agmo") : resolve(os.homedir(), ".agmo");
+    scope === "project"
+      ? join(projectRoot, ".agmo")
+      : resolve(os.homedir(), ".agmo");
 
   return {
     scope,
@@ -57,9 +64,12 @@ export function resolveInstallPaths(
     codexDir,
     agentsDir: join(codexDir, "agents"),
     promptsDir: join(codexDir, "prompts"),
+    skillsDir: join(codexDir, "skills"),
     hooksFile: join(codexDir, "hooks.json"),
     agentsMdFile:
-      scope === "project" ? join(projectRoot, "AGENTS.md") : join(codexDir, "AGENTS.md"),
+      scope === "project"
+        ? join(projectRoot, "AGENTS.md")
+        : join(codexDir, "AGENTS.md"),
     agmoDir,
     agmoConfigFile: join(agmoDir, "config.json"),
     stateDir: join(agmoDir, "state"),
@@ -70,7 +80,7 @@ export function resolveInstallPaths(
     memoryDir: join(agmoDir, "memory"),
     cacheDir: join(agmoDir, "cache"),
     handoffsDir: join(agmoDir, "handoffs"),
-    sessionInstructionsDir: join(agmoDir, "cache", "session-instructions")
+    sessionInstructionsDir: join(agmoDir, "cache", "session-instructions"),
   };
 }
 

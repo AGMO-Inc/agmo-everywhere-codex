@@ -1,64 +1,52 @@
 ---
 name: execute
-description: "Agmo implementation orchestration workflow. Use when approved plan work is ready and coding should begin, with agmo-explore/agmo-architect preflight and the main session staying as orchestrator."
+description: Use when implementation should begin from an approved plan, with agmo-explore/agmo-architect preflight and the main session staying in orchestrator mode while handing coding to the Agmo execution lane.
 argument-hint: "[approved plan, implementation request, or execution handoff]"
 ---
 
-# Execute
+# Agmo Execute
 
-Use this when implementation should begin.
+Use this when implementation should begin from an approved plan or otherwise accepted scope.
 
 ## Main-session contract
 
-The main session remains the orchestrator. Do not absorb the whole execution lane into the leader by default.
+The main session remains the orchestrator. Do not absorb the full execution lane into the leader by default.
 
 When `$execute` is invoked, the main session should:
 
-1. Confirm the latest accepted context
-   - approved plan (with any linked design context)
-   - non-goals / constraints
-   - verification expectations
-2. Fill missing repo facts with `agmo-explore` before coding when file locations, current patterns, or symbol ownership are unclear
-3. Route unresolved boundaries, interfaces, or tradeoff questions to `agmo-architect` before or alongside implementation when needed
-4. Delegate the primary coding lane to `agmo-executor`
-5. Pull in `agmo-verifier` for evidence, tests, or completion review when needed
-6. Keep ownership of:
-   - scope control
-   - integration decisions
-   - workflow transitions
-   - durable note continuity
+1. confirm the accepted scope, constraints, and non-goals
+2. fill missing repo facts with `agmo-explore` before coding when file ownership, patterns, or symbol locations are unclear
+3. route unresolved boundary or tradeoff tension to `agmo-architect`
+4. delegate the primary coding lane to `agmo-executor`
+5. keep integration, scope control, and workflow transitions in the leader
+6. pull `agmo-verifier` for proof before claiming completion
+7. if proof fails or remains incomplete, keep the fix -> re-verify loop running until the task passes or a real blocker is identified
 
 ## Default posture
 
-- Start with **solo delegated execution**
-- Prefer `agmo-explore` over ad hoc guessing for quick repo lookups during execution
-- Use native subagents for bounded sidecars when they do not require durable team coordination
-- Escalate to `$team` only when the work has genuinely independent parallel lanes or needs durable pane-based workers
-
-## When to escalate to `$team`
-
-Escalate when at least one of these is true:
-
-- API / UI / test work can proceed independently
-- implementation is large enough that one executor lane becomes the bottleneck
-- you need durable tmux workers with observable progress
-
-When escalating, the leader should stay in orchestrator mode and treat `$team` as the worker runtime, not as a replacement for the leader.
-
-## Execution expectations
-
-- ground the implementation in the approved plan/design
-- treat direct brainstorming-to-execute jumps as exceptional rather than the default public path
+- start with solo delegated execution
 - keep changes incremental and reversible
-- verify with concrete evidence before claiming completion
-- capture changed files, verification output, and resulting decisions as durable context
+- prefer repo evidence over guesses during implementation
+- escalate to `team` only when one execution lane is no longer enough
 
-## Output
+## Completion gate
+
+A task is not done just because code was written.
+
+Before reporting completion, expect:
+
+- concrete implementation evidence
+- fresh verification output
+- a clear distinction between failures, missing proof, and true blockers
+
+## Output expectation
 
 By the end of the workflow, the leader should be able to report:
 
 - what changed
 - what was verified
-- what remains / risks
+- what remains or still risks follow-up
 
-Agmo autosave is expected to persist implementation checkpoints in the implementation note lane.
+## Compatibility alias
+
+`ralph` remains available as a compatibility alias for users who want a stricter completion gate on top of `execute` semantics. The canonical workflow name is still `execute`.

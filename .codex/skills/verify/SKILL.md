@@ -1,12 +1,12 @@
 ---
 name: verify
-description: "Agmo verification workflow. Use for tests, evidence gathering, completion review, and non-plan-specific validation."
+description: Use when the task needs validation, testing, completion checks, or evidence review.
 argument-hint: "[artifact, change, or implementation to verify]"
 ---
 
-# Verify
+# Agmo Verify
 
-Use this when the primary goal is validation rather than planning or initial implementation.
+Use this when the primary goal is validation rather than planning or first-pass implementation.
 
 ## Main-session contract
 
@@ -15,12 +15,9 @@ The main session orchestrates verification and delegates the evidence-gathering 
 Typical responsibilities:
 
 1. choose what must be proven
-2. delegate the proof / test / inspection work
-3. read the actual output
-4. decide whether to:
-   - accept completion
-   - request fixes
-   - escalate back to `$execute`
+2. delegate the proof / test / inspection lane
+3. read the actual output instead of trusting summaries alone
+4. decide whether to accept completion, request fixes, or escalate back to `execute`
 
 ## Use this for
 
@@ -31,5 +28,15 @@ Typical responsibilities:
 
 ## Do not use this for
 
-- first-pass plan critique that should stay in the planning lane (`$plan-review`)
-- open-ended design exploration (`$brainstorming`)
+- first-pass plan critique that should stay in the planning lane (`plan-review`)
+- open-ended design exploration (`brainstorming`)
+
+## Verdict contract
+
+Return a concise `PASS / FAIL / INCOMPLETE / BLOCKED` verdict plus gaps.
+
+- `FAIL` means the proof shows broken behavior
+- `INCOMPLETE` means the proof bar was not fully met yet
+- `BLOCKED` means the next verification step cannot proceed without external resolution
+
+Distinguish missing proof from proven failure so `execute` can decide whether to fix, re-run, or report a blocker.
