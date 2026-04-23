@@ -9,6 +9,7 @@ export type InstallPaths = {
   projectRoot: string;
   codexDir: string;
   agentsDir: string;
+  promptsDir: string;
   hooksFile: string;
   agentsMdFile: string;
   agmoDir: string;
@@ -55,6 +56,7 @@ export function resolveInstallPaths(
     projectRoot,
     codexDir,
     agentsDir: join(codexDir, "agents"),
+    promptsDir: join(codexDir, "prompts"),
     hooksFile: join(codexDir, "hooks.json"),
     agentsMdFile:
       scope === "project" ? join(projectRoot, "AGENTS.md") : join(codexDir, "AGENTS.md"),

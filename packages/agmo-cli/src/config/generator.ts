@@ -14,6 +14,7 @@ export function buildAgmoConfigSummary(): Record<string, unknown> {
   return {
     outputs: [
       ".codex/agents/*.toml",
+      ".codex/prompts/*.md",
       ".codex/hooks.json",
       "AGENTS.md",
       ".agmo/state/*",
@@ -34,6 +35,7 @@ export function buildAgmoRuntimeConfig(
     paths: {
       codex_dir: paths.codexDir,
       agents_dir: paths.agentsDir,
+      prompts_dir: paths.promptsDir,
       hooks_file: paths.hooksFile,
       agents_md_file: paths.agentsMdFile,
       agmo_dir: paths.agmoDir,

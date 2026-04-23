@@ -3,6 +3,19 @@ import { join } from "node:path";
 import { AGMO_AGENT_DEFINITIONS, type AgmoAgentDefinition } from "./definitions.js";
 import { agmoCliPackageRoot } from "../utils/paths.js";
 
+export const MANAGED_PROMPT_MIRROR_FILES = new Set<string>([
+  "agmo-architect.md",
+  "agmo-critic.md",
+  "agmo-explore.md",
+  "executor.md",
+  "planner.md",
+  "verifier.md"
+]);
+
+export function promptSourcePath(fileName: string): string {
+  return join(agmoCliPackageRoot(), "src", "prompts", fileName);
+}
+
 export function generateStandaloneAgentToml(input: {
   name: string;
   description: string;
@@ -51,9 +64,18 @@ function composeDeveloperInstructions(
   ].join("\n");
 }
 
-async function readPromptContent(fileName: string): Promise<string> {
-  const promptPath = join(agmoCliPackageRoot(), "src", "prompts", fileName);
-  return await readFile(promptPath, "utf-8");
+export async function readPromptContent(fileName: string): Promise<string> {
+  return await readFile(promptSourcePath(fileName), "utf-8");
+}
+
+export async function buildManagedPromptMirrorMap(): Promise<Record<string, string>> {
+  const mirroredEntries = await Promise.all(
+    AGMO_AGENT_DEFINITIONS.filter((agent) =>
+      MANAGED_PROMPT_MIRROR_FILES.has(agent.promptFile)
+    ).map(async (agent) => [agent.promptFile, await readPromptContent(agent.promptFile)] as const)
+  );
+
+  return Object.fromEntries(mirroredEntries);
 }
 
 export async function buildInitialAgentTomlMap(): Promise<Record<string, string>> {
