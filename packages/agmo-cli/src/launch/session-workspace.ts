@@ -104,6 +104,30 @@ function runGit(args: string[], cwd = process.cwd()): string {
   }).trim();
 }
 
+function formatGitError(error: unknown): string {
+  if (error instanceof Error) {
+    const stderr =
+      "stderr" in error &&
+      (typeof error.stderr === "string" || Buffer.isBuffer(error.stderr))
+        ? String(error.stderr)
+        : "";
+
+    return `${error.message}\n${stderr}`.trim();
+  }
+
+  return String(error);
+}
+
+function shouldRetryCloneWithoutHardlinks(error: unknown): boolean {
+  const detail = formatGitError(error);
+
+  return (
+    detail.includes("failed to create link") ||
+    detail.includes("Operation not permitted") ||
+    detail.includes("Invalid cross-device link")
+  );
+}
+
 function isGitRepository(cwd = process.cwd()): boolean {
   try {
     return runGit(["rev-parse", "--is-inside-work-tree"], cwd) === "true";
@@ -283,11 +307,32 @@ async function clearWorkspaceRoot(workspaceRoot: string): Promise<void> {
   );
 }
 
-async function cloneGitWorkspace(args: {
+export function cloneGitWorkspace(args: {
+  projectRoot: string;
+  workspaceRoot: string;
+  gitRunner?: typeof runGit;
+}): void {
+  const gitRunner = args.gitRunner ?? runGit;
+
+  try {
+    gitRunner(["clone", "--local", args.projectRoot, args.workspaceRoot], args.projectRoot);
+  } catch (error) {
+    if (!shouldRetryCloneWithoutHardlinks(error)) {
+      throw error;
+    }
+
+    gitRunner(
+      ["clone", "--local", "--no-hardlinks", args.projectRoot, args.workspaceRoot],
+      args.projectRoot
+    );
+  }
+}
+
+async function initializeGitWorkspace(args: {
   projectRoot: string;
   workspaceRoot: string;
 }): Promise<void> {
-  runGit(["clone", "--local", args.projectRoot, args.workspaceRoot], args.projectRoot);
+  cloneGitWorkspace(args);
   await clearWorkspaceRoot(args.workspaceRoot);
 }
 
@@ -319,7 +364,7 @@ export async function prepareSessionWorkspace(args: {
   await mkdir(workspaceDir, { recursive: true });
 
   if (isGitRepository(projectRoot)) {
-    await cloneGitWorkspace({
+    await initializeGitWorkspace({
       projectRoot,
       workspaceRoot
     });

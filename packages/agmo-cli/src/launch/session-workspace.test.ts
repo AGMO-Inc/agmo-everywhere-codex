@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { prepareSessionWorkspace } from "./session-workspace.js";
+import { cloneGitWorkspace, prepareSessionWorkspace } from "./session-workspace.js";
 
 function runGit(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -13,6 +13,44 @@ function runGit(args: string[], cwd: string): string {
     stdio: ["ignore", "pipe", "pipe"]
   }).trim();
 }
+
+test("cloneGitWorkspace retries without hardlinks when local clone linking is blocked", () => {
+  const calls: string[][] = [];
+
+  cloneGitWorkspace({
+    projectRoot: "/tmp/project",
+    workspaceRoot: "/tmp/workspace",
+    gitRunner: (args) => {
+      calls.push(args);
+
+      if (calls.length === 1) {
+        const error = new Error("clone failed");
+        (error as Error & { stderr?: string }).stderr =
+          "fatal: failed to create link '/tmp/workspace/.git/objects/ab/cd': Operation not permitted";
+        throw error;
+      }
+
+      return "";
+    }
+  });
+
+  assert.deepEqual(calls, [
+    ["clone", "--local", "/tmp/project", "/tmp/workspace"],
+    ["clone", "--local", "--no-hardlinks", "/tmp/project", "/tmp/workspace"]
+  ]);
+});
+
+test("cloneGitWorkspace does not swallow unrelated clone failures", () => {
+  assert.throws(() =>
+    cloneGitWorkspace({
+      projectRoot: "/tmp/project",
+      workspaceRoot: "/tmp/workspace",
+      gitRunner: () => {
+        throw new Error("fatal: repository '/tmp/project' does not exist");
+      }
+    })
+  );
+});
 
 test("prepareSessionWorkspace builds an isolated git sandbox from the current tree", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "agmo-session-workspace-"));
