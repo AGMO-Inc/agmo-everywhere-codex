@@ -22,8 +22,16 @@ Before creating anything, verify:
 
 1. the cwd is inside the target git repo
 2. `origin` resolves to the intended GitHub owner/repo
-3. `gh auth status` succeeds
+3. token-first GitHub auth is available and `gh auth status` succeeds
 4. any repo-local issue policy in `AGENTS.md`, `README`, or `.github` has been checked
+
+## GitHub auth lane
+
+- prefer token-based auth for GitHub issue and project mutations
+- prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
+- never open interactive `gh auth login` when a token environment variable is already available
+- never persist tokens into tracked files, issue bodies, shell history snippets committed to the repo, or remote URLs
+- if token env is missing and `gh auth status` is not already healthy, stop at the exact auth blocker and report it
 
 Prefer repo-local conventions first. If no stronger local convention exists, default to a simple `Feature` / `Task` / `Bug` split with titles like `[Feature] ...`, `[Task] ...`, and `[Bug] ...`.
 

@@ -23,9 +23,17 @@ Before conversion, verify:
 1. the source note path is known
 2. the vault root is configured when the user references a vault-relative note
 3. the note can be read locally
-4. `gh auth status` succeeds for the target repo
+4. token-first GitHub auth is available and `gh auth status` succeeds for the target repo
 
 Prefer resolving vault location through `agmo vault config show` or `AGMO_VAULT_ROOT`. If the vault root is not configured and the user only gave a vault-relative path, stop and ask for the missing path or vault config.
+
+## GitHub auth lane
+
+- prefer token-based auth for GitHub issue and project mutations
+- prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
+- never open interactive `gh auth login` when a token environment variable is already available
+- never persist tokens into tracked note content, tracked files, or remote URLs
+- if token env is missing and `gh auth status` is not already healthy, stop at the exact auth blocker and report it
 
 ## Note ingestion
 

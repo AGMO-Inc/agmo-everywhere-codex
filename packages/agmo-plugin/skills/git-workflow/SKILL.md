@@ -23,7 +23,17 @@ Before mutating git state, verify:
 1. the cwd is inside a git repo
 2. `git status --short --branch` and the relevant diff were inspected
 3. the intended remote/upstream situation is understood
-4. `gh auth status` is available before PR work
+4. token-first GitHub auth is understood before PR work or GitHub remote mutations
+
+## GitHub auth lane
+
+- prefer token-based auth for GitHub automation and repo mutation work
+- prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
+- verify auth with `gh auth status` before PR work or other GitHub mutations
+- for GitHub HTTPS git operations, prefer an existing non-interactive token-backed credential helper such as a `gh auth setup-git` path instead of interactive prompts
+- never open interactive `gh auth login` or browser/device flows when a token environment variable is already available
+- never persist tokens into tracked files, commit contents, or remote URLs; keep them in process environment or other non-tracked credential storage only
+- if neither token env nor existing non-interactive auth is available, stop at the exact blocker and report the missing prerequisite
 
 ## Commit lane
 
@@ -36,6 +46,7 @@ Before mutating git state, verify:
 
 ## Push and branch lane
 
+- prefer token-backed non-interactive auth for GitHub remotes; do not rely on interactive credential prompts
 - prefer `git push -u origin <branch>` when the branch has no upstream yet
 - verify the current branch before pushing or deleting anything
 - do not force-push protected branches unless the user explicitly asks and the risk is surfaced

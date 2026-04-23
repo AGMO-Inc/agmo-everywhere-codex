@@ -495,17 +495,17 @@ function buildWorkflowEnforcementContext(args: {
       case "git-workflow":
         return [
           "Agmo runtime enforcement: git-workflow is an operational repo-mutation lane.",
-          "Delegate commit/push/PR execution to agmo-executor, inspect actual git/gh output, and do not claim branch or PR success without fresh command evidence."
+          "Delegate commit/push/PR execution to agmo-executor, prefer token-based GitHub auth (`GH_TOKEN`, then `GITHUB_TOKEN`) plus non-interactive credential flow for GitHub remotes, inspect actual git/gh output, and do not claim branch or PR success without fresh command evidence."
         ];
       case "create-issue":
         return [
           "Agmo runtime enforcement: create-issue is a GitHub mutation lane with a proof requirement.",
-          "Use agmo-wisdom if the ticket body needs shaping, delegate the actual gh issue/project commands to agmo-executor, and verify the final issue URL and metadata before reporting success."
+          "Use agmo-wisdom if the ticket body needs shaping, prefer token-based `gh` auth (`GH_TOKEN`, then `GITHUB_TOKEN`), delegate the actual gh issue/project commands to agmo-executor, and verify the final issue URL and metadata before reporting success."
         ];
       case "note-to-issue":
         return [
           "Agmo runtime enforcement: note-to-issue spans both durable note context and GitHub mutation.",
-          "Use agmo-wisdom to interpret the note, delegate GitHub plus note-file mutations to agmo-executor, and verify both the created issue and the updated note contents before claiming completion."
+          "Use agmo-wisdom to interpret the note, prefer token-based `gh` auth (`GH_TOKEN`, then `GITHUB_TOKEN`), delegate GitHub plus note-file mutations to agmo-executor, and verify both the created issue and the updated note contents before claiming completion."
         ];
       case "verify":
         return [
