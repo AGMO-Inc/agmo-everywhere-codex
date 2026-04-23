@@ -1,0 +1,10 @@
+{
+  "name": "agmo",
+  "version": "0.1.0",
+  "description": "Codex-native workflow and knowledge plugin for Agmo",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "label": "Agmo"
+  }
+}

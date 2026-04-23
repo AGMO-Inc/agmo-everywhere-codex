@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.env.*
+
+# Codex / Agmo runtime artifacts
+.codex/agents/
+.codex/hooks.json
+.agmo/
+
+# Workspace outputs
+coverage/
+*.log
+.omx/
+.codex/*
+!.codex/agents/
+!.codex/agents/**
+!.codex/skills/
+!.codex/skills/**
+.codex/skills/.system/**
+!.codex/prompts/
+!.codex/prompts/**

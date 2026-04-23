@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "agmo_vault": {
+      "description": "[TODO: define Obsidian/vault MCP server wiring]"
+    }
+  }
+}
