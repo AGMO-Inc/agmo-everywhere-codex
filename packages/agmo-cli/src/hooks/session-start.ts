@@ -77,7 +77,35 @@ function resolveWorkflowStatus(record: JsonRecord): string {
   return "unknown";
 }
 
-async function listWorkflowSummaries(runtimeRoot: string): Promise<WorkflowSummary[]> {
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isStaleWorkflowSnapshot(record: JsonRecord, staleAfterMs: number, now = Date.now()): boolean {
+  if (resolveWorkflowStatus(record) !== "active") {
+    return false;
+  }
+
+  const referenceAtMs =
+    parseTimestampMs(record.updated_at) ??
+    parseTimestampMs(record.completed_at) ??
+    parseTimestampMs(record.started_at);
+  if (referenceAtMs === null) {
+    return false;
+  }
+
+  return now - referenceAtMs > staleAfterMs;
+}
+
+async function listWorkflowSummaries(
+  runtimeRoot: string,
+  staleAfterMs: number
+): Promise<WorkflowSummary[]> {
   const { workflowsStateDir } = resolveInstallPaths("project", runtimeRoot);
 
   try {
@@ -87,19 +115,28 @@ async function listWorkflowSummaries(runtimeRoot: string): Promise<WorkflowSumma
       .map((entry) => entry.name)
       .sort();
 
-      const summaries = await Promise.all(
+    const summaries = await Promise.all(
       workflowFiles.map(async (fileName) => {
         const record = await readJsonFile(`${workflowsStateDir}/${fileName}`);
+        const status = record ? resolveWorkflowStatus(record) : "unknown";
+
+        if (record && isStaleWorkflowSnapshot(record, staleAfterMs)) {
+          return null;
+        }
+
         return {
           name:
             (record && typeof record.workflow === "string" && record.workflow.trim()) ||
             fileName.replace(/\.json$/u, ""),
-          status: record ? resolveWorkflowStatus(record) : "unknown"
+          status
         };
       })
     );
 
-    return summaries.filter((summary) => summary.status !== "inactive");
+    return summaries.filter(
+      (summary): summary is WorkflowSummary =>
+        summary !== null && summary.status !== "inactive"
+    );
   } catch {
     return [];
   }
@@ -462,11 +499,14 @@ export async function buildSessionStartContext(
 ): Promise<string> {
   const runtimeRoot = resolveRuntimeRoot(cwd);
   const currentSessionId = resolveCurrentTeamSessionId(env, payload);
-  const workflows = await listWorkflowSummaries(runtimeRoot);
+  const launchPolicy = await resolveLaunchPolicy(runtimeRoot);
+  const workflows = await listWorkflowSummaries(
+    runtimeRoot,
+    launchPolicy.policy.heartbeat_stale_after_ms
+  );
   const activeTeams = await listActiveTeams(runtimeRoot, currentSessionId);
   const vault = await resolveVaultRoot(runtimeRoot);
   const wisdom = await readEffectiveWisdom(runtimeRoot);
-  const launchPolicy = await resolveLaunchPolicy(runtimeRoot);
   const sessionStartPolicy = await resolveSessionStartPolicy(runtimeRoot);
   const sessionInstructionsLine = await formatSessionInstructionsLine({
     runtimeRoot,

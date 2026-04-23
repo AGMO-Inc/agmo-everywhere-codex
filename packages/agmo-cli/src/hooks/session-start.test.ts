@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { buildSessionStartContext } from "./session-start.js";
 import { startTeamRuntime } from "../team/runtime.js";
+import { resolveInstallPaths } from "../utils/paths.js";
 import { addWisdomEntry } from "../wisdom/store.js";
 
 async function withTempHome<T>(fn: () => Promise<T>): Promise<T> {
@@ -130,5 +131,55 @@ test("buildSessionStartContext merges global and project wisdom into Agmo bootst
     assert.match(context, /decisions: \[project\] Project decision: Agmo owns startup wisdom context\./);
     assert.match(context, /issues: \[project\] Current issue: remove remaining startup dependency\./);
     assert.match(context, /learns: \[global\] Global learn: prefer compact JSON CLI outputs\./);
+  });
+});
+
+test("buildSessionStartContext hides stale older workflow snapshots using launch heartbeat policy", async () => {
+  await withTempHome(async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-session-start-workflows-"));
+    const { agmoConfigFile, workflowsStateDir } = resolveInstallPaths("project", tempRoot);
+    const now = Date.now();
+
+    await mkdir(join(tempRoot, ".agmo"), { recursive: true });
+    await writeFile(
+      agmoConfigFile,
+      `${JSON.stringify({ launch: { heartbeat_stale_after_ms: 60_000 } }, null, 2)}\n`
+    );
+    await mkdir(workflowsStateDir, { recursive: true });
+    await writeFile(
+      join(workflowsStateDir, "fresh-session.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          session_id: "fresh-session",
+          active: true,
+          workflow: "fresh-workflow",
+          last_event: "PostToolUse",
+          updated_at: new Date(now - 5_000).toISOString()
+        },
+        null,
+        2
+      )}\n`
+    );
+    await writeFile(
+      join(workflowsStateDir, "stale-session.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          session_id: "stale-session",
+          active: true,
+          workflow: "stale-workflow",
+          last_event: "PostToolUse",
+          updated_at: new Date(now - 5 * 60_000).toISOString()
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const context = await buildSessionStartContext(tempRoot);
+
+    assert.match(context, /Workflow state: fresh-workflow \(active\)/);
+    assert.doesNotMatch(context, /stale-workflow \(active\)/);
   });
 });
