@@ -20,6 +20,24 @@ test("detectWorkflowRoute keeps wisdom for synthesis-oriented doc asks", () => {
   assert.equal(route?.skill, "wisdom");
 });
 
+test("detectWorkflowRoute prefers git-workflow for commit requests", () => {
+  const route = detectWorkflowRoute("커밋하고 푸시해줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "git-workflow");
+});
+
+test("detectWorkflowRoute prefers create-issue for conversation-based issue creation", () => {
+  const route = detectWorkflowRoute("이 내용으로 깃허브 이슈 만들어줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "create-issue");
+});
+
+test("detectWorkflowRoute prefers note-to-issue over generic issue creation for note conversions", () => {
+  const route = detectWorkflowRoute("이 옵시디언 노트를 깃허브 이슈로 변환해줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "note-to-issue");
+});
+
 
 test("detectWorkflowRoute routes explicit $ralplan to the planning lane alias", () => {
   const route = detectWorkflowRoute("$ralplan 인증 흐름 개편 계획 짜줘", null);

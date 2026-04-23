@@ -1,154 +1,247 @@
 # agmo-everywhere-codex
 
-Codex-native rebuild of Agmo with a split architecture:
+<div align="center">
 
-- `packages/agmo-plugin`: reusable Codex plugin surface
-- `packages/agmo-cli`: npm runtime for setup, hooks, agents, and team orchestration
+<img src="docs/assets/github-small.svg" alt="GitHub" height="28" />
+<img src="docs/assets/codex-small.svg" alt="Codex" height="28" />
 
-## Installation and setup
+### Agmo rebuilt for Codex
 
-Agmo is designed to be installed as a CLI package and then activated with `agmo setup`.
+Codex-native Agmo runtime and plugin for planning, execution, verification, GitHub workflows, vault persistence, and tmux-backed team orchestration.
 
-### 1. Install the CLI
+[![Version](https://img.shields.io/badge/version-0.1.0-1f2937.svg)](package.json)
+[![CLI](https://img.shields.io/badge/runtime-agmo%20CLI-0f766e.svg)](packages/agmo-cli)
+[![Plugin](https://img.shields.io/badge/plugin-Codex%20native-1d4ed8.svg)](packages/agmo-plugin)
+[![Agents](https://img.shields.io/badge/agents-7-14532d.svg)](#managed-native-agent-roster)
+[![Skills](https://img.shields.io/badge/skills-15-b45309.svg)](#skill-surface)
+[![License](https://img.shields.io/badge/license-MIT-6b7280.svg)](LICENSE)
+
+</div>
+
+---
+
+Agmo Everywhere for Claude Code established the workflow shape. This repository rebuilds that product around Codex-native primitives:
+
+- managed native agents under `.codex/agents`
+- managed skills under `.codex/skills`
+- native hook wiring through `.codex/hooks.json`
+- project/user runtime state under `.agmo/state`
+- built-in vault and wisdom flows
+- optional tmux + git-worktree team runtime
+
+## Why This Exists
+
+Codex already has strong local execution and agent delegation primitives. Agmo adds a tighter operating model on top:
+
+- a canonical workflow chain: `brainstorming -> plan -> plan-review -> execute -> team`
+- durable project memory instead of chat-only context
+- explicit planning, execution, verification, and wisdom lanes
+- Git and GitHub skill surfaces for commits, PRs, and issue creation
+- repeatable setup for both user-wide and project-local installs
+
+## Quick Start
+
+### Install the CLI
 
 ```bash
 npm install -g agmo
 ```
 
-### 2. Run setup
+### Run setup
 
 ```bash
 agmo setup
 ```
 
-When you run `agmo setup` in an interactive terminal, Agmo now asks which scope you want:
+`agmo setup` installs both parts of the product together:
 
-- `user` / `global`
-  - installs into `~/.codex` and `~/.agmo`
-  - good when you want Agmo available across all local projects
-- `project`
-  - installs into `<project>/.codex` and `<project>/.agmo`
-  - good when you want the setup isolated to one repository
-
-Setup applies the chosen scope to both parts of the product:
-
-- the **Agmo CLI runtime** setup
-  - managed agents
+- Agmo runtime
+  - managed native agents
   - hooks
   - `AGENTS.md`
   - `.agmo/config.json`
-- the **Codex plugin** setup
-  - plugin marketplace files
-  - plugin cache/install bundle
-  - plugin activation in the scoped `.codex/config.toml`
+- Codex plugin bundle
+  - plugin manifest
+  - managed skills
+  - MCP placeholders
+  - scoped activation in `.codex/config.toml`
 
-### Explicit scope examples
-
-If you already know the target scope, you can skip the prompt:
+### Choose the install scope
 
 ```bash
 agmo setup --scope user
 agmo setup --scope project
 ```
 
-### Non-interactive environments
+- `user`: installs into `~/.codex` and `~/.agmo`
+- `project`: installs into `<repo>/.codex` and `<repo>/.agmo`
 
-In CI, scripts, or any non-interactive shell, `agmo setup` cannot ask the question for you.
-In those cases, pass the scope explicitly:
+### Launch a session
 
 ```bash
-agmo setup --scope user
-# or
-agmo setup --scope project
+agmo launch
 ```
 
-If you omit `--scope` outside an interactive terminal, Agmo exits with an error instead of guessing.
+For CI or other non-interactive shells, pass `--scope` explicitly. Agmo will not guess.
 
-## Recommended workflow surface
+## Versioning
 
-Agmo's public workflow is:
+Agmo keeps the CLI package, plugin package, plugin manifest, and README badge on one version.
 
-`brainstorming -> plan -> plan-review -> execute -> team`
+```bash
+pnpm version:check
+pnpm version:sync 0.1.1
+pnpm version:bump:patch
+pnpm version:bump:minor
+pnpm version:bump:major
+pnpm version:prerelease:alpha
+pnpm version:prerelease:beta
+pnpm version:prerelease:rc
+pnpm version:release
+```
 
-- `brainstorming`: shape ideas, tradeoffs, and design direction with `agmo-explore`/`agmo-architect` support as needed
-- `plan`: create an execution-ready handoff via `agmo-planner`, using `agmo-explore` for repo facts and `agmo-architect` for boundary/tradeoff checks when needed
-- `plan-review`: challenge or approve the plan before coding via `agmo-critic`, `agmo-architect`, and/or `agmo-verifier`
-- `execute`: start implementation in the current session, with `agmo-explore` for missing repo facts, `agmo-architect` for unresolved design tension, `agmo-executor` for coding, and `agmo-verifier` for proof
-- `team`: escalate to durable tmux workers when one execution lane is no longer enough
+- root `package.json` is the source of truth
+- `packages/agmo-cli/package.json` stays aligned for the published runtime
+- `packages/agmo-plugin/package.json` and `packages/agmo-plugin/.codex-plugin/plugin.json` stay aligned for plugin installs
+- `pnpm check` fails if those versions drift
+- managed release channels are `alpha`, `beta`, `rc`, then `release`
+- prerelease tags outside that policy are rejected by the sync script
+- plugin validation checks manifest shape, skill bundle structure, and `.codex/skills` mirror parity
 
-`design` remains available only as a compatibility alias that routes into `brainstorming`; it is not a separate public workflow stage.
-`ralplan` remains available as a compatibility alias that routes into the planning lane for a consensus-style, higher-trust planning pass; it is not a separate public workflow stage.
-`ralph` remains available as a compatibility alias that routes into the execution lane for a completion-gated, verify-before-done pass; it is not a separate public workflow stage.
+## What You Get
 
-## Managed native agent roster
+<table>
+  <tr>
+    <td valign="top" width="25%">
+      <strong>Codex-native workflows</strong><br />
+      Brainstorm, plan, review, execute, and escalate without leaving Codex-native surfaces.
+    </td>
+    <td valign="top" width="25%">
+      <strong>GitHub-ready operations</strong><br />
+      Use dedicated skills for commit/PR flow, conversation-to-issue, and note-to-issue conversion.
+    </td>
+    <td valign="top" width="25%">
+      <strong>Vault + wisdom</strong><br />
+      Keep plans, implementation notes, research, and project decisions durable outside transient chat.
+    </td>
+    <td valign="top" width="25%">
+      <strong>Team runtime</strong><br />
+      Scale from one execution lane to tmux-backed workers with worktrees, integration policy, and monitoring.
+    </td>
+  </tr>
+</table>
 
-Agmo keeps a small managed native roster under `.codex/agents/*.toml`. Workflow routing treats these as first-class lanes:
+## Recommended Workflow
 
-- `agmo-planner` — planning, decomposition, and execution sequencing
-- `agmo-executor` — direct implementation and task completion
-- `agmo-verifier` — verification, testing, and completion evidence review
-- `agmo-wisdom` — durable knowledge retrieval and note synthesis
-- `agmo-architect` — read-only system design, boundary, and tradeoff analysis
-- `agmo-critic` — read-only plan and design challenge lane
-- `agmo-explore` — fast repo fact gathering and file/symbol mapping
+```text
+brainstorming -> plan -> plan-review -> execute -> team
+```
 
-### Pinned model policy
+### Public stages
 
-These managed agents are intentionally pinned in-repo so installs and workflow routing stay predictable:
+- `brainstorming`: shape ideas and tradeoffs with `agmo-planner`, `agmo-explore`, and `agmo-architect`
+- `plan`: produce an execution-ready handoff
+- `plan-review`: challenge or approve the plan before coding
+- `execute`: implement with `agmo-executor` and prove with `agmo-verifier`
+- `team`: escalate to durable multi-worker execution when one lane is no longer enough
 
-| agent | model | reasoning effort |
-| --- | --- | --- |
-| `agmo-planner` | `gpt-5.4` | `medium` |
-| `agmo-executor` | `gpt-5.4` | `high` |
-| `agmo-verifier` | `gpt-5.4` | `high` |
-| `agmo-wisdom` | `gpt-5.4-mini` | `medium` |
-| `agmo-architect` | `gpt-5.4` | `high` |
-| `agmo-critic` | `gpt-5.4` | `high` |
-| `agmo-explore` | `gpt-5.3-codex-spark` | `low` |
+### Compatibility aliases
 
-If the managed roster or any pin changes, update the checked-in agent TOMLs and workflow docs together.
+- `design` routes to `brainstorming`
+- `ralplan` routes to a higher-trust planning lane
+- `ralph` routes to completion-gated execution
 
-## Planned architecture
+## Managed Native Agent Roster
+
+Agmo keeps a small pinned roster under `.codex/agents/*.toml`.
+
+| Agent | Role | Model | Reasoning |
+| --- | --- | --- | --- |
+| `agmo-planner` | planning and decomposition | `gpt-5.4` | `medium` |
+| `agmo-executor` | direct implementation | `gpt-5.4` | `high` |
+| `agmo-verifier` | verification and proof | `gpt-5.4` | `high` |
+| `agmo-wisdom` | durable knowledge and note synthesis | `gpt-5.4-mini` | `medium` |
+| `agmo-architect` | read-only design and tradeoffs | `gpt-5.4` | `high` |
+| `agmo-critic` | plan and design challenge | `gpt-5.4` | `high` |
+| `agmo-explore` | fast repo fact gathering | `gpt-5.3-codex-spark` | `low` |
+
+## Skill Surface
+
+### Workflow skills
+
+- `brainstorming`
+- `plan`
+- `plan-review`
+- `execute`
+- `team`
+
+### Compatibility skills
+
+- `design`
+- `ralplan`
+- `ralph`
+
+### Knowledge and vault skills
+
+- `wisdom`
+- `vault-search`
+- `save-note`
+
+### Verification and GitHub skills
+
+- `verify`
+- `git-workflow`
+- `create-issue`
+- `note-to-issue`
+
+### Git and GitHub additions
+
+These three are modeled after the Claude Code plugin project, but adapted for Codex-native lanes and Agmo runtime contracts:
+
+- `git-workflow`: commit, push, PR, and branch operations
+- `create-issue`: create GitHub issues from conversation or repo context
+- `note-to-issue`: convert an existing vault or markdown note into a GitHub issue
+
+## Architecture
+
+```text
+packages/
+├── agmo-plugin/
+│   ├── .codex-plugin/plugin.json
+│   ├── skills/
+│   ├── .mcp.json
+│   └── assets/
+└── agmo-cli/
+    ├── src/cli/
+    ├── src/hooks/
+    ├── src/prompts/
+    ├── src/team/
+    ├── src/vault/
+    └── src/templates/
+```
 
 ### Plugin layer
 
-- Codex plugin manifest
-- Skills
-- MCP configuration placeholders
-- Assets
+- reusable Codex plugin manifest
+- managed skill catalog
+- MCP server placeholders
+- packaged assets bundled into installs
 
 ### Runtime layer
 
 - `agmo setup`
-- Native agent TOML generation
-- `.codex/hooks.json` management
-- `AGENTS.md` generation
-- `.agmo/state/*` runtime state
-- tmux + worktree team runtime
-- monitor + auto-nudge / auto-reclaim (`agmo team monitor --auto-nudge --auto-reclaim`)
-- monitor presets / cooldown tuning (`agmo team monitor --preset balanced`)
-- claim reclaim + reassignment (`agmo team reclaim --reassign`)
-- tuned pending-task rebalance (`agmo team rebalance ...`)
-- leader-friendly monitor view (`agmo team monitor --leader-view`)
-- compact HUD + optional tmux HUD pane (`agmo team hud`, `team start --hud`)
-- Obsidian-first vault config/save/scaffold/create commands (`agmo vault ...`)
-- optional git-based auto integration with conflict policies (`agmo team integrate`, `team complete --auto-integrate`)
-- role-aware initial task allocation for planner/executor/verifier/wisdom lanes
-- tunable tmux HUD refresh controls (`team start --hud --hud-refresh-ms ...`, `team hud --watch`)
-- richer Obsidian note linking policy (`project_note`, `parent`, `related`, returned wikilinks)
-- expanded integration strategies + conflict assist (`--strategy squash`, `team integrate-assist`)
-- monitor escalation/leader alert tuning (`leader-alerts.json`, escalation thresholds/cooldowns)
-- leader alert delivery surface (`team alert-delivery`, mailbox + Slack webhook + sendmail email bridge)
-- dependency-aware claim gating (`depends_on`, blocked tasks, unblock notifications)
-- explicit initial allocation overrides (`--allocation-intent`, `--role-map`)
-- vault template overrides and custom schema fields (`--template-file`, `--schema`, `--field`)
-- richer integration batching + target-branch policy (`--batch-size`, `--batch-order`, `--target-ref`)
+- `agmo launch`
+- native hook management
+- runtime state under `.agmo/state/*`
+- team runtime with tmux and git worktrees
+- vault and wisdom commands
+- integration and conflict-assist flows
 
-## Obsidian-first vault workflow
+## Vault and Wisdom
 
-Agmo’s runtime now includes a built-in vault surface so the plugin can save and scaffold notes without relying on external shell scripts.
+Agmo includes a built-in vault surface so durable notes do not depend on ad-hoc shell scripts.
 
-### Configure vault root
+### Configure the vault root
 
 ```bash
 agmo vault config set-root "/path/to/obsidian/vault" --scope project
@@ -161,297 +254,101 @@ Vault root resolution order:
 2. project `.agmo/config.json`
 3. user `~/.agmo/config.json`
 
-### Tune autosave policy per workflow
-
-Use workflow-specific autosave toggles when a canonical vault should keep implementation/design notes but skip transient lanes like verification:
+### Core vault commands
 
 ```bash
-agmo config vault-autosave show
-agmo config vault-autosave set workflow_enabled.verify false --scope project
-agmo config vault-autosave unset workflow_enabled.verify --scope project
+agmo vault save --type impl --project agmo-everywhere-codex --title "Runtime Bootstrap" --file /tmp/runtime-bootstrap.md --index
+agmo vault scaffold --type design --project agmo-everywhere-codex --title "Launch UX" --output /tmp/launch-ux.md
+agmo vault create --type meeting --project agmo-everywhere-codex --title "Weekly Runtime Sync" --date 2026-04-22 --attendees "alice,bob" --index
 ```
 
-The current project uses this to stop `verify` autosaves from generating transient memo notes in the canonical Obsidian vault while still preserving `execute`, `plan`, `brainstorming`, and research-oriented checkpoints.
-
-### Save an existing markdown file into the vault
+### Wisdom commands
 
 ```bash
-agmo vault save \
-  --type impl \
-  --project agmo-everywhere-codex \
-  --title "Runtime Bootstrap" \
-  --file /tmp/runtime-bootstrap.md \
-  --index
+agmo wisdom show
+agmo wisdom add learn "Prefer evidence-backed workflow routing."
+agmo wisdom add decision "Keep execute and verify as separate lanes." --scope project
 ```
 
-### Scaffold a new Obsidian note template
+## Team Runtime
+
+When one execution lane is no longer enough, Agmo can move into a durable team runtime instead of spawning ad-hoc short-lived fanout.
+
+### Common commands
 
 ```bash
-agmo vault scaffold \
-  --type impl \
-  --project agmo-everywhere-codex \
-  --title "Vault Scaffold Improvements" \
-  --issue 123 \
-  --pr 456 \
-  --plan '[[agmo-everywhere-codex/plans/[Plan] Runtime Bootstrap]]' \
-  --aliases "Vault Scaffold Improvements,Scaffold Improvements" \
-  --tags "obsidian,vault" \
-  --output /tmp/vault-scaffold.md
+agmo team start 3 "Ship the scoped feature with verification"
+agmo team status <team-name>
+agmo team monitor <team-name> --preset balanced --leader-view
+agmo team integrate <team-name> --strategy squash --target-ref @base
+agmo team integrate-assist <team-name>
 ```
 
-### Create and save a scaffolded note directly
+### Operational features
 
-```bash
-agmo vault create \
-  --type meeting \
-  --project agmo-everywhere-codex \
-  --title "Weekly Runtime Sync" \
-  --date 2026-04-22 \
-  --attendees "alice,bob" \
-  --tags "weekly,team-sync" \
-  --index
-```
+- worker-specific worktrees
+- role-aware task allocation
+- heartbeat and stale-worker detection
+- optional monitor auto-nudge and auto-reclaim
+- batched integration with conflict policy
+- manual conflict assist note generation
 
-### Tune note linking policy
+## Git and GitHub Workflow
 
-```bash
-agmo vault scaffold \
-  --type impl \
-  --project agmo-everywhere-codex \
-  --title "Vault Linking Policy" \
-  --plan 'agmo-everywhere-codex/plans/[Plan] Runtime Bootstrap' \
-  --parent 'agmo-everywhere-codex/agmo-everywhere-codex' \
-  --related 'agmo-everywhere-codex/designs/[Design] Runtime UX,https://example.com/ref'
-```
+Agmo now has an explicit Git/GitHub lane instead of hiding these behaviors inside generic execution.
 
-### Override the template and note schema
-
-```bash
-agmo vault scaffold \
-  --type impl \
-  --project agmo-everywhere-codex \
-  --title "Custom Schema Impl" \
-  --schema custom-impl \
-  --field owner=platform \
-  --field area=runtime \
-  --template-file /path/to/template.md
-```
-
-Supported note types:
-
-- `plan`
-- `impl`
-- `design`
-- `research`
-- `meeting`
-- `memo`
-
-Scaffolds are Obsidian-oriented:
-
-- safe YAML frontmatter output for links, issue/pr refs, and strings with special characters
-- default `aliases` entry using the clean note title
-- default type/project tags plus optional extra `--tags`
-- consistent `created` / `updated` fields
-- project index note auto-append with `--index`
-- explicit `project_note` field pointing at the project index note
-- optional `parent` and `related` link metadata
-- `Related Links` body section with internal wikilinks and external URLs
-- `vault create` / `vault save` results include canonical `wikilink` and `project_wikilink`
-- optional `schema` frontmatter field for custom note families
-- repeatable `--field key=value` custom frontmatter extensions
-- `--template-file` support with placeholders like `{{frontmatter}}`, `{{body}}`, `{{title}}`, `{{project}}`, and custom `{{fieldName}}`
-
-## Git integration policy controls
-
-Runtime-managed worker branch integration now exposes a few safety policies:
-
-```bash
-agmo team integrate my-team \
-  --target-ref @base \
-  --checkout-target \
-  --strategy squash \
-  --batch-size 2 \
-  --batch-order oldest \
-  --max-commits 3 \
-  --on-conflict stop \
-  --on-empty skip
-```
-
-- `--strategy cherry-pick|squash`: integrate commit-by-commit or squash the whole worker branch
-- `--target-ref <ref|@base|@current>`: integrate onto the current ref, the team base ref, or an explicit branch/ref
-- `--checkout-target`: automatically switch the repo root to the requested target ref before integrating
-- `--batch-size <n>`: integrate only the first `n` matching completed tasks in this run
-- `--batch-order oldest|newest|task-id`: choose how matching completed tasks are ordered before batching
-- `--max-commits <n>`: skip large candidate integrations
-- `--on-conflict continue|stop`: continue with later candidates or stop after the first conflict
-- `--on-empty skip|fail`: skip empty cherry-picks caused by already-applied changes or treat them as failures
-
-Integration history keeps structured metadata for:
-
-- `batch_id`
-- `batch_index`
-- `batch_total`
-- `applied_commits`
-- `skipped_commits`
-- `conflict_commit`
-- `conflict_paths`
-- `created_commit`
-- `assist_path`
-- `requested_target_ref`
-- `target_ref`
-- `target_source`
-
-When an integration conflict occurs, Agmo now writes a manual-resolution assist note and you can reopen it with:
-
-```bash
-agmo team integrate-assist my-team
-```
-
-## Monitor auto-policy presets
-
-`team monitor` now supports preset-driven operator policies:
-
-```bash
-agmo team monitor my-team --preset balanced
-agmo team monitor my-team --preset aggressive --no-auto-reassign --leader-view
-```
-
-Available presets:
-
-- `observe`: monitor only, no auto actions
-- `conservative`: slower stale/dead thresholds with auto-nudge only
-- `balanced`: auto-nudge + auto-reclaim + auto-reassign
-- `aggressive`: faster thresholds, short nudge cooldown, reclaim stale workers too
-
-You can still override individual behaviors:
-
-- `--auto-nudge` / `--no-auto-nudge`
-- `--auto-reclaim` / `--no-auto-reclaim`
-- `--auto-reassign` / `--no-auto-reassign`
-- `--include-stale` / `--no-include-stale`
-- `--nudge-cooldown-ms <ms>`
-- `--reclaim-lease-ms <ms>`
-
-Each run saves the effective policy to:
-
-- `.agmo/state/team/<team>/monitor-policy.json`
-
-Leader escalation tuning is also available:
-
-- `--escalate-leader|--no-escalate-leader`
-- `--notify-on-stale|--no-notify-on-stale`
-- `--notify-on-dead|--no-notify-on-dead`
-- `--notify-on-claim-risk|--no-notify-on-claim-risk`
-- `--leader-alert-cooldown-ms <ms>`
-- `--escalation-repeat-threshold <n>`
-
-Durable leader alert state is written to:
-
-- `.agmo/state/team/<team>/leader-alerts.json`
-
-Leader alerts can also fan out to a durable mailbox plus optional Slack/email bridges:
-
-```bash
-agmo team alert-delivery show my-team
-agmo team alert-delivery set my-team --mailbox
-agmo team alert-delivery set my-team --slack --slack-webhook-url https://hooks.slack.com/services/...
-agmo team alert-delivery set my-team --email --email-to ops@example.com --email-from agmo@example.com
-```
-
-Notes:
-
-- mailbox delivery writes a markdown feed and NDJSON payload log
-- Slack delivery uses an incoming webhook URL
-- email delivery uses a local `sendmail` bridge (default: `/usr/sbin/sendmail`)
-- Slack/email config can also come from env: `AGMO_LEADER_ALERT_SLACK_WEBHOOK_URL`, `AGMO_LEADER_ALERT_EMAIL_TO`, `AGMO_LEADER_ALERT_EMAIL_FROM`, `AGMO_LEADER_ALERT_EMAIL_SENDMAIL_PATH`, `AGMO_LEADER_ALERT_EMAIL_SUBJECT_PREFIX`
-
-Delivery artifacts are written to:
-
-- `.agmo/state/team/<team>/leader-alert-delivery.json`
-- `.agmo/state/team/<team>/leader-alert-deliveries.json`
-- `.agmo/state/team/<team>/leader-alert-mailbox.md`
-- `.agmo/state/team/<team>/leader-alert-mailbox.ndjson`
-
-## Role-aware initial allocation
-
-`team start` now assigns initial worker lanes based on task intent and worker count.
-
-Examples:
-
-- implementation-heavy task → planner + executor(s) + verifier
-- Obsidian/vault implementation task with enough workers → planner + executor + wisdom + verifier
-- research/doc task → wisdom + planner + verifier
-- verification task → verifier + executor + planner
-
-The `team start` result now includes `initial_roles` so the leader can inspect the first lane split immediately.
-
-Dependent tasks now start in `blocked` state when they rely on earlier lanes, and they automatically move back to `pending` when dependencies complete.
-
-If needed, a worker can still override the gate explicitly:
-
-```bash
-agmo team claim my-team 3 worker-3 --ignore-dependencies
-```
-
-If the default lane split is close but not quite right, you can steer it:
-
-```bash
-agmo team start 3 "Implement vault workflow" \
-  --allocation-intent knowledge \
-  --role-map worker-1=agmo-wisdom,worker-2=agmo-planner,worker-3=agmo-verifier
-```
-
-- `--allocation-intent`: force the initial lane family (`implementation|verification|planning|knowledge`)
-- `--role-map`: override specific worker roles without disabling lane summaries/dependencies
-
-`agmo team shutdown <team>` now also normalizes durable worker/task/dispatch state on disk so a stopped team no longer looks active because of leftover `working`, `pending`, or outstanding dispatch records.
-
-If older sessions already left behind active-looking orphan teams, you can bulk-normalize them:
-
-```bash
-agmo team cleanup-stale --dry-run
-agmo team cleanup-stale --include-stale
-```
-
-- default behavior only shuts down teams whose workers are all dead
-- `--include-stale` also cleans teams that have no healthy workers left
-- `--stale-ms` / `--dead-ms` let you tighten or relax the heartbeat thresholds used for cleanup
-- `--dry-run` reports which teams would be normalized without mutating state
-
-## HUD controls and refresh tuning
-
-You can now tune HUD behavior both for direct CLI use and tmux panes:
-
-```bash
-agmo team hud my-team --watch --refresh-ms 1000 --no-clear
-agmo team start 3 "Implement vault sync" --hud --hud-refresh-ms 5000 --hud-no-clear
-```
-
-Supported controls:
-
-- `team hud --watch`: live-refresh in the current terminal
-- `team hud --refresh-ms <ms>`: control refresh interval
-- `team hud --clear|--no-clear`: clear or append between refreshes
-- `team start --hud-refresh-ms <ms>`: set tmux HUD pane refresh interval
-- `team start --hud-clear|--hud-no-clear`: control tmux HUD pane clearing behavior
-
-The chosen tmux HUD settings are recorded in team config under:
-
-- `config.tmux.hud_refresh_ms`
-- `config.tmux.hud_clear_screen`
-
-## Initial focus
-
-1. Scaffold plugin + runtime packages
-2. Implement `agmo setup`
-3. Implement native agent sync
-4. Implement hook sync
-5. Implement team runtime MVP
-
-## Workspace layout
+### Commit and PR flow
 
 ```text
-packages/
-  agmo-plugin/
-  agmo-cli/
+"커밋해줘" -> git-workflow
+"PR 만들어줘" -> git-workflow
 ```
+
+`git-workflow` is opinionated about:
+
+- staging only intended files
+- checking diffs before commit
+- respecting repo-local commit policy
+- avoiding `--no-verify`
+- running tests or checks before PR creation when the repo exposes them
+
+### Issue creation flow
+
+```text
+"이 내용으로 이슈 만들어줘" -> create-issue
+"이 노트를 이슈로 바꿔줘" -> note-to-issue
+```
+
+- `create-issue` is for conversation-to-issue or repo-context issue creation
+- `note-to-issue` is for converting an existing note artifact
+
+## Development
+
+### Monorepo commands
+
+```bash
+pnpm install
+pnpm check
+pnpm build
+```
+
+### Package roles
+
+- `packages/agmo-plugin`: installable Codex plugin surface
+- `packages/agmo-cli`: setup/runtime/launch/team/vault CLI
+
+## Design Notes
+
+This README intentionally mirrors the readability pattern of the earlier Claude Code plugin project:
+
+- centered hero
+- high-signal badges
+- quick-start-first layout
+- workflow-oriented sectioning
+- compact tables instead of long prose dumps
+
+The content itself is Codex-first and reflects the current Agmo runtime contract in this repository.
+
+## License
+
+MIT

@@ -89,7 +89,10 @@ export const DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY: Required<
     verify: "memo",
     wisdom: "research",
     "vault-search": "research",
-    "save-note": "memo"
+    "save-note": "memo",
+    "git-workflow": "memo",
+    "create-issue": "memo",
+    "note-to-issue": "memo"
   }
 };
 

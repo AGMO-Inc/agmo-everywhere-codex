@@ -70,6 +70,9 @@ function inferDefaultCheckpointType(workflow: string | undefined): VaultNoteType
     case "vault-search":
       return "research";
     case "verify":
+    case "git-workflow":
+    case "create-issue":
+    case "note-to-issue":
       return "memo";
     case "execute":
     case "save-note":

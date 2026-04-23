@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "build": "node -e \"console.log('agmo-plugin: no build step yet')\"",
-    "check": "node -e \"console.log('agmo-plugin: manifest/skill validation TODO')\"",
+    "check": "node ../../scripts/validate-plugin.mjs",
     "clean": "rm -rf dist"
   }
 }

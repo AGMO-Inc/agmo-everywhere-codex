@@ -34,6 +34,30 @@ const EXPLICIT_ROUTE_OVERRIDES: Array<{
   route: WorkflowRoute;
 }> = [
   {
+    pattern: /^\$git-workflow\b/i,
+    route: {
+      skill: "git-workflow",
+      label: "git-workflow",
+      reason: "explicit $git-workflow invocation"
+    }
+  },
+  {
+    pattern: /^\$create-issue\b/i,
+    route: {
+      skill: "create-issue",
+      label: "create-issue",
+      reason: "explicit $create-issue invocation"
+    }
+  },
+  {
+    pattern: /^\$note-to-issue\b/i,
+    route: {
+      skill: "note-to-issue",
+      label: "note-to-issue",
+      reason: "explicit $note-to-issue invocation"
+    }
+  },
+  {
     pattern: /^\$vault-search\b/i,
     route: {
       skill: "vault-search",
@@ -119,6 +143,49 @@ const ROUTES: Array<{
   route: WorkflowRoute;
   patterns: ScoredPattern[];
 }> = [
+  {
+    route: {
+      skill: "note-to-issue",
+      label: "note-to-issue",
+      reason: "vault note to GitHub issue conversion request"
+    },
+    patterns: [
+      { pattern: /\$?note-to-issue\b/i, score: 9 },
+      { pattern: /\b(note|vault|markdown)\b.*\b(issue|github issue)\b/i, score: 7 },
+      { pattern: /\b(issue|github issue)\b.*\b(from|from the)\b.*\b(note|vault|markdown)\b/i, score: 7 },
+      { pattern: /(노트|문서|옵시디언).*(이슈|깃허브 이슈).*(변환|만들|생성)/u, score: 8 },
+      { pattern: /(이슈|깃허브 이슈).*(노트|문서|옵시디언).*(변환|만들|생성)/u, score: 8 }
+    ]
+  },
+  {
+    route: {
+      skill: "create-issue",
+      label: "create-issue",
+      reason: "GitHub issue creation request"
+    },
+    patterns: [
+      { pattern: /\$?create-issue\b/i, score: 9 },
+      { pattern: /\b(?:create|open|file)\b.*\b(?:github )?issue\b/i, score: 7 },
+      { pattern: /\b(?:github )?issue\b.*\b(?:create|open|file)\b/i, score: 7 },
+      { pattern: /(이슈|깃허브 이슈).*(만들|생성|발행|등록)/u, score: 8 },
+      { pattern: /(버그 이슈|태스크 이슈|피처 이슈)/u, score: 8 }
+    ]
+  },
+  {
+    route: {
+      skill: "git-workflow",
+      label: "git-workflow",
+      reason: "git workflow request for commit/push/pr/branch work"
+    },
+    patterns: [
+      { pattern: /\$?git-workflow\b/i, score: 9 },
+      { pattern: /\b(?:commit|push|branch)\b/i, score: 5 },
+      { pattern: /\b(?:pull request|pr)\b/i, score: 6 },
+      { pattern: /(커밋|푸시|브랜치)/u, score: 6 },
+      { pattern: /(?:PR|풀 리퀘스트).*(만들|생성|열어)/u, score: 7 },
+      { pattern: /git 워크플로우/u, score: 7 }
+    ]
+  },
   {
     route: {
       skill: "vault-search",
@@ -424,6 +491,21 @@ function buildWorkflowEnforcementContext(args: {
                 "Do not stop at first implementation. If verification fails or remains incomplete, fix the issue, re-run proof, and escalate to team only when separate implementation and verification lanes are justified."
               ]
             : [])
+        ];
+      case "git-workflow":
+        return [
+          "Agmo runtime enforcement: git-workflow is an operational repo-mutation lane.",
+          "Delegate commit/push/PR execution to agmo-executor, inspect actual git/gh output, and do not claim branch or PR success without fresh command evidence."
+        ];
+      case "create-issue":
+        return [
+          "Agmo runtime enforcement: create-issue is a GitHub mutation lane with a proof requirement.",
+          "Use agmo-wisdom if the ticket body needs shaping, delegate the actual gh issue/project commands to agmo-executor, and verify the final issue URL and metadata before reporting success."
+        ];
+      case "note-to-issue":
+        return [
+          "Agmo runtime enforcement: note-to-issue spans both durable note context and GitHub mutation.",
+          "Use agmo-wisdom to interpret the note, delegate GitHub plus note-file mutations to agmo-executor, and verify both the created issue and the updated note contents before claiming completion."
         ];
       case "verify":
         return [

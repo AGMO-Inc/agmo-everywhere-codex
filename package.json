@@ -5,8 +5,18 @@
   "description": "Agmo Codex-native plugin and runtime monorepo",
   "packageManager": "pnpm@10.8.1",
   "scripts": {
+    "version:sync": "node scripts/sync-versions.mjs",
+    "version:check": "node scripts/sync-versions.mjs --check",
+    "version:bump:patch": "node scripts/sync-versions.mjs patch",
+    "version:bump:minor": "node scripts/sync-versions.mjs minor",
+    "version:bump:major": "node scripts/sync-versions.mjs major",
+    "version:prerelease:alpha": "node scripts/sync-versions.mjs alpha",
+    "version:prerelease:beta": "node scripts/sync-versions.mjs beta",
+    "version:prerelease:rc": "node scripts/sync-versions.mjs rc",
+    "version:release": "node scripts/sync-versions.mjs release",
+    "test:tooling": "node --test scripts/sync-versions.test.mjs scripts/validate-plugin.test.mjs",
     "build": "pnpm -r build",
     "clean": "pnpm -r clean",
-    "check": "pnpm -r check"
+    "check": "pnpm run version:check && pnpm -r check && pnpm run test:tooling"
   }
 }
