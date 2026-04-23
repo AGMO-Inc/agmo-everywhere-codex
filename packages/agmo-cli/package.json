@@ -14,7 +14,7 @@
     "agmo": "dist/cli/index.js"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.json && mkdir -p dist dist/plugin && cp -R src/templates dist/templates && cp -R src/prompts dist/prompts && cp -R ../agmo-plugin/.codex-plugin dist/plugin/.codex-plugin && cp -R ../agmo-plugin/skills dist/plugin/skills && cp -R ../agmo-plugin/assets dist/plugin/assets && cp ../agmo-plugin/.mcp.json dist/plugin/.mcp.json && node dist/cli/index.js config vault-autosave generate-docs --output dist/templates/vault-autosave/SCHEMA.md",
+    "build": "rm -rf dist && tsc -p tsconfig.json && chmod +x dist/cli/index.js && mkdir -p dist dist/plugin && cp -R src/templates dist/templates && cp -R src/prompts dist/prompts && cp -R ../agmo-plugin/.codex-plugin dist/plugin/.codex-plugin && cp -R ../agmo-plugin/skills dist/plugin/skills && cp -R ../agmo-plugin/assets dist/plugin/assets && cp ../agmo-plugin/.mcp.json dist/plugin/.mcp.json && node dist/cli/index.js config vault-autosave generate-docs --output dist/templates/vault-autosave/SCHEMA.md",
     "check": "tsc -p tsconfig.json --noEmit",
     "clean": "rm -rf dist"
   },
