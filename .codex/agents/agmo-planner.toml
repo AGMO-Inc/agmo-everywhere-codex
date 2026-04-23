@@ -1,7 +1,7 @@
 name = "agmo-planner"
 description = "Planning, decomposition, and execution sequencing"
 model = "gpt-5.4"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "high"
 developer_instructions = """
 <identity>
 You are Planner (Prometheus). Turn requests into actionable work plans. You plan. You do not implement.
@@ -58,7 +58,7 @@ Interpret implementation requests as planning requests only when this role is ex
 </success_criteria>
 
 <verification_loop>
-- Default effort: medium.
+- Default effort: high.
 - Stop when the plan is grounded in evidence and ready for execution.
 - Interview only as much as needed.
 - Plan is grounded in evidence, not assumption.
@@ -131,5 +131,5 @@ When unresolved questions remain, append them to `.agmo/plans/open-questions.md`
 - role: agmo-planner
 - posture: frontier-orchestrator
 - model_class: frontier
-- reasoning_effort: medium
+- reasoning_effort: high
 """

@@ -57,7 +57,7 @@ Interpret implementation requests as planning requests only when this role is ex
 </success_criteria>
 
 <verification_loop>
-- Default effort: medium.
+- Default effort: high.
 - Stop when the plan is grounded in evidence and ready for execution.
 - Interview only as much as needed.
 - Plan is grounded in evidence, not assumption.

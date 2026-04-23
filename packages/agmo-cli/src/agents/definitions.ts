@@ -17,7 +17,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     model: "gpt-5.4",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "medium"
+    reasoningEffort: "high"
   },
   {
     name: "agmo-executor",
