@@ -18,6 +18,7 @@ import {
 import { currentTmuxPaneId, isTmuxAvailable } from "../team/tmux-session.js";
 import { agmoCliDistEntryPath, resolveRuntimeRoot } from "../utils/paths.js";
 import { parseScopeFlag } from "../utils/args.js";
+import { ensureCodexCliArgs } from "../utils/codex.js";
 
 const AGMO_TMUX_BOOTSTRAPPED_ENV = "AGMO_TMUX_BOOTSTRAPPED";
 
@@ -131,7 +132,7 @@ function resolveLaunchTmuxMode(args: string[]): {
     message: "--tmux and --no-tmux cannot be used together"
   });
 
-  const codexArgs = removeFlag(removeFlag(args, "--tmux"), "--no-tmux");
+  const codexArgs = ensureCodexCliArgs(removeFlag(removeFlag(args, "--tmux"), "--no-tmux"));
   return {
     mode: forceTmux ? "force" : disableTmux ? "disabled" : "auto",
     codexArgs

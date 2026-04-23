@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { ensureCodexCliArgs } from "../utils/codex.js";
 
 export type TmuxTopology = {
   available: boolean;
@@ -72,6 +73,10 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+export function buildWorkerCodexArgs(prompt: string): string[] {
+  return ["codex", ...ensureCodexCliArgs(["--no-alt-screen", prompt])];
+}
+
 function buildWorkerBootstrapCommand(spec: TmuxWorkerPaneSpec): string {
   const prompt = [
     `You are ${spec.workerName} for team ${spec.teamName}.`,
@@ -80,11 +85,7 @@ function buildWorkerBootstrapCommand(spec: TmuxWorkerPaneSpec): string {
     `Follow the worker instructions in ${spec.instructionsPath}.`,
     `Current task summary: ${spec.taskSummary}.`
   ].join(" ");
-  const args = [
-    "codex",
-    "--no-alt-screen",
-    prompt
-  ];
+  const args = buildWorkerCodexArgs(prompt);
   const exports = [
     `export AGMO_TEAM_NAME=${shellQuote(spec.teamName)}`,
     `export AGMO_WORKER_NAME=${shellQuote(spec.workerName)}`,
