@@ -1,4 +1,3 @@
-import os from "node:os";
 import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
@@ -25,28 +24,6 @@ type DoctorRecommendation = {
   command?: string;
 };
 
-export type LegacyRuntimeInspection = {
-  project_omx_dir: string;
-  user_omx_dir: string;
-  project_omx_exists: boolean;
-  user_omx_exists: boolean;
-};
-
-export function inspectLegacyRuntimeArtifacts(
-  projectRoot: string,
-  userHome = os.homedir()
-): LegacyRuntimeInspection {
-  const projectOmxDir = join(projectRoot, ".omx");
-  const userOmxDir = join(userHome, ".omx");
-
-  return {
-    project_omx_dir: projectOmxDir,
-    user_omx_dir: userOmxDir,
-    project_omx_exists: existsSync(projectOmxDir),
-    user_omx_exists: existsSync(userOmxDir)
-  };
-}
-
 export async function runDoctorCommand(args: string[]): Promise<void> {
   const scope = parseScopeFlag(args);
   const paths = resolveInstallPaths(scope);
@@ -59,7 +36,6 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
   const launchWorkspaces = await listLaunchWorkspaces({
     projectRoot
   });
-  const legacyRuntime = inspectLegacyRuntimeArtifacts(projectRoot);
   const setupRecommendations: DoctorRecommendation[] = [];
   const vaultRecommendations: DoctorRecommendation[] = [];
   const teamRecommendations: DoctorRecommendation[] = [];
@@ -88,7 +64,6 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
     }
   );
   const launchWorkspaceRecommendations: DoctorRecommendation[] = [];
-  const legacyRuntimeRecommendations: DoctorRecommendation[] = [];
   const setupCommand = `agmo setup --scope ${scope}`;
 
   if (
@@ -174,23 +149,6 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
     );
   }
 
-  if (legacyRuntime.project_omx_exists || legacyRuntime.user_omx_exists) {
-    if (legacyRuntime.project_omx_exists) {
-      legacyRuntimeRecommendations.push({
-        severity: "info",
-        message: `Legacy project runtime artifacts are still present: ${legacyRuntime.project_omx_dir}`,
-        command: "agmo setup migrate-legacy --scope project"
-      });
-    }
-
-    if (legacyRuntime.user_omx_exists) {
-      legacyRuntimeRecommendations.push({
-        severity: "info",
-        message: `Legacy user runtime artifacts are still present: ${legacyRuntime.user_omx_dir}`,
-        command: "agmo setup migrate-legacy --scope user"
-      });
-    }
-  }
 
   console.log(
     JSON.stringify(
@@ -218,14 +176,12 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
           ...launchPolicy.policy,
           sources: launchPolicy.sources
         },
-        legacy_runtime: legacyRuntime,
         launch_workspaces: launchWorkspaceSummary,
         recommendations: {
           setup: setupRecommendations,
           vault: vaultRecommendations,
           team: teamRecommendations,
-          launch_workspaces: launchWorkspaceRecommendations,
-          legacy_runtime: legacyRuntimeRecommendations
+          launch_workspaces: launchWorkspaceRecommendations
         },
         paths: {
           codex_home: codexHomeDir(),

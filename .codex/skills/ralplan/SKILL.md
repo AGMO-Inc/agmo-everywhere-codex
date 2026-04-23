@@ -34,4 +34,4 @@ A strong `ralplan` result should usually include:
 
 ## Canonical name
 
-Use `plan` in docs, onboarding, and workflow descriptions. Keep `ralplan` available so users can explicitly ask for a consensus-style planning pass and existing OMX habits keep routing correctly.
+Use `plan` in docs, onboarding, and workflow descriptions. Keep `ralplan` available so users can explicitly ask for a consensus-style planning pass without introducing a separate workflow stage.

@@ -3,37 +3,15 @@ import os from "node:os";
 import { mkdir, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { inspectLegacyRuntimeArtifacts } from "./doctor.js";
 import { runDoctorCommand } from "./doctor.js";
 
-test("inspectLegacyRuntimeArtifacts reports project and user .omx directories independently", async () => {
-  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-doctor-project-"));
-  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-doctor-home-"));
-
-  await mkdir(join(tempProject, ".omx"), { recursive: true });
-
-  const projectOnly = inspectLegacyRuntimeArtifacts(tempProject, tempHome);
-  assert.equal(projectOnly.project_omx_exists, true);
-  assert.equal(projectOnly.user_omx_exists, false);
-  assert.match(projectOnly.project_omx_dir, /\.omx$/);
-  assert.match(projectOnly.user_omx_dir, /\.omx$/);
-
-  await mkdir(join(tempHome, ".omx"), { recursive: true });
-
-  const projectAndUser = inspectLegacyRuntimeArtifacts(tempProject, tempHome);
-  assert.equal(projectAndUser.project_omx_exists, true);
-  assert.equal(projectAndUser.user_omx_exists, true);
-});
-
-test("runDoctorCommand recommends scope-specific legacy runtime migration commands", async () => {
+test("runDoctorCommand reports launch workspace cleanup guidance without legacy runtime recommendations", async () => {
   const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-doctor-cmd-project-"));
   const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-doctor-cmd-home-"));
 
-  await mkdir(join(tempProject, ".codex"), { recursive: true });
+  await mkdir(join(tempProject, ".codex", "agents"), { recursive: true });
   await mkdir(join(tempProject, ".agmo", "state"), { recursive: true });
   await mkdir(join(tempProject, ".agmo", "cache", "launch-workspaces"), { recursive: true });
-  await mkdir(join(tempProject, ".omx"), { recursive: true });
-  await mkdir(join(tempHome, ".omx"), { recursive: true });
 
   const originalHome = process.env.HOME;
   const originalCwd = process.cwd();
@@ -60,8 +38,7 @@ test("runDoctorCommand recommends scope-specific legacy runtime migration comman
   }
 
   const output = JSON.parse(stdoutChunks.join(""));
-  assert.deepEqual(output.recommendations.legacy_runtime.map((entry: { command: string }) => entry.command), [
-    "agmo setup migrate-legacy --scope project",
-    "agmo setup migrate-legacy --scope user"
-  ]);
+  assert.equal("legacy_runtime" in output, false);
+  assert.equal("legacy_runtime" in output.recommendations, false);
+  assert.ok(Array.isArray(output.recommendations.setup));
 });

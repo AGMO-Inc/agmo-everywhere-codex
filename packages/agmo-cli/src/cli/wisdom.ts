@@ -18,7 +18,7 @@ Examples:
   agmo wisdom show --scope user
   agmo wisdom add learn "Prefer JSON-first CLI output."
   agmo wisdom add decision "SessionStart should merge user + project wisdom." --scope project
-  agmo wisdom add issue "Remove remaining OMX startup dependency." --scope project
+  agmo wisdom add issue "Remove remaining startup dependency." --scope project
   agmo wisdom reset --scope project
 `);
 }

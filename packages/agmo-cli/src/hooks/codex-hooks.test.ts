@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mergeManagedHooksConfig } from "./codex-hooks.js";
 
-test("mergeManagedHooksConfig replaces legacy OMX hooks on managed events and preserves unmanaged events", () => {
+test("mergeManagedHooksConfig replaces legacy hook commands on managed events and preserves unmanaged events", () => {
   const existing = {
     hooks: {
       SessionStart: [
@@ -10,14 +10,14 @@ test("mergeManagedHooksConfig replaces legacy OMX hooks on managed events and pr
           matcher: "startup|resume",
           hooks: [
             { type: "command", command: "node \"/tmp/agmo/dist/cli/index.js\" internal hook" },
-            { type: "command", command: "node \"/tmp/omx/dist/scripts/codex-native-hook.js\"" }
+            { type: "command", command: "node \"/tmp/legacy/dist/scripts/codex-native-hook.js\"" }
           ]
         }
       ],
       UserPromptSubmit: [
         {
           hooks: [
-            { type: "command", command: "node \"/tmp/omx/dist/scripts/codex-native-hook.js\"" }
+            { type: "command", command: "node \"/tmp/legacy/dist/scripts/codex-native-hook.js\"" }
           ]
         }
       ],

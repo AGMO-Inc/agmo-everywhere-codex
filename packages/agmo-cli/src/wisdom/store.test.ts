@@ -47,7 +47,7 @@ test("wisdom store keeps scoped entries and merges effective summary", async () 
     await addWisdomEntry({
       scope: "project",
       kind: "issue",
-      content: "Open issue: remove OMX dependency from startup path.",
+      content: "Open issue: remove startup dependency from runtime bootstrap path.",
       cwd: tempRoot
     });
 

@@ -12,7 +12,6 @@ dist/
 # Workspace outputs
 coverage/
 *.log
-.omx/
 .codex/*
 !.codex/agents/
 !.codex/agents/**

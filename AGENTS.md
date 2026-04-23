@@ -187,7 +187,7 @@ USE CODEX NATIVE SUBAGENTS FOR INDEPENDENT PARALLEL SUBTASKS WHEN THAT IMPROVES 
 
 This repository now treats **Agmo** as the primary runtime contract.
 
-Legacy references such as `omx ...`, `OMX_*`, and `.omx/` are compatibility shims only unless a file explicitly says they are still operationally required.
+Legacy Agmo surfaces should be retired instead of preserved as compatibility shims unless a file explicitly says they remain operationally required.
 
 ## Working agreements
 
@@ -258,6 +258,5 @@ Rules:
 
 ## Migration note
 
-- `docs/agmo-agents-runtime-migration-plan.md` is the current staged plan for removing remaining legacy runtime surfaces.
-- Prefer migrating or archiving legacy `.omx` runtime artifacts with `agmo setup migrate-legacy --scope project|user` instead of deleting them blindly.
+- Keep runtime guidance Agmo-first; remove stale legacy artifacts instead of reintroducing compatibility-only surfaces.
 <!-- AGMO:MANUAL:END -->

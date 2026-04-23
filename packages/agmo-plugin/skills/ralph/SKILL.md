@@ -33,4 +33,4 @@ Treat this as a compatibility alias of `execute`, not as a separate canonical wo
 
 ## Canonical name
 
-Use `execute` in docs, onboarding, and workflow descriptions. Keep `ralph` available so users can explicitly ask for a completion-gated execution pass and existing OMX habits keep routing correctly.
+Use `execute` in docs, onboarding, and workflow descriptions. Keep `ralph` available so users can explicitly ask for a completion-gated execution pass without introducing a separate workflow stage.

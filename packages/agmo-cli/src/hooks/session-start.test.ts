@@ -120,7 +120,7 @@ test("buildSessionStartContext merges global and project wisdom into Agmo bootst
     await addWisdomEntry({
       scope: "project",
       kind: "issue",
-      content: "Current issue: remove remaining OMX startup dependency.",
+      content: "Current issue: remove remaining startup dependency.",
       cwd: tempRoot
     });
 
@@ -128,7 +128,7 @@ test("buildSessionStartContext merges global and project wisdom into Agmo bootst
 
     assert.match(context, /Wisdom memory: loaded 3 entries \(global=1, project=2\)\./);
     assert.match(context, /decisions: \[project\] Project decision: Agmo owns startup wisdom context\./);
-    assert.match(context, /issues: \[project\] Current issue: remove remaining OMX startup dependency\./);
+    assert.match(context, /issues: \[project\] Current issue: remove remaining startup dependency\./);
     assert.match(context, /learns: \[global\] Global learn: prefer compact JSON CLI outputs\./);
   });
 });

@@ -70,7 +70,7 @@ Examples:
   agmo config vault-autosave set min_interval_ms 15000 --scope project
   agmo config vault-autosave set append_max_entries 12 --scope project
   agmo config vault-autosave set verification_history_limit 5 --scope project
-  agmo config vault-autosave set changed_file_ignore_prefixes \".agmo/,.codex/,.omx/\" --scope project
+  agmo config vault-autosave set changed_file_ignore_prefixes \".agmo/,.codex/\" --scope project
   agmo config vault-autosave set workflow_enabled.verify false --scope project
   agmo config vault-autosave set template_file.impl /path/to/template.md --scope project
   agmo config vault-autosave set title_pattern.execute \"{{date}} {{topic}} {{session_suffix}}\" --scope project

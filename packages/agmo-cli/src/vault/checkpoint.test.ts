@@ -118,7 +118,7 @@ test("design and research autosaves render focused briefs instead of raw prompt 
         workflow: "brainstorming",
         workflow_reason: "compare brainstorming and deep-interview flows",
         prompt_excerpt:
-          "브레인스토밍은 agmo-everywhere와 OMX deep-interview를 비교해서 설계하자.",
+          "브레인스토밍은 현재 Agmo 워크플로우와 기존 디자인 노트를 비교해서 설계하자.",
         last_event: "Stop"
       })
     });
@@ -128,7 +128,7 @@ test("design and research autosaves render focused briefs instead of raw prompt 
     assert.match(designNote, /## Design Brief/);
     assert.match(designNote, /## Decision Drivers/);
     assert.match(designNote, /## Recommended Next Step/);
-    assert.match(designNote, /> 브레인스토밍은 agmo-everywhere와 OMX deep-interview를 비교해서 설계하자\./);
+    assert.match(designNote, /> 브레인스토밍은 현재 Agmo 워크플로우와 기존 디자인 노트를 비교해서 설계하자\./);
     assert.doesNotMatch(designNote, /## 개요/);
 
     const research = await saveSessionCheckpointNote({

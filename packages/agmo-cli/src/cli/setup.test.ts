@@ -1,48 +1,10 @@
 import assert from "node:assert/strict";
 import os from "node:os";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile } from "node:fs/promises";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import {
-  installScopedCodexPlugin,
-  migrateLegacyRuntimeArtifacts,
-  resolveLegacyRuntimePaths,
-  resolveSetupScope
-} from "./setup.js";
-
-test("migrateLegacyRuntimeArtifacts archives legacy project .omx state into .agmo/legacy", async () => {
-  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-setup-project-"));
-  const sourcePath = join(tempProject, ".omx");
-  await mkdir(join(sourcePath, "state"), { recursive: true });
-
-  const result = await migrateLegacyRuntimeArtifacts({
-    scope: "project",
-    cwd: tempProject,
-    now: new Date("2026-04-23T00:00:00.000Z")
-  });
-
-  assert.equal(result.status, "archived");
-  assert.equal(result.archive_path, join(tempProject, ".agmo", "legacy", "omx", "project-2026-04-23T00-00-00-000Z"));
-  assert.equal(existsSync(sourcePath), false);
-  assert.equal(existsSync(result.archive_path!), true);
-});
-
-test("migrateLegacyRuntimeArtifacts deletes legacy user .omx state when requested", async () => {
-  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-setup-home-"));
-  const { sourcePath } = resolveLegacyRuntimePaths("user", process.cwd(), tempHome);
-  await mkdir(join(sourcePath, "logs"), { recursive: true });
-
-  const result = await migrateLegacyRuntimeArtifacts({
-    scope: "user",
-    userHome: tempHome,
-    mode: "delete"
-  });
-
-  assert.equal(result.status, "deleted");
-  assert.equal(result.archive_path, null);
-  assert.equal(existsSync(sourcePath), false);
-});
+import { installScopedCodexPlugin, resolveSetupScope } from "./setup.js";
 
 test("resolveSetupScope prompts when setup scope is omitted in an interactive terminal", async () => {
   let promptCalls = 0;
@@ -83,4 +45,35 @@ test("installScopedCodexPlugin writes project-scoped marketplace, cache, and act
   assert.match(config, /\[marketplaces\.agmo-local\]/);
   assert.match(config, /\[plugins\."agmo@agmo-local"\]/);
   assert.match(config, /enabled = true/);
+});
+
+test("installScopedCodexPlugin strips legacy runtime config before writing Agmo plugin settings", async () => {
+  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-setup-clean-config-"));
+  const configPath = join(tempProject, ".codex", "config.toml");
+  mkdirSync(join(tempProject, ".codex"), { recursive: true });
+  writeFileSync(
+    configPath,
+    `# legacy package top-level settings (must be before any [table])
+notify = ["node", "/tmp/legacy-runtime/dist/scripts/notify-hook.js"]
+developer_instructions = "AGENTS.md is your orchestration brain"
+
+[env]
+USE_LEGACY_EXPLORE_CMD = "1"
+
+[mcp_servers.legacy_state]
+command = "node"
+args = ["/tmp/legacy-runtime/dist/mcp/state-server.js"]
+enabled = true
+
+[projects."${tempProject}"]
+trust_level = "trusted"
+`
+  );
+
+  await installScopedCodexPlugin("project", tempProject);
+
+  const config = await readFile(configPath, "utf8");
+  assert.doesNotMatch(config, /USE_LEGACY_EXPLORE_CMD|mcp_servers\.legacy_state|notify-hook\.js|AGENTS\.md is your orchestration brain/);
+  assert.match(config, /\[projects\./);
+  assert.match(config, /\[marketplaces\.agmo-local\]/);
 });

@@ -1,7 +1,6 @@
-import os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
-import { cp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { cp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { syncAgents } from "./agents.js";
 import { syncManagedAgentsMd } from "../agents/agents-md.js";
@@ -11,18 +10,8 @@ import { hasFlag, parseOptionalScopeFlag, parseScopeFlag } from "../utils/args.j
 import { ensureDir, readTextFileIfExists, writeJsonFile } from "../utils/fs.js";
 import { agmoCliPackageRoot, type InstallScope, resolveInstallPaths } from "../utils/paths.js";
 
-type LegacyRuntimeMigrationMode = "archive" | "delete";
 const AGMO_CODEX_PLUGIN_MARKETPLACE = "agmo-local";
 const AGMO_CODEX_PLUGIN_NAME = "agmo";
-
-export type LegacyRuntimeMigrationResult = {
-  command: "setup migrate-legacy";
-  scope: "project" | "user";
-  mode: LegacyRuntimeMigrationMode;
-  source_path: string;
-  status: "archived" | "deleted" | "skipped";
-  archive_path: string | null;
-};
 
 export type SetupScopePrompt = () => Promise<InstallScope>;
 
@@ -65,24 +54,6 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
   }
 
   return JSON.parse(content) as T;
-}
-
-export function resolveLegacyRuntimePaths(
-  scope: "project" | "user",
-  cwd = process.cwd(),
-  userHome = os.homedir()
-): { sourcePath: string; archiveRoot: string } {
-  if (scope === "user") {
-    return {
-      sourcePath: join(userHome, ".omx"),
-      archiveRoot: join(userHome, ".agmo", "legacy", "omx")
-    };
-  }
-
-  return {
-    sourcePath: join(cwd, ".omx"),
-    archiveRoot: join(cwd, ".agmo", "legacy", "omx")
-  };
 }
 
 function isInteractiveSetup(options?: SetupScopeOptions): boolean {
@@ -166,6 +137,61 @@ function appendTomlTable(content: string, tableName: string, body: string): stri
   const cleaned = stripTomlTable(content, tableName).trimEnd();
   const prefix = cleaned.length > 0 ? `${cleaned}\n\n` : "";
   return `${prefix}[${tableName}]\n${body.trimEnd()}\n`;
+}
+
+
+function stripLegacyCodexConfig(content: string): string {
+  const blocks: string[][] = [];
+  let currentBlock: string[] = [];
+
+  for (const line of content.split("\n")) {
+    if (/^\[[^\]]+\]$/.test(line) && currentBlock.length > 0) {
+      blocks.push(currentBlock);
+      currentBlock = [line];
+      continue;
+    }
+
+    currentBlock.push(line);
+  }
+
+  if (currentBlock.length > 0) {
+    blocks.push(currentBlock);
+  }
+
+  let next = blocks
+    .filter(
+      (block) => !block.some((line) => /\/dist\/mcp\//.test(line) || /codex-native-hook\.js/.test(line))
+    )
+    .map((block) => block.join("\n"))
+    .join("\n")
+    .split("\n")
+    .filter((line) => {
+      if (/notify-hook\.js/.test(line)) {
+        return false;
+      }
+
+      if (/USE_[A-Z_]*EXPLORE_CMD/.test(line)) {
+        return false;
+      }
+
+      if (/developer_instructions\s*=/.test(line) && /AGENTS\.md is your orchestration brain/.test(line)) {
+        return false;
+      }
+
+      if (/top-level settings|seeded behavioral defaults|Managed by .* setup|End .* defaults/.test(line)) {
+        return false;
+      }
+
+      return true;
+    })
+    .join("\n");
+
+  next = next
+    .replace(/(?:^|\n)\[env\]\n(?=(?:\n\[)|$)/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return next.length > 0 ? `${next}\n` : "";
 }
 
 function buildFallbackPluginManifest(version: string): CodexPluginManifest {
@@ -257,7 +283,7 @@ async function writeScopedCodexPluginConfig(args: {
   marketplaceRoot: string;
   pluginKey: string;
 }): Promise<void> {
-  const existing = (await readTextFileIfExists(args.configPath)) ?? "";
+  const existing = stripLegacyCodexConfig((await readTextFileIfExists(args.configPath)) ?? "");
   let next = appendTomlTable(
     existing,
     `marketplaces.${AGMO_CODEX_PLUGIN_MARKETPLACE}`,
@@ -329,74 +355,7 @@ export async function installScopedCodexPlugin(
   };
 }
 
-export async function migrateLegacyRuntimeArtifacts(args: {
-  scope: "project" | "user";
-  cwd?: string;
-  userHome?: string;
-  mode?: LegacyRuntimeMigrationMode;
-  now?: Date;
-}): Promise<LegacyRuntimeMigrationResult> {
-  const mode = args.mode ?? "archive";
-  const { sourcePath, archiveRoot } = resolveLegacyRuntimePaths(
-    args.scope,
-    args.cwd,
-    args.userHome
-  );
-
-  if (!existsSync(sourcePath)) {
-    return {
-      command: "setup migrate-legacy",
-      scope: args.scope,
-      mode,
-      source_path: sourcePath,
-      status: "skipped",
-      archive_path: null
-    };
-  }
-
-  if (mode === "delete") {
-    await rm(sourcePath, { recursive: true, force: true });
-    return {
-      command: "setup migrate-legacy",
-      scope: args.scope,
-      mode,
-      source_path: sourcePath,
-      status: "deleted",
-      archive_path: null
-    };
-  }
-
-  const timestamp = (args.now ?? new Date()).toISOString().replace(/[:.]/g, "-");
-  const archivePath = join(archiveRoot, `${args.scope}-${timestamp}`);
-  await ensureDir(archiveRoot);
-  await rename(sourcePath, archivePath);
-
-  return {
-    command: "setup migrate-legacy",
-    scope: args.scope,
-    mode,
-    source_path: sourcePath,
-    status: "archived",
-    archive_path: archivePath
-  };
-}
-
 export async function runSetupCommand(args: string[]): Promise<void> {
-  if (args[0] === "migrate-legacy") {
-    const mode = hasFlag(args, "--delete") ? "delete" : "archive";
-    console.log(
-      JSON.stringify(
-        await migrateLegacyRuntimeArtifacts({
-          scope: parseScopeFlag(args.slice(1)),
-          mode
-        }),
-        null,
-        2
-      )
-    );
-    return;
-  }
-
   const scopeResolution = await resolveSetupScope(args);
   const scope = scopeResolution.scope;
   const force = hasFlag(args, "--force");

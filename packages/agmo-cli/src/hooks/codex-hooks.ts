@@ -101,8 +101,8 @@ function isManagedCommand(command: string): boolean {
   return /\binternal hook\b/.test(command);
 }
 
-function isLegacyOmxManagedCommand(command: string): boolean {
-  return /codex-native-hook\.js/.test(command) || /oh-my-codex/.test(command);
+function isLegacyManagedCommand(command: string): boolean {
+  return /codex-native-hook\.js/.test(command);
 }
 
 function stripManagedHooks(entries: HookEntry[] | undefined): HookEntry[] {
@@ -116,7 +116,7 @@ function stripManagedHooks(entries: HookEntry[] | undefined): HookEntry[] {
         (hook) =>
           !(
             hook.type === "command" &&
-            (isManagedCommand(hook.command) || isLegacyOmxManagedCommand(hook.command))
+            (isManagedCommand(hook.command) || isLegacyManagedCommand(hook.command))
           )
       );
 

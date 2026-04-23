@@ -83,7 +83,6 @@ Setup:
 
 Usage:
   agmo setup [--scope user|project] [--force]
-  agmo setup migrate-legacy [--scope user|project] [--delete]
   agmo doctor
   agmo config show [--scope user|project]
   agmo config vault <show|set-root> ...

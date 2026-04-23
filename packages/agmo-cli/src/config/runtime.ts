@@ -69,7 +69,7 @@ export const DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY: Required<
   append_max_entries: 12,
   verification_history_limit: 5,
   dedupe_same_signature: true,
-  changed_file_ignore_prefixes: [".agmo/", ".codex/", ".omx/"],
+  changed_file_ignore_prefixes: [".agmo/", ".codex/"],
   changed_file_ignore_basenames: ["AGENTS.md", ".DS_Store"],
   changed_file_ignore_segments: [
     "dist",

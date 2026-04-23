@@ -35,7 +35,7 @@ test("handlePostToolUse persists save-note outcomes into project wisdom store", 
       cwd: tempRoot,
       payload,
       workflow: "save-note",
-      reason: "record the decision about removing OMX dependencies"
+      reason: "record the decision about removing legacy runtime dependencies"
     });
 
     await handlePostToolUse({
@@ -51,7 +51,7 @@ test("handlePostToolUse persists save-note outcomes into project wisdom store", 
     const store = await readWisdomStore("project", tempRoot);
     assert.equal(store.entries.length, 1);
     assert.equal(store.entries[0].kind, "decision");
-    assert.match(store.entries[0].content, /record the decision about removing OMX dependencies/i);
+    assert.match(store.entries[0].content, /record the decision about removing legacy runtime dependencies/i);
   });
 });
 
