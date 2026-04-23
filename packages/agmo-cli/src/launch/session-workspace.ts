@@ -1,6 +1,15 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdir, mkdir, rm, stat, symlink } from "node:fs/promises";
-import { join } from "node:path";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  readlink,
+  rm,
+  symlink
+} from "node:fs/promises";
+import { basename, join } from "node:path";
 import {
   DEFAULT_AGMO_LAUNCH_POLICY,
   resolveLaunchPolicy
@@ -13,6 +22,7 @@ import {
 } from "../agents/agents-md.js";
 
 const WORKSPACE_CACHE_DIR = "launch-workspaces";
+const WORKSPACE_SKIPPED_DIRS = new Set(["node_modules"]);
 
 export type LaunchWorkspaceMetadata = {
   session_id: string;
@@ -63,14 +73,14 @@ function buildRuntimeOverlay(args: {
     `- launch_session_id: ${args.sessionId}`,
     `- project_root: ${args.projectRoot}`,
     `- session_workspace_root: ${args.workspaceRoot}`,
-    "- This session was launched through `agmo launch`, so the current working directory is a session workspace shadow root.",
+    "- This session was launched through `agmo launch`, so the current working directory is a session-local Git sandbox.",
     "- Treat the session workspace `AGENTS.md` as the active main-session orchestrator contract for this run.",
     "- Persist durable runtime state against the real project root, not the session workspace cache root."
   ].join("\n");
 }
 
 function shouldLinkEntry(name: string): boolean {
-  return name !== "AGENTS.md" && name !== ".agmo";
+  return name !== "AGENTS.md" && name !== ".agmo" && name !== ".git";
 }
 
 function resolveLaunchWorkspaceCacheDir(projectRoot: string): string {
@@ -84,6 +94,31 @@ function parseIsoTimestamp(value: string | undefined): number | null {
 
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function runGit(args: string[], cwd = process.cwd()): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"]
+  }).trim();
+}
+
+function isGitRepository(cwd = process.cwd()): boolean {
+  try {
+    return runGit(["rev-parse", "--is-inside-work-tree"], cwd) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function isTrackedInGit(path: string, cwd = process.cwd()): boolean {
+  try {
+    runGit(["ls-files", "--error-unmatch", path], cwd);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isPidAlive(pid: number | undefined): boolean {
@@ -179,10 +214,89 @@ async function linkEntry(args: {
   sourcePath: string;
   destinationPath: string;
 }): Promise<void> {
-  const sourceStats = await stat(args.sourcePath);
+  const sourceStats = await lstat(args.sourcePath);
+  if (sourceStats.isSymbolicLink()) {
+    await symlink(await readlink(args.sourcePath), args.destinationPath);
+    return;
+  }
+
   const type =
     sourceStats.isDirectory() && process.platform === "win32" ? "junction" : undefined;
   await symlink(args.sourcePath, args.destinationPath, type);
+}
+
+async function copyWorkspaceFile(args: {
+  sourcePath: string;
+  destinationPath: string;
+}): Promise<void> {
+  await copyFile(args.sourcePath, args.destinationPath);
+}
+
+function shouldSkipDirectory(sourcePath: string): boolean {
+  return WORKSPACE_SKIPPED_DIRS.has(basename(sourcePath));
+}
+
+async function mirrorWorkspaceEntry(args: {
+  sourcePath: string;
+  destinationPath: string;
+}): Promise<void> {
+  const sourceStats = await lstat(args.sourcePath);
+
+  if (sourceStats.isSymbolicLink()) {
+    await linkEntry(args);
+    return;
+  }
+
+  if (sourceStats.isDirectory() && shouldSkipDirectory(args.sourcePath)) {
+    return;
+  }
+
+  if (!sourceStats.isDirectory()) {
+    await copyWorkspaceFile(args);
+    return;
+  }
+
+  await mkdir(args.destinationPath, { recursive: true });
+  const entries = await readdir(args.sourcePath, { withFileTypes: true });
+
+  await Promise.all(
+    entries.map(async (entry) => {
+      await mirrorWorkspaceEntry({
+        sourcePath: join(args.sourcePath, entry.name),
+        destinationPath: join(args.destinationPath, entry.name)
+      });
+    })
+  );
+}
+
+async function clearWorkspaceRoot(workspaceRoot: string): Promise<void> {
+  const entries = await readdir(workspaceRoot, { withFileTypes: true });
+  await Promise.all(
+    entries
+      .filter((entry) => entry.name !== ".git")
+      .map((entry) =>
+        rm(join(workspaceRoot, entry.name), {
+          recursive: true,
+          force: true
+        })
+      )
+  );
+}
+
+async function cloneGitWorkspace(args: {
+  projectRoot: string;
+  workspaceRoot: string;
+}): Promise<void> {
+  runGit(["clone", "--local", args.projectRoot, args.workspaceRoot], args.projectRoot);
+  await clearWorkspaceRoot(args.workspaceRoot);
+}
+
+async function markSessionAgentsIgnored(workspaceRoot: string): Promise<void> {
+  if (!isTrackedInGit("AGENTS.md", workspaceRoot)) {
+    return;
+  }
+
+  runGit(["update-index", "--skip-worktree", "--", "AGENTS.md"], workspaceRoot);
 }
 
 export async function prepareSessionWorkspace(args: {
@@ -202,7 +316,16 @@ export async function prepareSessionWorkspace(args: {
   const workspaceRoot = join(workspaceDir, "workspace");
 
   await rm(workspaceDir, { recursive: true, force: true });
-  await mkdir(workspaceRoot, { recursive: true });
+  await mkdir(workspaceDir, { recursive: true });
+
+  if (isGitRepository(projectRoot)) {
+    await cloneGitWorkspace({
+      projectRoot,
+      workspaceRoot
+    });
+  } else {
+    await mkdir(workspaceRoot, { recursive: true });
+  }
 
   const composedAgents = await writeSessionComposedAgentsFile({
     cwd: projectRoot,
@@ -219,19 +342,22 @@ export async function prepareSessionWorkspace(args: {
     throw new Error("failed to compose session AGENTS.md");
   }
 
-  await writeTextFile(join(workspaceRoot, "AGENTS.md"), composedContent);
-
   const entries = await readdir(projectRoot, { withFileTypes: true });
   await Promise.all(
     entries
       .filter((entry) => shouldLinkEntry(entry.name))
       .map(async (entry) => {
-        await linkEntry({
+        await mirrorWorkspaceEntry({
           sourcePath: join(projectRoot, entry.name),
           destinationPath: join(workspaceRoot, entry.name)
         });
       })
   );
+
+  await writeTextFile(join(workspaceRoot, "AGENTS.md"), composedContent);
+  if (isGitRepository(workspaceRoot)) {
+    await markSessionAgentsIgnored(workspaceRoot);
+  }
 
   const metadataPath = join(workspaceDir, "metadata.json");
   await writeLaunchWorkspaceMetadata(metadataPath, {

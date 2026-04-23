@@ -3,5 +3,11 @@ import test from "node:test";
 import { buildWorkerCodexArgs } from "./tmux-session.js";
 
 test("buildWorkerCodexArgs injects --yolo for tmux workers", () => {
-  assert.deepEqual(buildWorkerCodexArgs("hello"), ["codex", "--yolo", "--no-alt-screen", "hello"]);
+  assert.deepEqual(buildWorkerCodexArgs("hello"), [
+    "codex",
+    "--yolo",
+    "--full-auto",
+    "--no-alt-screen",
+    "hello"
+  ]);
 });

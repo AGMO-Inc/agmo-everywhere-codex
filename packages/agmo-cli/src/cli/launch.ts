@@ -34,7 +34,7 @@ function printLaunchHelp(): void {
   agmo launch cleanup [--all] [--older-than-hours <n>] [--include-active] [--stale]
 
 Launch Codex from an Agmo session workspace shadow root so the main session
-uses a session-scoped AGENTS.md while keeping runtime state anchored to the
+uses a session-scoped AGENTS.md inside a session-local Git sandbox while keeping runtime state anchored to the
 real project root.
 
 Notes:
