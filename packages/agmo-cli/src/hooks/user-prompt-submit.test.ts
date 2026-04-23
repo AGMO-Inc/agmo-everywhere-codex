@@ -19,3 +19,18 @@ test("detectWorkflowRoute keeps wisdom for synthesis-oriented doc asks", () => {
   assert.ok(route);
   assert.equal(route?.skill, "wisdom");
 });
+
+
+test("detectWorkflowRoute routes explicit $ralplan to the planning lane alias", () => {
+  const route = detectWorkflowRoute("$ralplan 인증 흐름 개편 계획 짜줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "ralplan");
+  assert.equal(route?.label, "plan");
+});
+
+test("detectWorkflowRoute prefers ralplan for consensus-style planning asks", () => {
+  const route = detectWorkflowRoute("합의형 계획으로 정리해줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "ralplan");
+  assert.equal(route?.label, "plan");
+});

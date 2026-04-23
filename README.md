@@ -77,6 +77,7 @@ Agmo's public workflow is:
 - `team`: escalate to durable tmux workers when one execution lane is no longer enough
 
 `design` remains available only as a compatibility alias that routes into `brainstorming`; it is not a separate public workflow stage.
+`ralplan` remains available as a compatibility alias that routes into the planning lane for a consensus-style, higher-trust planning pass; it is not a separate public workflow stage.
 
 ## Managed native agent roster
 

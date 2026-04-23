@@ -82,6 +82,14 @@ const EXPLICIT_ROUTE_OVERRIDES: Array<{
     }
   },
   {
+    pattern: /^\$?ralplan\b/i,
+    route: {
+      skill: "ralplan",
+      label: "plan",
+      reason: "explicit ralplan compatibility alias invocation"
+    }
+  },
+  {
     pattern: /^\$plan\b/i,
     route: {
       skill: "plan",
@@ -193,6 +201,19 @@ const ROUTES: Array<{
       { pattern: /\bdesign\b/i, score: 3 },
       { pattern: /브레인스토밍|아이디어|논의|초안/u, score: 5 },
       { pattern: /설계/u, score: 3 }
+    ]
+  },
+  {
+    route: {
+      skill: "ralplan",
+      label: "plan",
+      reason: "consensus-oriented planning request via compatibility alias"
+    },
+    patterns: [
+      { pattern: /\$?ralplan\b/i, score: 8 },
+      { pattern: /\b(?:consensus|high-trust)\b.*\bplan\b/i, score: 6 },
+      { pattern: /\bplan\b.*\b(?:consensus|high-trust)\b/i, score: 6 },
+      { pattern: /(?:합의형|컨센서스|고신뢰).*(?:플랜|계획)/u, score: 6 }
     ]
   },
   {
@@ -347,9 +368,17 @@ function buildWorkflowEnforcementContext(args: {
           "Keep implementation blocked, gather repo context first, and delegate the primary design exploration pass to agmo-planner or another read-only support lane before proposing execution."
         ];
       case "plan":
+      case "ralplan":
         return [
-          "Agmo runtime enforcement: planning stays in the planning lane.",
-          "Delegate the primary planning pass to agmo-planner, keep the leader as orchestrator, and do not start source-code implementation from this workflow."
+          route.skill === "ralplan"
+            ? "Agmo runtime enforcement: ralplan is a consensus-style compatibility alias that still stays in the planning lane."
+            : "Agmo runtime enforcement: planning stays in the planning lane.",
+          "Delegate the primary planning pass to agmo-planner, keep the leader as orchestrator, and do not start source-code implementation from this workflow.",
+          ...(route.skill === "ralplan"
+            ? [
+                "Raise the bar on assumptions, risks, non-goals, and verification path, and use agmo-architect/agmo-critic when the plan needs stronger boundary or challenge review."
+              ]
+            : [])
         ];
       case "plan-review":
         return [
