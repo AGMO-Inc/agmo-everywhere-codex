@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { AGMO_AGENT_DEFINITIONS, type AgmoAgentDefinition } from "./definitions.js";
@@ -13,7 +14,13 @@ export const MANAGED_PROMPT_MIRROR_FILES = new Set<string>([
 ]);
 
 export function promptSourcePath(fileName: string): string {
-  return join(agmoCliPackageRoot(), "src", "prompts", fileName);
+  const packageRoot = agmoCliPackageRoot();
+  const candidates = [
+    join(packageRoot, "src", "prompts", fileName),
+    join(packageRoot, "dist", "prompts", fileName)
+  ];
+
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
 }
 
 export function generateStandaloneAgentToml(input: {

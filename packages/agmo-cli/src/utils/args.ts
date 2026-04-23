@@ -1,6 +1,6 @@
 import type { InstallScope } from "./paths.js";
 
-export function parseScopeFlag(args: string[]): InstallScope {
+export function parseOptionalScopeFlag(args: string[]): InstallScope | null {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
 
@@ -20,6 +20,15 @@ export function parseScopeFlag(args: string[]): InstallScope {
     if (arg === "--scope=user") {
       return "user";
     }
+  }
+
+  return null;
+}
+
+export function parseScopeFlag(args: string[]): InstallScope {
+  const scope = parseOptionalScopeFlag(args);
+  if (scope) {
+    return scope;
   }
 
   return "project";

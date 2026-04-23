@@ -74,6 +74,13 @@ function formatCliError(error: unknown): string {
 function printHelp(): void {
   console.log(`Agmo CLI
 
+Setup:
+  agmo setup now installs both the Agmo runtime and the Codex plugin.
+  - Run \`agmo setup\` in an interactive terminal to choose:
+    - \`user\`    → install into ~/.codex and ~/.agmo
+    - \`project\` → install into <project>/.codex and <project>/.agmo
+  - In non-interactive environments, pass \`--scope user\` or \`--scope project\`.
+
 Usage:
   agmo setup [--scope user|project] [--force]
   agmo setup migrate-legacy [--scope user|project] [--delete]
@@ -122,6 +129,11 @@ Usage:
   agmo vault scaffold --type <type> --project <project> --title <title> [--schema <name>] [--template-file <path>]
   agmo vault create --type <type> --project <project> --title <title> [--schema <name>] [--template-file <path>] [--index]
   agmo vault save --type <type> --project <project> --title <title> --file <path> [--index]
+
+Examples:
+  agmo setup
+  agmo setup --scope user
+  agmo setup --scope project
 `);
 }
 

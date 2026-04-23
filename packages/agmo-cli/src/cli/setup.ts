@@ -1,16 +1,19 @@
 import os from "node:os";
+import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
-import { rename, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { syncAgents } from "./agents.js";
 import { syncManagedAgentsMd } from "../agents/agents-md.js";
 import { buildAgmoRuntimeConfig, loadAgentsTemplate } from "../config/generator.js";
 import { syncHooks } from "./hooks.js";
-import { hasFlag, parseScopeFlag } from "../utils/args.js";
+import { hasFlag, parseOptionalScopeFlag, parseScopeFlag } from "../utils/args.js";
 import { ensureDir, readTextFileIfExists, writeJsonFile } from "../utils/fs.js";
-import { resolveInstallPaths } from "../utils/paths.js";
+import { agmoCliPackageRoot, type InstallScope, resolveInstallPaths } from "../utils/paths.js";
 
 type LegacyRuntimeMigrationMode = "archive" | "delete";
+const AGMO_CODEX_PLUGIN_MARKETPLACE = "agmo-local";
+const AGMO_CODEX_PLUGIN_NAME = "agmo";
 
 export type LegacyRuntimeMigrationResult = {
   command: "setup migrate-legacy";
@@ -19,6 +22,40 @@ export type LegacyRuntimeMigrationResult = {
   source_path: string;
   status: "archived" | "deleted" | "skipped";
   archive_path: string | null;
+};
+
+export type SetupScopePrompt = () => Promise<InstallScope>;
+
+export type SetupScopeOptions = {
+  interactive?: boolean;
+  prompt?: SetupScopePrompt;
+};
+
+export type SetupScopeResolution = {
+  scope: InstallScope;
+  source: "explicit" | "prompt";
+};
+
+export type CodexPluginInstallResult = {
+  scope: InstallScope;
+  source: "packaged" | "generated";
+  plugin_name: string;
+  plugin_version: string;
+  plugin_key: string;
+  marketplace_name: string;
+  marketplace_root: string;
+  plugin_source_dir: string;
+  cache_dir: string;
+  config_file: string;
+};
+
+type CodexPluginManifest = {
+  name: string;
+  version: string;
+  description?: string;
+  skills?: string;
+  mcpServers?: string;
+  interface?: Record<string, unknown>;
 };
 
 async function readJsonFile<T>(path: string): Promise<T | null> {
@@ -45,6 +82,250 @@ export function resolveLegacyRuntimePaths(
   return {
     sourcePath: join(cwd, ".omx"),
     archiveRoot: join(cwd, ".agmo", "legacy", "omx")
+  };
+}
+
+function isInteractiveSetup(options?: SetupScopeOptions): boolean {
+  if (typeof options?.interactive === "boolean") {
+    return options.interactive;
+  }
+
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+export async function promptForSetupScope(): Promise<InstallScope> {
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  try {
+    process.stdout.write(
+      [
+        "Choose setup scope:",
+        "  1) user/global — install into ~/.codex and ~/.agmo",
+        "  2) project     — install into this project's .codex and .agmo"
+      ].join("\n") + "\n"
+    );
+
+    while (true) {
+      const answer = (await rl.question("Scope [user/project]: ")).trim().toLowerCase();
+
+      if (["1", "u", "user", "global"].includes(answer)) {
+        return "user";
+      }
+
+      if (["2", "p", "project", "local"].includes(answer)) {
+        return "project";
+      }
+
+      process.stdout.write("Please enter user/global or project.\n");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+export async function resolveSetupScope(
+  args: string[],
+  options?: SetupScopeOptions
+): Promise<SetupScopeResolution> {
+  const explicitScope = parseOptionalScopeFlag(args);
+  if (explicitScope) {
+    return {
+      scope: explicitScope,
+      source: "explicit"
+    };
+  }
+
+  if (!isInteractiveSetup(options)) {
+    throw new Error("Missing --scope user|project. Run interactively to choose a scope.");
+  }
+
+  const prompt = options?.prompt ?? promptForSetupScope;
+  return {
+    scope: await prompt(),
+    source: "prompt"
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripTomlTable(content: string, tableName: string): string {
+  const pattern = new RegExp(
+    `(?:^|\\n)\\[${escapeRegExp(tableName)}\\]\\n(?:.*\\n)*?(?=(?:\\n\\[)|$)`,
+    "g"
+  );
+
+  return content.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+}
+
+function appendTomlTable(content: string, tableName: string, body: string): string {
+  const cleaned = stripTomlTable(content, tableName).trimEnd();
+  const prefix = cleaned.length > 0 ? `${cleaned}\n\n` : "";
+  return `${prefix}[${tableName}]\n${body.trimEnd()}\n`;
+}
+
+function buildFallbackPluginManifest(version: string): CodexPluginManifest {
+  return {
+    name: AGMO_CODEX_PLUGIN_NAME,
+    version,
+    description: "Codex-native workflow and knowledge plugin for Agmo",
+    skills: "./skills/",
+    mcpServers: "./.mcp.json",
+    interface: {
+      label: "Agmo"
+    }
+  };
+}
+
+async function resolveBundledPluginTemplate(): Promise<{
+  source: "packaged" | "generated";
+  manifest: CodexPluginManifest;
+  packageRoot: string | null;
+}> {
+  const packageRoots = [
+    join(agmoCliPackageRoot(), "dist", "plugin"),
+    join(agmoCliPackageRoot(), "..", "agmo-plugin")
+  ];
+
+  for (const packageRoot of packageRoots) {
+    const manifestPath = join(packageRoot, ".codex-plugin", "plugin.json");
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as CodexPluginManifest;
+      return {
+        source: "packaged",
+        manifest,
+        packageRoot
+      };
+    }
+  }
+
+  const cliPackage = await readJsonFile<{ version?: string }>(join(agmoCliPackageRoot(), "package.json"));
+  return {
+    source: "generated",
+    manifest: buildFallbackPluginManifest(cliPackage?.version ?? "0.1.0"),
+    packageRoot: null
+  };
+}
+
+async function writeGeneratedPluginBundle(
+  pluginDir: string,
+  manifest: CodexPluginManifest
+): Promise<void> {
+  await ensureDir(join(pluginDir, ".codex-plugin"));
+  await ensureDir(join(pluginDir, "skills"));
+  await ensureDir(join(pluginDir, "assets"));
+  await writeFile(join(pluginDir, ".codex-plugin", "plugin.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeFile(
+    join(pluginDir, ".mcp.json"),
+    `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`
+  );
+}
+
+async function writeMarketplaceManifest(
+  marketplaceRoot: string,
+  pluginName: string
+): Promise<void> {
+  const marketplaceManifest = {
+    name: AGMO_CODEX_PLUGIN_MARKETPLACE,
+    plugins: [
+      {
+        name: pluginName,
+        source: {
+          source: "local",
+          path: `./plugins/${pluginName}`
+        },
+        policy: {
+          installation: "AVAILABLE"
+        }
+      }
+    ]
+  };
+
+  await ensureDir(join(marketplaceRoot, ".agents", "plugins"));
+  await writeFile(
+    join(marketplaceRoot, ".agents", "plugins", "marketplace.json"),
+    `${JSON.stringify(marketplaceManifest, null, 2)}\n`
+  );
+}
+
+async function writeScopedCodexPluginConfig(args: {
+  configPath: string;
+  marketplaceRoot: string;
+  pluginKey: string;
+}): Promise<void> {
+  const existing = (await readTextFileIfExists(args.configPath)) ?? "";
+  let next = appendTomlTable(
+    existing,
+    `marketplaces.${AGMO_CODEX_PLUGIN_MARKETPLACE}`,
+    [
+      `last_updated = ${JSON.stringify(new Date().toISOString())}`,
+      'source_type = "local"',
+      `source = ${JSON.stringify(args.marketplaceRoot)}`
+    ].join("\n")
+  );
+
+  next = appendTomlTable(
+    next,
+    `plugins.${JSON.stringify(args.pluginKey)}`,
+    'enabled = true'
+  );
+
+  await ensureDir(dirname(args.configPath));
+  await writeFile(args.configPath, next);
+}
+
+export async function installScopedCodexPlugin(
+  scope: InstallScope,
+  cwd = process.cwd()
+): Promise<CodexPluginInstallResult> {
+  const paths = resolveInstallPaths(scope, cwd);
+  const template = await resolveBundledPluginTemplate();
+  const pluginName = template.manifest.name || AGMO_CODEX_PLUGIN_NAME;
+  const marketplaceRoot = join(paths.codexDir, "plugins", "marketplaces", AGMO_CODEX_PLUGIN_MARKETPLACE);
+  const pluginSourceDir = join(marketplaceRoot, "plugins", pluginName);
+  const pluginCacheRoot = join(paths.codexDir, "plugins", "cache", AGMO_CODEX_PLUGIN_MARKETPLACE, pluginName);
+
+  await rm(pluginSourceDir, { recursive: true, force: true });
+  await ensureDir(join(marketplaceRoot, "plugins"));
+  if (template.packageRoot) {
+    await cp(template.packageRoot, pluginSourceDir, { recursive: true });
+  } else {
+    await writeGeneratedPluginBundle(pluginSourceDir, template.manifest);
+  }
+
+  const manifest = JSON.parse(
+    await readFile(join(pluginSourceDir, ".codex-plugin", "plugin.json"), "utf-8")
+  ) as CodexPluginManifest;
+  const pluginVersion = manifest.version;
+  const cacheDir = join(pluginCacheRoot, pluginVersion);
+  const pluginKey = `${pluginName}@${AGMO_CODEX_PLUGIN_MARKETPLACE}`;
+  const configFile = join(paths.codexDir, "config.toml");
+
+  await rm(pluginCacheRoot, { recursive: true, force: true });
+  await ensureDir(pluginCacheRoot);
+  await cp(pluginSourceDir, cacheDir, { recursive: true });
+  await writeMarketplaceManifest(marketplaceRoot, pluginName);
+  await writeScopedCodexPluginConfig({
+    configPath: configFile,
+    marketplaceRoot,
+    pluginKey
+  });
+
+  return {
+    scope,
+    source: template.source,
+    plugin_name: pluginName,
+    plugin_version: pluginVersion,
+    plugin_key: pluginKey,
+    marketplace_name: AGMO_CODEX_PLUGIN_MARKETPLACE,
+    marketplace_root: marketplaceRoot,
+    plugin_source_dir: pluginSourceDir,
+    cache_dir: cacheDir,
+    config_file: configFile
   };
 }
 
@@ -116,12 +397,14 @@ export async function runSetupCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const scope = parseScopeFlag(args);
+  const scopeResolution = await resolveSetupScope(args);
+  const scope = scopeResolution.scope;
   const force = hasFlag(args, "--force");
   const paths = resolveInstallPaths(scope);
 
   const agentSummary = await syncAgents(scope);
   const hookSummary = await syncHooks(scope);
+  const pluginSummary = await installScopedCodexPlugin(scope);
 
   const agentsTemplate = await loadAgentsTemplate();
 
@@ -182,10 +465,12 @@ export async function runSetupCommand(args: string[]): Promise<void> {
       {
         command: "setup",
         scope,
+        scope_source: scopeResolution.source,
         force,
         outputs: {
           agents: agentSummary,
           hooks: hookSummary,
+          plugin: pluginSummary,
           agents_md: agentsMdResult,
           agmo_config: configResult
         },

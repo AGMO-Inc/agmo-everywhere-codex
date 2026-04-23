@@ -5,6 +5,65 @@ Codex-native rebuild of Agmo with a split architecture:
 - `packages/agmo-plugin`: reusable Codex plugin surface
 - `packages/agmo-cli`: npm runtime for setup, hooks, agents, and team orchestration
 
+## Installation and setup
+
+Agmo is designed to be installed as a CLI package and then activated with `agmo setup`.
+
+### 1. Install the CLI
+
+```bash
+npm install -g agmo
+```
+
+### 2. Run setup
+
+```bash
+agmo setup
+```
+
+When you run `agmo setup` in an interactive terminal, Agmo now asks which scope you want:
+
+- `user` / `global`
+  - installs into `~/.codex` and `~/.agmo`
+  - good when you want Agmo available across all local projects
+- `project`
+  - installs into `<project>/.codex` and `<project>/.agmo`
+  - good when you want the setup isolated to one repository
+
+Setup applies the chosen scope to both parts of the product:
+
+- the **Agmo CLI runtime** setup
+  - managed agents
+  - hooks
+  - `AGENTS.md`
+  - `.agmo/config.json`
+- the **Codex plugin** setup
+  - plugin marketplace files
+  - plugin cache/install bundle
+  - plugin activation in the scoped `.codex/config.toml`
+
+### Explicit scope examples
+
+If you already know the target scope, you can skip the prompt:
+
+```bash
+agmo setup --scope user
+agmo setup --scope project
+```
+
+### Non-interactive environments
+
+In CI, scripts, or any non-interactive shell, `agmo setup` cannot ask the question for you.
+In those cases, pass the scope explicitly:
+
+```bash
+agmo setup --scope user
+# or
+agmo setup --scope project
+```
+
+If you omit `--scope` outside an interactive terminal, Agmo exits with an error instead of guessing.
+
 ## Recommended workflow surface
 
 Agmo's public workflow is:
