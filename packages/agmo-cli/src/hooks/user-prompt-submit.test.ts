@@ -34,3 +34,46 @@ test("detectWorkflowRoute prefers ralplan for consensus-style planning asks", ()
   assert.equal(route?.skill, "ralplan");
   assert.equal(route?.label, "plan");
 });
+
+
+test("detectWorkflowRoute routes explicit $ralph to completion-gated execute", () => {
+  const route = detectWorkflowRoute("$ralph 결제 에러 수정 끝까지 진행해줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "ralph");
+  assert.equal(route?.label, "execute");
+});
+
+test("detectWorkflowRoute prefers ralph for completion-gated execution asks", () => {
+  const route = detectWorkflowRoute("검증 통과할 때까지 구현해줘", null);
+  assert.ok(route);
+  assert.equal(route?.skill, "ralph");
+  assert.equal(route?.label, "execute");
+});
+
+test("detectWorkflowRoute keeps canonical plan on continuation prompts", () => {
+  const route = detectWorkflowRoute("continue", {
+    version: 1,
+    session_id: "s1",
+    active: true,
+    last_event: "UserPromptSubmit",
+    workflow: "plan",
+    updated_at: new Date(0).toISOString()
+  });
+  assert.ok(route);
+  assert.equal(route?.skill, "plan");
+  assert.equal(route?.label, "plan");
+});
+
+test("detectWorkflowRoute keeps canonical execute on continuation prompts", () => {
+  const route = detectWorkflowRoute("continue", {
+    version: 1,
+    session_id: "s2",
+    active: true,
+    last_event: "UserPromptSubmit",
+    workflow: "execute",
+    updated_at: new Date(0).toISOString()
+  });
+  assert.ok(route);
+  assert.equal(route?.skill, "execute");
+  assert.equal(route?.label, "execute");
+});

@@ -17,9 +17,14 @@ The main session should:
 4. hand the primary coding lane to `agmo-executor`
 5. keep integration and scope control in the leader
 6. pull `agmo-verifier` for proof before claiming completion
+7. if proof fails or remains incomplete, keep the fix -> re-verify loop running until the task passes or a real blocker is identified
 
 ## Expectations
 
 - keep changes incremental
 - verify before reporting done
 - escalate to `team` only when one execution lane is not enough
+
+## Compatibility alias
+
+`ralph` remains available as a compatibility alias for users who want a stricter completion gate on top of `execute` semantics. The canonical workflow name is still `execute`.

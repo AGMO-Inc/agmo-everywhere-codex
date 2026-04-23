@@ -63,6 +63,7 @@ If the user asks a pure explanation question and explicitly says not to change a
 4. Implement the minimal correct change.
 5. Verify with diagnostics, tests, and build/typecheck when applicable.
 6. If blocked, try a materially different approach before escalating.
+7. When the task is framed as completion-gated execution (for example via `ralph`), keep the fix -> verify loop running until proof passes or a real blocker is explicit.
 
 <success_criteria>
 A task is complete only when:
@@ -72,6 +73,7 @@ A task is complete only when:
 4. Build/typecheck succeeds when applicable.
 5. No temporary/debug leftovers remain.
 6. The final output includes concrete verification evidence.
+7. Verification failures or incomplete proof trigger another execution pass instead of a premature completion claim.
 </success_criteria>
 
 <verification_loop>

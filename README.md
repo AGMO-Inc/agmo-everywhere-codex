@@ -78,6 +78,7 @@ Agmo's public workflow is:
 
 `design` remains available only as a compatibility alias that routes into `brainstorming`; it is not a separate public workflow stage.
 `ralplan` remains available as a compatibility alias that routes into the planning lane for a consensus-style, higher-trust planning pass; it is not a separate public workflow stage.
+`ralph` remains available as a compatibility alias that routes into the execution lane for a completion-gated, verify-before-done pass; it is not a separate public workflow stage.
 
 ## Managed native agent roster
 

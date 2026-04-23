@@ -20,3 +20,4 @@ Use this when the leader should stay in-session while durable worker lanes handl
 - independent implementation / verification lanes
 - long-running coordinated work
 - worktree-backed execution and later integration
+- separate implementation and verification lanes for completion-gated execution (`ralph`/strict `execute`)

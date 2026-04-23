@@ -98,6 +98,14 @@ const EXPLICIT_ROUTE_OVERRIDES: Array<{
     }
   },
   {
+    pattern: /^\$?ralph\b/i,
+    route: {
+      skill: "ralph",
+      label: "execute",
+      reason: "explicit ralph compatibility alias invocation"
+    }
+  },
+  {
     pattern: /^\$execute\b/i,
     route: {
       skill: "execute",
@@ -233,6 +241,19 @@ const ROUTES: Array<{
   },
   {
     route: {
+      skill: "ralph",
+      label: "execute",
+      reason: "completion-gated execution request via compatibility alias"
+    },
+    patterns: [
+      { pattern: /\$?ralph\b/i, score: 8 },
+      { pattern: /\b(?:keep going until done|don't stop until|until done|fully complete)\b/i, score: 6 },
+      { pattern: /\bfinish this\b.*\b(?:fully|completely)\b/i, score: 5 },
+      { pattern: /(?:끝까지|완료될 때까지|검증 통과할 때까지).*(?:해|해줘|진행|수정|구현)/u, score: 6 }
+    ]
+  },
+  {
+    route: {
       skill: "execute",
       label: "execute",
       reason: "implementation-oriented request"
@@ -254,7 +275,13 @@ function routeForWorkflowLabel(workflow: string | undefined): WorkflowRoute | nu
     return null;
   }
 
-  return ROUTES.find((candidate) => candidate.route.label === workflow)?.route ?? null;
+  return (
+    ROUTES.find((candidate) => candidate.route.skill === workflow)?.route ??
+    ROUTES.find((candidate) => candidate.route.label === workflow && candidate.route.skill === workflow)
+      ?.route ??
+    ROUTES.find((candidate) => candidate.route.label === workflow)?.route ??
+    null
+  );
 }
 
 function scoreRoute(prompt: string, patterns: ScoredPattern[]): number {
@@ -386,9 +413,17 @@ function buildWorkflowEnforcementContext(args: {
           "Hand the critique/approval pass to agmo-verifier (optionally with agmo-planner for revisions) and keep the result as a planning-lane verdict: approve, revise, or reject."
         ];
       case "execute":
+      case "ralph":
         return [
-          "Agmo runtime enforcement: execute keeps the leader in orchestrator mode.",
-          "Delegate the primary coding lane to agmo-executor, keep local work limited to narrow orchestration/integration/fixup steps, and pull agmo-verifier or equivalent concrete proof before claiming completion."
+          route.skill === "ralph"
+            ? "Agmo runtime enforcement: ralph is a compatibility alias for execute with a stricter completion gate."
+            : "Agmo runtime enforcement: execute keeps the leader in orchestrator mode.",
+          "Delegate the primary coding lane to agmo-executor, keep local work limited to narrow orchestration/integration/fixup steps, and pull agmo-verifier or equivalent concrete proof before claiming completion.",
+          ...(route.skill === "ralph"
+            ? [
+                "Do not stop at first implementation. If verification fails or remains incomplete, fix the issue, re-run proof, and escalate to team only when separate implementation and verification lanes are justified."
+              ]
+            : [])
         ];
       case "verify":
         return [
