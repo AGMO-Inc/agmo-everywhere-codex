@@ -4,7 +4,31 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { installScopedCodexPlugin, resolveSetupScope } from "./setup.js";
+import { buildSetupVaultNotice, installScopedCodexPlugin, resolveSetupScope } from "./setup.js";
+
+async function withIsolatedHome<T>(run: (home: string) => Promise<T>): Promise<T> {
+  const previousHome = process.env.HOME;
+  const previousVaultRoot = process.env.AGMO_VAULT_ROOT;
+  const home = await mkdtemp(join(os.tmpdir(), "agmo-setup-home-"));
+  process.env.HOME = home;
+  delete process.env.AGMO_VAULT_ROOT;
+
+  try {
+    return await run(home);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+
+    if (previousVaultRoot === undefined) {
+      delete process.env.AGMO_VAULT_ROOT;
+    } else {
+      process.env.AGMO_VAULT_ROOT = previousVaultRoot;
+    }
+  }
+}
 
 test("resolveSetupScope prompts when setup scope is omitted in an interactive terminal", async () => {
   let promptCalls = 0;
@@ -102,4 +126,39 @@ trust_level = "trusted"
   const config = await readFile(configPath, "utf8");
   assert.match(config, /\[tui\]\nstatus_line = \["custom-status", "branch"\]\ntheme = "amber"/);
   assert.doesNotMatch(config, /model-with-reasoning", "current-dir", "context-usage"/);
+});
+
+test("buildSetupVaultNotice prompts for vault root when no config exists", async () => {
+  await withIsolatedHome(async () => {
+    const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-setup-vault-empty-"));
+    const notice = await buildSetupVaultNotice("project", tempProject);
+
+    assert.equal(notice.configured, false);
+    assert.equal(notice.source, "none");
+    assert.equal(notice.vault_root, null);
+    assert.equal(
+      notice.configure_command,
+      'agmo vault config set-root "/path/to/obsidian/vault" --scope project'
+    );
+    assert.match(notice.note, /Vault is not configured yet/);
+  });
+});
+
+test("buildSetupVaultNotice reports an existing project vault root", async () => {
+  await withIsolatedHome(async () => {
+    const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-setup-vault-project-"));
+    const vaultRoot = join(tempProject, "obsidian-vault");
+    mkdirSync(join(tempProject, ".agmo"), { recursive: true });
+    writeFileSync(
+      join(tempProject, ".agmo", "config.json"),
+      `${JSON.stringify({ vault_root: vaultRoot }, null, 2)}\n`
+    );
+
+    const notice = await buildSetupVaultNotice("project", tempProject);
+
+    assert.equal(notice.configured, true);
+    assert.equal(notice.source, "project");
+    assert.equal(notice.vault_root, vaultRoot);
+    assert.equal(notice.note, "Vault is configured from project.");
+  });
 });

@@ -66,6 +66,8 @@ agmo setup
   - MCP placeholders
   - scoped activation in `.codex/config.toml`
 
+The setup output also reports vault status. If no vault is configured yet, run the suggested `agmo vault config set-root ...` command before relying on wisdom or note persistence.
+
 ### Choose the install scope
 
 ```bash
@@ -75,6 +77,24 @@ agmo setup --scope project
 
 - `user`: installs into `~/.codex` and `~/.agmo`
 - `project`: installs into `<repo>/.codex` and `<repo>/.agmo`
+
+### Configure the Obsidian vault
+
+Vault-backed wisdom is optional, but recommended. Agmo does not hardcode a machine-specific vault path during plugin installation.
+
+For one project:
+
+```bash
+agmo vault config set-root "/path/to/obsidian/vault" --scope project
+agmo vault config show
+```
+
+For a user-wide default:
+
+```bash
+agmo vault config set-root "/path/to/obsidian/vault" --scope user
+agmo vault config show
+```
 
 ### Launch a session
 
@@ -247,6 +267,8 @@ Agmo includes a built-in vault surface so durable notes do not depend on ad-hoc 
 agmo vault config set-root "/path/to/obsidian/vault" --scope project
 agmo vault config show
 ```
+
+Use `--scope project` for a repository-specific vault, or `--scope user` for a default shared by Agmo workspaces on the same machine. The selected path is stored in `.agmo/config.json` for project scope or `~/.agmo/config.json` for user scope.
 
 Vault root resolution order:
 

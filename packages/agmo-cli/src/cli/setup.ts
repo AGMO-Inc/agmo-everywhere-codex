@@ -9,6 +9,7 @@ import { syncHooks } from "./hooks.js";
 import { hasFlag, parseOptionalScopeFlag, parseScopeFlag } from "../utils/args.js";
 import { ensureDir, readTextFileIfExists, writeJsonFile } from "../utils/fs.js";
 import { agmoCliPackageRoot, type InstallScope, resolveInstallPaths } from "../utils/paths.js";
+import { resolveVaultRoot } from "../vault/runtime.js";
 
 const AGMO_CODEX_PLUGIN_MARKETPLACE = "agmo-local";
 const AGMO_CODEX_PLUGIN_NAME = "agmo";
@@ -38,6 +39,16 @@ export type CodexPluginInstallResult = {
   plugin_source_dir: string;
   cache_dir: string;
   config_file: string;
+};
+
+export type SetupVaultNotice = {
+  configured: boolean;
+  source: "env" | "project" | "user" | "none";
+  vault_root: string | null;
+  resolution_order: string[];
+  configure_command: string;
+  verify_command: string;
+  note: string;
 };
 
 type CodexPluginManifest = {
@@ -324,6 +335,30 @@ async function writeScopedCodexPluginConfig(args: {
   await writeFile(args.configPath, next);
 }
 
+export async function buildSetupVaultNotice(
+  scope: InstallScope,
+  cwd = process.cwd()
+): Promise<SetupVaultNotice> {
+  const vault = await resolveVaultRoot(cwd);
+  const configureCommand = `agmo vault config set-root "/path/to/obsidian/vault" --scope ${scope}`;
+
+  return {
+    configured: Boolean(vault.vault_root),
+    source: vault.source,
+    vault_root: vault.vault_root,
+    resolution_order: [
+      "AGMO_VAULT_ROOT",
+      "project .agmo/config.json",
+      "user ~/.agmo/config.json"
+    ],
+    configure_command: configureCommand,
+    verify_command: "agmo vault config show",
+    note: vault.vault_root
+      ? `Vault is configured from ${vault.source}.`
+      : `Vault is not configured yet. Run ${configureCommand} to enable vault-backed wisdom.`
+  };
+}
+
 export async function installScopedCodexPlugin(
   scope: InstallScope,
   cwd = process.cwd()
@@ -438,6 +473,7 @@ export async function runSetupCommand(args: string[]): Promise<void> {
       }
     }
   );
+  const vaultNotice = await buildSetupVaultNotice(scope, paths.projectRoot);
 
   console.log(
     JSON.stringify(
@@ -451,8 +487,14 @@ export async function runSetupCommand(args: string[]): Promise<void> {
           hooks: hookSummary,
           plugin: pluginSummary,
           agents_md: agentsMdResult,
-          agmo_config: configResult
+          agmo_config: configResult,
+          vault: vaultNotice
         },
+        next_steps: [
+          vaultNotice.configured ? vaultNotice.note : vaultNotice.configure_command,
+          vaultNotice.verify_command,
+          "agmo launch"
+        ],
         ensured_directories: createdDirs,
         paths: {
           codex_dir: paths.codexDir,
