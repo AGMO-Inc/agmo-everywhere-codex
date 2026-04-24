@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "agmo_vault": {
-      "description": "[TODO: define Obsidian/vault MCP server wiring]"
+      "description": "[TODO: define Agmo vault/knowledge MCP server wiring. GitHub workflows intentionally use the gh CLI, not MCP.]"
     }
   }
 }

@@ -27,6 +27,7 @@ Before mutating git state, verify:
 
 ## GitHub auth lane
 
+- GitHub operations in this skill use the `gh` CLI, not a GitHub MCP server
 - prefer token-based auth for GitHub automation and repo mutation work
 - prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
 - verify auth with `gh auth status` before PR work or other GitHub mutations

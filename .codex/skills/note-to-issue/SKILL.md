@@ -29,6 +29,7 @@ Prefer resolving vault location through `agmo vault config show` or `AGMO_VAULT_
 
 ## GitHub auth lane
 
+- GitHub operations in this skill use the `gh` CLI, not a GitHub MCP server
 - prefer token-based auth for GitHub issue and project mutations
 - prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
 - never open interactive `gh auth login` when a token environment variable is already available
