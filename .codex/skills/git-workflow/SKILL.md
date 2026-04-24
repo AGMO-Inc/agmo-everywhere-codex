@@ -28,16 +28,15 @@ Before mutating git state, verify:
 ## GitHub auth lane
 
 - GitHub operations in this skill use the `gh` CLI, not a GitHub MCP server
-- prefer token-based auth for GitHub automation and repo mutation work
-- prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
-- before push, PR, or other GitHub mutations, check for the token environment variable without printing the token value
-- when a token environment variable is present, use that token-backed `gh`/git path and do not fall back to macOS Keychain or another existing credential helper
-- verify token-backed auth with `gh auth status` before PR work or other GitHub mutations
-- for GitHub HTTPS git operations, prefer `gh auth setup-git` or another token-backed non-interactive credential path that runs under the same token environment
+- treat `gh` API operations and `git push` authentication as separate checks
+- for `gh` operations such as PRs, issues, projects, and API calls, prefer `GH_TOKEN`, then `GITHUB_TOKEN`; use the enterprise token variants when the target host requires them
+- verify `gh` auth with `gh auth status` before PR, issue, project, or API mutations
+- for `git push`, inspect `git remote -v` first; if the remote is SSH or a trusted SSH host alias such as `github-agmo`, use that non-interactive SSH path after verifying it with `ssh -T` or `git ls-remote`
+- if the remote is HTTPS, prefer a token-backed path such as `GH_TOKEN` / `GITHUB_TOKEN` plus `gh auth setup-git`
 - never open interactive `gh auth login` or browser/device flows when a token environment variable is already available
 - never persist tokens into tracked files, commit contents, or remote URLs; keep them in process environment or other non-tracked credential storage only
-- treat existing Keychain or credential-helper auth as an explicit fallback only when no token environment variable is available
-- if neither token env nor an explicitly accepted non-interactive fallback is available, stop at the exact blocker and report the missing prerequisite
+- treat macOS Keychain or generic credential-helper auth as an explicit fallback only after token env and verified SSH alias paths are unavailable
+- if no non-interactive token or SSH path is available, stop at the exact blocker and report the missing prerequisite
 - when the runtime asks for command approval, request a reusable command prefix for the specific git/gh operation so later commit, push, and PR steps do not repeatedly interrupt the user
 
 ## Commit lane
