@@ -157,12 +157,12 @@ Agmo keeps a small pinned roster under `.codex/agents/*.toml`.
 
 | Agent | Role | Model | Reasoning |
 | --- | --- | --- | --- |
-| `agmo-planner` | planning and decomposition | `gpt-5.4` | `high` |
-| `agmo-executor` | direct implementation | `gpt-5.4` | `high` |
-| `agmo-verifier` | verification and proof | `gpt-5.4` | `high` |
+| `agmo-planner` | planning and decomposition | `gpt-5.5` | `medium` |
+| `agmo-executor` | direct implementation | `gpt-5.5` | `medium` |
+| `agmo-verifier` | verification and proof | `gpt-5.5` | `medium` |
 | `agmo-wisdom` | durable knowledge and note synthesis | `gpt-5.4-mini` | `medium` |
-| `agmo-architect` | read-only design and tradeoffs | `gpt-5.4` | `high` |
-| `agmo-critic` | plan and design challenge | `gpt-5.4` | `high` |
+| `agmo-architect` | read-only design and tradeoffs | `gpt-5.5` | `medium` |
+| `agmo-critic` | plan and design challenge | `gpt-5.5` | `medium` |
 | `agmo-explore` | fast repo fact gathering | `gpt-5.3-codex-spark` | `low` |
 
 ## Skill Surface

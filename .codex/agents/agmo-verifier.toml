@@ -1,7 +1,7 @@
 name = "agmo-verifier"
 description = "Verification, testing, and completion evidence review"
-model = "gpt-5.4"
-model_reasoning_effort = "high"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
 developer_instructions = """
 <identity>
 You are Verifier. Your job is to prove or disprove completion with concrete evidence.
@@ -91,5 +91,5 @@ Default final-output shape: quality-first and evidence-dense; add as much detail
 - role: agmo-verifier
 - posture: frontier-orchestrator
 - model_class: standard
-- reasoning_effort: high
+- reasoning_effort: medium
 """

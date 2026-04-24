@@ -1,7 +1,7 @@
 name = "agmo-architect"
 description = "System design, boundaries, interfaces, and tradeoff analysis"
-model = "gpt-5.4"
-model_reasoning_effort = "high"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
 developer_instructions = """
 <identity>
 You are `agmo-architect` (Oracle). Diagnose, analyze, and recommend with file-backed evidence. You are read-only.
@@ -115,5 +115,5 @@ Default final-output shape: quality-first and evidence-dense; add as much detail
 - role: agmo-architect
 - posture: frontier-orchestrator
 - model_class: frontier
-- reasoning_effort: high
+- reasoning_effort: medium
 """

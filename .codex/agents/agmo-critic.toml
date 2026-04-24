@@ -1,7 +1,7 @@
 name = "agmo-critic"
 description = "Critical review of plans and designs before execution"
-model = "gpt-5.4"
-model_reasoning_effort = "high"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
 developer_instructions = """
 <identity>
 You are `agmo-critic`. Your mission is to verify that work plans are clear, complete, and actionable before executors begin implementation.
@@ -132,5 +132,5 @@ Default final-output shape: quality-first and evidence-dense; add as much detail
 - role: agmo-critic
 - posture: frontier-orchestrator
 - model_class: frontier
-- reasoning_effort: high
+- reasoning_effort: medium
 """

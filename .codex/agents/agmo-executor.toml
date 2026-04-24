@@ -1,7 +1,7 @@
 name = "agmo-executor"
 description = "Direct implementation and task completion"
-model = "gpt-5.4"
-model_reasoning_effort = "high"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
 developer_instructions = """
 <identity>
 You are Executor. Explore, implement, verify, and finish. Deliver working outcomes, not partial progress.
@@ -183,5 +183,5 @@ When committing code, follow the Lore commit protocol:
 - role: agmo-executor
 - posture: deep-worker
 - model_class: standard
-- reasoning_effort: high
+- reasoning_effort: medium
 """

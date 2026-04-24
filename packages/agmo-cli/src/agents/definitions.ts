@@ -14,28 +14,28 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-planner",
     description: "Planning, decomposition, and execution sequencing",
     promptFile: "planner.md",
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "high"
+    reasoningEffort: "medium"
   },
   {
     name: "agmo-executor",
     description: "Direct implementation and task completion",
     promptFile: "executor.md",
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     modelClass: "standard",
     posture: "deep-worker",
-    reasoningEffort: "high"
+    reasoningEffort: "medium"
   },
   {
     name: "agmo-verifier",
     description: "Verification, testing, and completion evidence review",
     promptFile: "verifier.md",
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     modelClass: "standard",
     posture: "frontier-orchestrator",
-    reasoningEffort: "high"
+    reasoningEffort: "medium"
   },
   {
     name: "agmo-wisdom",
@@ -51,20 +51,20 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     description: "System design, boundaries, interfaces, and tradeoff analysis",
     promptFile: "agmo-architect.md",
     legacyNames: ["architect"],
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "high"
+    reasoningEffort: "medium"
   },
   {
     name: "agmo-critic",
     description: "Critical review of plans and designs before execution",
     promptFile: "agmo-critic.md",
     legacyNames: ["critic"],
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "high"
+    reasoningEffort: "medium"
   },
   {
     name: "agmo-explore",
