@@ -1,10 +1,12 @@
 import { readTextFileIfExists, writeJsonFile } from "../utils/fs.js";
 import { resolveInstallPaths, type InstallScope } from "../utils/paths.js";
+import { normalizeCodexAutonomyMode, type CodexAutonomyMode } from "../utils/codex.js";
 
 export type AgmoLaunchPolicyConfig = {
   default_cleanup_older_than_hours?: number;
   heartbeat_stale_after_ms?: number;
   heartbeat_interval_ms?: number;
+  autonomy_mode?: CodexAutonomyMode;
 };
 
 export type AgmoSessionStartPolicyConfig = {
@@ -45,7 +47,8 @@ export type AgmoRuntimeConfig = {
 export const DEFAULT_AGMO_LAUNCH_POLICY: Required<AgmoLaunchPolicyConfig> = {
   default_cleanup_older_than_hours: 24,
   heartbeat_stale_after_ms: 2 * 60 * 1000,
-  heartbeat_interval_ms: 30 * 1000
+  heartbeat_interval_ms: 30 * 1000,
+  autonomy_mode: "full-auto"
 };
 
 export const DEFAULT_AGMO_SESSION_START_POLICY: Required<AgmoSessionStartPolicyConfig> = {
@@ -198,6 +201,7 @@ export async function resolveLaunchPolicy(cwd = process.cwd()): Promise<{
       default_cleanup_older_than_hours: "project" | "user" | "default";
       heartbeat_stale_after_ms: "project" | "user" | "default";
       heartbeat_interval_ms: "project" | "user" | "default";
+      autonomy_mode: "project" | "user" | "default";
     };
   };
 }> {
@@ -225,6 +229,8 @@ export async function resolveLaunchPolicy(cwd = process.cwd()): Promise<{
   const userHeartbeatInterval = normalizeNonNegativeNumber(
     userLaunch.heartbeat_interval_ms
   );
+  const projectAutonomyMode = normalizeCodexAutonomyMode(projectLaunch.autonomy_mode);
+  const userAutonomyMode = normalizeCodexAutonomyMode(userLaunch.autonomy_mode);
 
   return {
     policy: {
@@ -239,7 +245,11 @@ export async function resolveLaunchPolicy(cwd = process.cwd()): Promise<{
       heartbeat_interval_ms:
         projectHeartbeatInterval ??
         userHeartbeatInterval ??
-        DEFAULT_AGMO_LAUNCH_POLICY.heartbeat_interval_ms
+        DEFAULT_AGMO_LAUNCH_POLICY.heartbeat_interval_ms,
+      autonomy_mode:
+        projectAutonomyMode ??
+        userAutonomyMode ??
+        DEFAULT_AGMO_LAUNCH_POLICY.autonomy_mode
     },
     sources: {
       project_config_path: projectConfigPath,
@@ -261,6 +271,12 @@ export async function resolveLaunchPolicy(cwd = process.cwd()): Promise<{
           projectHeartbeatInterval !== undefined
             ? "project"
             : userHeartbeatInterval !== undefined
+              ? "user"
+              : "default",
+        autonomy_mode:
+          projectAutonomyMode !== undefined
+            ? "project"
+            : userAutonomyMode !== undefined
               ? "user"
               : "default"
       }
@@ -601,13 +617,13 @@ export async function resolveVaultAutosavePolicy(cwd = process.cwd()): Promise<{
 
 export async function setLaunchPolicyValue(args: {
   key: keyof Required<AgmoLaunchPolicyConfig>;
-  value: number;
+  value: number | CodexAutonomyMode;
   scope: InstallScope;
   cwd?: string;
 }): Promise<{
   scope: InstallScope;
   key: keyof Required<AgmoLaunchPolicyConfig>;
-  value: number;
+  value: number | CodexAutonomyMode;
   config_path: string;
 }> {
   const cwd = args.cwd ?? process.cwd();

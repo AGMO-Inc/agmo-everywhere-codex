@@ -50,6 +50,7 @@ export function buildAgmoRuntimeConfig(
       heartbeat_stale_after_ms:
         DEFAULT_AGMO_LAUNCH_POLICY.heartbeat_stale_after_ms,
       heartbeat_interval_ms: DEFAULT_AGMO_LAUNCH_POLICY.heartbeat_interval_ms,
+      autonomy_mode: DEFAULT_AGMO_LAUNCH_POLICY.autonomy_mode,
     },
     session_start: {
       mode: DEFAULT_AGMO_SESSION_START_POLICY.mode,

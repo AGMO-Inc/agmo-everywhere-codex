@@ -333,7 +333,7 @@ function formatWisdomMemoryLines(summary: AgmoEffectiveWisdomSummary): string[] 
 function formatLaunchPolicyLine(
   policy: Awaited<ReturnType<typeof resolveLaunchPolicy>>["policy"]
 ): string {
-  return `- Launch policy: cleanup>${policy.default_cleanup_older_than_hours}h prunes by default; heartbeat every ${policy.heartbeat_interval_ms}ms; stale after ${policy.heartbeat_stale_after_ms}ms.`;
+  return `- Launch policy: autonomy=${policy.autonomy_mode}; cleanup>${policy.default_cleanup_older_than_hours}h prunes by default; heartbeat every ${policy.heartbeat_interval_ms}ms; stale after ${policy.heartbeat_stale_after_ms}ms.`;
 }
 
 function parseOptionalBoolean(value: unknown): boolean | null {
@@ -440,7 +440,7 @@ function resolveCurrentTeamSessionId(
 function formatLaunchPolicySourceLine(
   sources: Awaited<ReturnType<typeof resolveLaunchPolicy>>["sources"]["effective"]
 ): string {
-  return `- Launch policy source: cleanup=${sources.default_cleanup_older_than_hours}; heartbeat_interval=${sources.heartbeat_interval_ms}; stale_after=${sources.heartbeat_stale_after_ms}.`;
+  return `- Launch policy source: autonomy=${sources.autonomy_mode}; cleanup=${sources.default_cleanup_older_than_hours}; heartbeat_interval=${sources.heartbeat_interval_ms}; stale_after=${sources.heartbeat_stale_after_ms}.`;
 }
 
 function formatDebugLines(args: {

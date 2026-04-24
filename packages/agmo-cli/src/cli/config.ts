@@ -31,6 +31,7 @@ Examples:
   agmo config vault-autosave set append_max_entries 12 --scope project
   agmo config vault-autosave set workflow_type.execute impl --scope project
   agmo config launch show
+  agmo config launch set autonomy_mode madmax --scope project
   agmo config launch set heartbeat_interval_ms 45000 --scope project
   agmo config session-start show
   agmo config session-start set mode compact --scope project

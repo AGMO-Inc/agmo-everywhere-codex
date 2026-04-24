@@ -30,11 +30,15 @@ Before mutating git state, verify:
 - GitHub operations in this skill use the `gh` CLI, not a GitHub MCP server
 - prefer token-based auth for GitHub automation and repo mutation work
 - prefer `GH_TOKEN`, then `GITHUB_TOKEN`, for `gh` on `github.com`; use the enterprise token variants when the target host requires them
-- verify auth with `gh auth status` before PR work or other GitHub mutations
-- for GitHub HTTPS git operations, prefer an existing non-interactive token-backed credential helper such as a `gh auth setup-git` path instead of interactive prompts
+- before push, PR, or other GitHub mutations, check for the token environment variable without printing the token value
+- when a token environment variable is present, use that token-backed `gh`/git path and do not fall back to macOS Keychain or another existing credential helper
+- verify token-backed auth with `gh auth status` before PR work or other GitHub mutations
+- for GitHub HTTPS git operations, prefer `gh auth setup-git` or another token-backed non-interactive credential path that runs under the same token environment
 - never open interactive `gh auth login` or browser/device flows when a token environment variable is already available
 - never persist tokens into tracked files, commit contents, or remote URLs; keep them in process environment or other non-tracked credential storage only
-- if neither token env nor existing non-interactive auth is available, stop at the exact blocker and report the missing prerequisite
+- treat existing Keychain or credential-helper auth as an explicit fallback only when no token environment variable is available
+- if neither token env nor an explicitly accepted non-interactive fallback is available, stop at the exact blocker and report the missing prerequisite
+- when the runtime asks for command approval, request a reusable command prefix for the specific git/gh operation so later commit, push, and PR steps do not repeatedly interrupt the user
 
 ## Commit lane
 

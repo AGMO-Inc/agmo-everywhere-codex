@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { ensureCodexCliArgs } from "../utils/codex.js";
+import { ensureCodexCliArgs, normalizeCodexAutonomyMode } from "../utils/codex.js";
 
 export type TmuxTopology = {
   available: boolean;
@@ -74,7 +74,13 @@ function shellQuote(value: string): string {
 }
 
 export function buildWorkerCodexArgs(prompt: string): string[] {
-  return ["codex", ...ensureCodexCliArgs(["--no-alt-screen", prompt])];
+  return [
+    "codex",
+    ...ensureCodexCliArgs(
+      ["--no-alt-screen", prompt],
+      normalizeCodexAutonomyMode(process.env.AGMO_CODEX_AUTONOMY_MODE) ?? "full-auto"
+    )
+  ];
 }
 
 function buildWorkerBootstrapCommand(spec: TmuxWorkerPaneSpec): string {

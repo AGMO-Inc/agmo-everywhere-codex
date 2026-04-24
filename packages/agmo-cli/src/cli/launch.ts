@@ -18,9 +18,10 @@ import {
 import { currentTmuxPaneId, isTmuxAvailable } from "../team/tmux-session.js";
 import { agmoCliDistEntryPath, resolveRuntimeRoot } from "../utils/paths.js";
 import { parseScopeFlag } from "../utils/args.js";
-import { ensureCodexCliArgs } from "../utils/codex.js";
+import { ensureCodexCliArgs, normalizeCodexAutonomyMode, type CodexAutonomyMode } from "../utils/codex.js";
 
 const AGMO_TMUX_BOOTSTRAPPED_ENV = "AGMO_TMUX_BOOTSTRAPPED";
+const AGMO_CODEX_AUTONOMY_MODE_ENV = "AGMO_CODEX_AUTONOMY_MODE";
 
 function printLaunchHelp(): void {
   console.log(`Usage:
@@ -47,11 +48,13 @@ Notes:
 Examples:
   agmo launch
   agmo launch --tmux
+  agmo launch --madmax
   agmo launch --no-tmux --full-auto
   agmo launch --full-auto
   agmo launch debug prompt-input "hello"
   agmo launch config show
   agmo launch config show --scope project
+  agmo launch config set autonomy_mode madmax --scope project
   agmo launch config set heartbeat_interval_ms 45000 --scope project
   agmo launch config unset heartbeat_interval_ms --scope project
   agmo launch config reset --scope project
@@ -123,19 +126,27 @@ function removeFlag(args: string[], flag: string): string[] {
 function resolveLaunchTmuxMode(args: string[]): {
   mode: "auto" | "force" | "disabled";
   codexArgs: string[];
+  explicitAutonomyMode: CodexAutonomyMode | null;
 } {
   const forceTmux = args.includes("--tmux");
   const disableTmux = args.includes("--no-tmux");
+  const launchArgs = removeFlag(removeFlag(args, "--tmux"), "--no-tmux");
+  const explicitAutonomyMode = launchArgs.includes("--madmax")
+    || launchArgs.includes("--dangerously-bypass-approvals-and-sandbox")
+    ? "madmax"
+    : launchArgs.includes("--full-auto") || launchArgs.includes("--yolo")
+      ? "full-auto"
+      : null;
 
   assertNoConflictingFlags({
     selected: [forceTmux, disableTmux],
     message: "--tmux and --no-tmux cannot be used together"
   });
 
-  const codexArgs = ensureCodexCliArgs(removeFlag(removeFlag(args, "--tmux"), "--no-tmux"));
   return {
     mode: forceTmux ? "force" : disableTmux ? "disabled" : "auto",
-    codexArgs
+    codexArgs: launchArgs,
+    explicitAutonomyMode
   };
 }
 
@@ -259,11 +270,13 @@ function parseLaunchPolicyKey(
 ):
   | "default_cleanup_older_than_hours"
   | "heartbeat_stale_after_ms"
-  | "heartbeat_interval_ms" {
+  | "heartbeat_interval_ms"
+  | "autonomy_mode" {
   const allowedKeys = new Set([
     "default_cleanup_older_than_hours",
     "heartbeat_stale_after_ms",
-    "heartbeat_interval_ms"
+    "heartbeat_interval_ms",
+    "autonomy_mode"
   ]);
 
   if (
@@ -276,7 +289,23 @@ function parseLaunchPolicyKey(
   return raw as
     | "default_cleanup_older_than_hours"
     | "heartbeat_stale_after_ms"
-    | "heartbeat_interval_ms";
+    | "heartbeat_interval_ms"
+    | "autonomy_mode";
+}
+
+function parseLaunchPolicyValue(
+  key: "default_cleanup_older_than_hours" | "heartbeat_stale_after_ms" | "heartbeat_interval_ms" | "autonomy_mode",
+  raw: string | undefined
+): number | CodexAutonomyMode {
+  if (key === "autonomy_mode") {
+    const mode = normalizeCodexAutonomyMode(raw);
+    if (!mode) {
+      throw new Error("autonomy_mode must be one of: full-auto, madmax");
+    }
+    return mode;
+  }
+
+  return parseRequiredNumericValue(raw, "<value>");
 }
 
 export async function runLaunchCommand(args: string[]): Promise<void> {
@@ -333,10 +362,10 @@ export async function runLaunchCommand(args: string[]): Promise<void> {
     if (action === "set") {
       const key = parseLaunchPolicyKey(
         args[2],
-        "usage: agmo launch config set <default_cleanup_older_than_hours|heartbeat_stale_after_ms|heartbeat_interval_ms> <value> [--scope user|project]"
+        "usage: agmo launch config set <default_cleanup_older_than_hours|heartbeat_stale_after_ms|heartbeat_interval_ms|autonomy_mode> <value> [--scope user|project]"
       );
 
-      const value = parseRequiredNumericValue(args[3], "<value>");
+      const value = parseLaunchPolicyValue(key, args[3]);
       const scope = parseScopeFlag(args.slice(4));
       const result = await setLaunchPolicyValue({
         key,
@@ -360,7 +389,7 @@ export async function runLaunchCommand(args: string[]): Promise<void> {
     if (action === "unset") {
       const key = parseLaunchPolicyKey(
         args[2],
-        "usage: agmo launch config unset <default_cleanup_older_than_hours|heartbeat_stale_after_ms|heartbeat_interval_ms> [--scope user|project]"
+        "usage: agmo launch config unset <default_cleanup_older_than_hours|heartbeat_stale_after_ms|heartbeat_interval_ms|autonomy_mode> [--scope user|project]"
       );
       const scope = parseScopeFlag(args.slice(3));
       const result = await unsetLaunchPolicyValue({
@@ -492,13 +521,15 @@ export async function runLaunchCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const { mode: tmuxMode, codexArgs } = resolveLaunchTmuxMode(args);
+  const { mode: tmuxMode, codexArgs, explicitAutonomyMode } = resolveLaunchTmuxMode(args);
+  const effectiveAutonomyMode = explicitAutonomyMode ?? launchPolicy.policy.autonomy_mode;
+  const effectiveCodexArgs = ensureCodexCliArgs(codexArgs, effectiveAutonomyMode);
   ensureTmuxLaunchAttachable(tmuxMode);
 
   if (shouldAutoBootstrapTmux(tmuxMode)) {
     await spawnTmuxBootstrap({
       projectRoot,
-      codexArgs
+      codexArgs: effectiveCodexArgs
     });
     return;
   }
@@ -507,14 +538,15 @@ export async function runLaunchCommand(args: string[]): Promise<void> {
     projectRoot
   });
 
-  const child = spawn("codex", codexArgs, {
+  const child = spawn("codex", effectiveCodexArgs, {
     stdio: "inherit",
     cwd: workspace.workspaceRoot,
     env: {
       ...process.env,
       AGMO_PROJECT_ROOT: projectRoot,
       AGMO_LAUNCH_SESSION_ID: workspace.sessionId,
-      AGMO_LAUNCH_WORKSPACE_ROOT: workspace.workspaceRoot
+      AGMO_LAUNCH_WORKSPACE_ROOT: workspace.workspaceRoot,
+      [AGMO_CODEX_AUTONOMY_MODE_ENV]: effectiveAutonomyMode
     }
   });
 
