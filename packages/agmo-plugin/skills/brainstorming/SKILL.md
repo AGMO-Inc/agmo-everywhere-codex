@@ -22,6 +22,10 @@ When `$brainstorming` is invoked, the main session should:
 4. bring the delegated result back into a user-facing design conversation
 5. keep implementation blocked until the direction is explicitly accepted
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Questioning style
 
 Keep the interaction lighter than a full interview, but do not stay shallow.
@@ -45,6 +49,16 @@ By the end of the brainstorming pass, try to provide:
 2. a recommended direction
 3. the main risks or tensions
 4. the next likely workflow transition
+
+## Artifact save body
+
+Before ending a meaningful brainstorming stage, make the final response or delegated result save-ready:
+
+- problem and context
+- decision drivers
+- options considered and recommendation
+- risks and non-goals
+- handoff to `plan`
 
 ## Hard gates
 

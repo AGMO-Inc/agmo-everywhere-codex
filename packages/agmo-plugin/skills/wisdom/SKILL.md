@@ -12,6 +12,8 @@ Use this when durable knowledge should shape the current run.
 
 The main session should delegate this workflow to `agmo-wisdom`, then integrate the result back into the active workflow.
 
+After the delegated result is integrated, call `close_agent` for the `agmo-wisdom` lane so the completed native subagent session releases its thread slot.
+
 Use it for:
 
 - doc or knowledge synthesis
@@ -37,6 +39,15 @@ A good wisdom result should usually include:
 - inferred project / design / plan lineage when relevant
 - a recommended durable title if the result should be saved
 - recommended aliases, tags, parent, and related links when persistence is likely
+
+## Artifact save body
+
+Before ending a meaningful wisdom stage, make the final response or delegated result save-ready:
+
+- knowledge question or durable decision
+- evidence vs inference
+- canonical note target and duplicate handling
+- recommended note update or follow-up handoff
 
 ## Canonical-note behavior
 

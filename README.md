@@ -9,7 +9,7 @@
 
 Codex-native Agmo runtime and plugin for planning, execution, verification, GitHub workflows, vault persistence, and tmux-backed team orchestration.
 
-[![Version](https://img.shields.io/badge/version-0.1.0-1f2937.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.1.1-1f2937.svg)](package.json)
 [![CLI](https://img.shields.io/badge/runtime-agmo%20CLI-0f766e.svg)](packages/agmo-cli)
 [![Plugin](https://img.shields.io/badge/plugin-Codex%20native-1d4ed8.svg)](packages/agmo-plugin)
 [![Agents](https://img.shields.io/badge/agents-7-14532d.svg)](#managed-native-agent-roster)

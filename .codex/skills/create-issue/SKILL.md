@@ -16,6 +16,10 @@ The leader should keep orchestration ownership.
 - delegate the GitHub mutation lane to `agmo-executor`
 - verify the created artifact with `gh` output before reporting success
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Preflight
 
 Before creating anything, verify:
@@ -70,3 +74,13 @@ Project-board registration is best-effort, not assumed.
 - do not silently create duplicate issues when an obvious open match already exists
 - do not claim issue type or project status were applied unless `gh` output confirms it
 - if GitHub CLI capability or permissions are insufficient, stop at the exact blocker and report it
+
+## Artifact save body
+
+Before ending this workflow, make the final response or delegated result save-ready:
+
+- issue title and type
+- source context and acceptance criteria
+- created issue URL and metadata
+- project/status handling
+- blockers or follow-up

@@ -114,6 +114,17 @@ Leader expectations:
 - If verification fails, treat that output as the new source of truth.
 - Distinguish verified facts from inference when reporting status.
 
+## Workflow artifact contract
+
+When a meaningful workflow stage completes, the leader should prepare a save-ready artifact summary before final reporting:
+
+- design stages: problem, decision drivers, options, recommendation, risks, handoff
+- plan stages: scope, ordered steps, acceptance criteria, verification path, handoff
+- implementation stages: goal, changed files, behavior changes, decisions, verification, remaining risks
+- research/wisdom stages: question, evidence, inference, canonical note target, follow-up
+
+Keep this content artifact-centered rather than chatty. The stage-end autosave path preserves workflow artifacts separately from terse hook checkpoints.
+
 ## Vault and knowledge contract
 
 If a vault root is configured, Agmo can use:
@@ -156,6 +167,15 @@ Use them according to task shape:
 - read-only design/tradeoff analysis → agmo-architect
 - read-only plan/design challenge → agmo-critic
 - fast repo fact gathering → agmo-explore
+
+## Native subagent lifecycle
+
+When using native subagents:
+
+- track every spawned agent id until the lane is complete
+- after `wait_agent` returns a completed result and the leader integrates it, call `close_agent` for that agent
+- close failed, superseded, or no-longer-needed agents as soon as the lane is no longer useful
+- do not leave completed subagents open across turns; open completed sessions continue occupying native thread slots
 
 ## Managed file contract
 

@@ -75,6 +75,13 @@ When persistence is useful, include:
 - Parent / related links
 - Compact body outline
 
+## Artifact Save Body
+When the workflow stage itself should be saved, include:
+- Knowledge question or durable decision
+- Evidence vs inference
+- Canonical note target and duplicate handling
+- Recommended update or follow-up handoff
+
 ## Open Gaps
 - Missing knowledge or conflicts still unresolved
 </output_contract>

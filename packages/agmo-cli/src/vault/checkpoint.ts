@@ -3,6 +3,7 @@ import { basename, resolve } from "node:path";
 import { promisify } from "node:util";
 import { resolveVaultAutosavePolicy } from "../config/runtime.js";
 import {
+  recordSessionArtifact,
   recordSessionAutosave,
   type SessionState,
   type SessionWorkflowNoteRef,
@@ -472,7 +473,10 @@ function resolveNoteRelations(
   noteType: VaultNoteType,
   sessionState: SessionState
 ): NoteRelations {
-  const notes = sessionState.autosave_notes ?? {};
+  const notes = {
+    ...(sessionState.autosave_notes ?? {}),
+    ...(sessionState.artifact_notes ?? {})
+  };
   const design = notes.brainstorming ?? null;
   const plan = notes.plan ?? null;
 
@@ -1536,6 +1540,426 @@ export async function saveSessionCheckpointNote(args: {
       workflow: args.sessionState.workflow,
       type: noteType,
       title: resolvedTitle,
+      relative_path: result.relative_path,
+      wikilink: result.wikilink,
+      saved_at: args.sessionState.completed_at ?? args.sessionState.updated_at
+    },
+    relations
+  });
+
+  return result;
+}
+
+function shouldSaveWorkflowArtifact(
+  workflow: string | undefined,
+  trigger: SessionCheckpointTrigger
+): workflow is string {
+  if (!workflow) {
+    return false;
+  }
+
+  if (trigger !== "workflow_change" && trigger !== "stop") {
+    return false;
+  }
+
+  return [
+    "brainstorming",
+    "plan",
+    "execute",
+    "ralph",
+    "wisdom",
+    "vault-search",
+    "save-note",
+    "git-workflow",
+    "create-issue",
+    "note-to-issue"
+  ].includes(workflow);
+}
+
+function workflowArtifactLabel(workflow: string): string {
+  switch (workflow) {
+    case "brainstorming":
+      return "design";
+    case "plan":
+      return "plan";
+    case "execute":
+    case "ralph":
+      return "implementation";
+    case "wisdom":
+    case "vault-search":
+      return "research";
+    default:
+      return "memo";
+  }
+}
+
+function buildArtifactTitle(args: {
+  sessionState: SessionState;
+  noteType: VaultNoteType;
+}): string {
+  const { sessionState, noteType } = args;
+  const workflow = sessionState.workflow ?? "session";
+  const existingTitle = sessionState.artifact_notes?.[workflow]?.title;
+  if (existingTitle) {
+    return existingTitle;
+  }
+
+  const topic =
+    normalizeTitleTopic(normalizePromptExcerptForBody(sessionState.prompt_excerpt)) ??
+    normalizeTitleTopic(sessionState.prompt_excerpt) ??
+    relatedTitleCandidate(noteType, sessionState) ??
+    `Agmo ${workflow}`;
+  const date = isoDate(sessionState.started_at ?? sessionState.updated_at);
+  return `${date} ${topic} ${workflowArtifactLabel(workflow)}`;
+}
+
+function buildArtifactFrontmatter(args: {
+  title: string;
+  noteType: VaultNoteType;
+  project: string;
+  projectWikiLink: string;
+  trigger: SessionCheckpointTrigger;
+  sessionState: SessionState;
+  parent: SessionWorkflowNoteRef | null;
+  related: SessionWorkflowNoteRef[];
+  changedFiles: string[];
+  verification: VerificationSummary[];
+}): string[] {
+  const {
+    title,
+    noteType,
+    project,
+    projectWikiLink,
+    trigger,
+    sessionState,
+    parent,
+    related,
+    changedFiles,
+    verification
+  } = args;
+  const workflow = sessionState.workflow ?? "unknown";
+  const tags = Array.from(
+    new Set([
+      "agmo",
+      "artifact",
+      noteType,
+      workflow,
+      project,
+      `type/${noteType}`,
+      `workflow/${workflow}`,
+      `project/${project}`
+    ])
+  );
+  const frontmatter = [
+    "---",
+    `type: ${yamlScalar(noteType)}`,
+    `schema: ${yamlScalar(`agmo-artifact-${noteType}-v1`)}`,
+    `project: ${yamlScalar(project)}`,
+    `project_note: ${yamlScalar(projectWikiLink)}`,
+    `session_id: ${yamlScalar(sessionState.session_id)}`,
+    `workflow: ${yamlScalar(workflow)}`,
+    `trigger: ${yamlScalar(trigger)}`,
+    `status: ${yamlScalar(trigger === "stop" ? "done" : "handoff")}`,
+    `created: ${yamlScalar(isoDate(sessionState.started_at ?? sessionState.updated_at))}`,
+    `updated: ${yamlScalar(isoDate(sessionState.completed_at ?? sessionState.updated_at))}`,
+    `artifact_kind: ${yamlScalar(workflowArtifactLabel(workflow))}`,
+    "aliases:",
+    ...yamlList(buildTitleAliases(title))
+  ];
+
+  if (parent) {
+    frontmatter.push(`parent: ${yamlScalar(parent.wikilink)}`);
+  }
+
+  if (related.length > 0) {
+    frontmatter.push("related:");
+    frontmatter.push(...yamlList(related.map((entry) => entry.wikilink)));
+  }
+
+  frontmatter.push(
+    ...buildTypeSpecificFrontmatter({
+      noteType,
+      trigger,
+      parent,
+      related,
+      changedFiles,
+      verification
+    }),
+    ...buildVerificationFrontmatter({ verification }),
+    "tags:",
+    ...yamlList(tags),
+    "---",
+    ""
+  );
+
+  return frontmatter;
+}
+
+function buildArtifactBody(args: {
+  title: string;
+  noteType: VaultNoteType;
+  projectWikiLink: string;
+  trigger: SessionCheckpointTrigger;
+  sessionState: SessionState;
+  parent: SessionWorkflowNoteRef | null;
+  related: SessionWorkflowNoteRef[];
+  changedFiles: string[];
+  verification: VerificationSummary[];
+}): string {
+  const {
+    title,
+    noteType,
+    projectWikiLink,
+    trigger,
+    sessionState,
+    parent,
+    related,
+    changedFiles,
+    verification
+  } = args;
+  const focus = resolveCheckpointFocus(noteType, sessionState);
+  const sourceRequest = renderQuotedLines(
+    sessionState.prompt_excerpt,
+    "{no source request captured}"
+  );
+  const verificationLines =
+    verification.length > 0
+      ? verification.map((entry) =>
+          `- ${entry.recordedAt ? `[${entry.recordedAt}] ` : ""}${entry.label}: ${entry.outcome}`
+        )
+      : ["- Verification evidence was not captured before this artifact save."];
+  const changedFileLines =
+    changedFiles.length > 0
+      ? changedFiles.map((entry) => `- \`${entry}\``)
+      : ["- No changed files were detected for this workflow artifact."];
+  const relationLines = [
+    ...(parent ? [`- Parent: ${parent.wikilink}`] : []),
+    ...related.map((entry) => `- Related: ${entry.wikilink}`)
+  ];
+  const latestSignal = formatLatestSignal(sessionState);
+  const commonHeader = [
+    `# ${title}`,
+    "",
+    `> Project: ${projectWikiLink}`,
+    ...(parent ? [`> Parent: ${parent.wikilink}`] : []),
+    "",
+    "## Artifact Summary",
+    "",
+    `- Workflow: ${sessionState.workflow ?? "unknown"}`,
+    `- Trigger: ${trigger}`,
+    `- Focus: ${focus}`,
+    `- Latest Signal: ${latestSignal}`,
+    `- Last Event: ${sessionState.last_event}`,
+    ""
+  ];
+
+  const typeSpecific =
+    noteType === "design"
+      ? [
+          "## Design Record",
+          "",
+          `${focus} was the active design topic for this workflow stage.`,
+          "",
+          "## Decision Drivers",
+          "",
+          `- Workflow Reason: ${sessionState.workflow_reason ?? "n/a"}`,
+          `- Latest Signal: ${latestSignal}`,
+          "",
+          "## Handoff",
+          "",
+          "- Use this design artifact as the parent context for planning."
+        ]
+      : noteType === "plan"
+        ? [
+            "## Plan Record",
+            "",
+            `Goal: ${focus}`,
+            "",
+            "## Execution Handoff",
+            "",
+            "1. Re-open linked design context if present.",
+            "2. Convert this artifact into concrete implementation ownership.",
+            "3. Verify against the captured evidence below."
+          ]
+        : noteType === "impl"
+          ? [
+              "## Implementation Record",
+              "",
+              `- Goal: ${focus}`,
+              `- Outcome Signal: ${latestSignal}`,
+              "",
+              "## Changed Files",
+              "",
+              ...changedFileLines,
+              "",
+              "## Verification Evidence",
+              "",
+              ...verificationLines
+            ]
+          : noteType === "research"
+            ? [
+                "## Research Record",
+                "",
+                `Topic: ${focus}`,
+                "",
+                "## Findings Snapshot",
+                "",
+                `- Retrieval Context: ${sessionState.workflow_reason ?? "n/a"}`,
+                `- Latest Signal: ${latestSignal}`,
+                "",
+                "## Recommended Follow-up",
+                "",
+                "- Carry these findings into design, planning, implementation, or a canonical note update."
+              ]
+            : [
+                "## Memo Record",
+                "",
+                `- Topic: ${focus}`,
+                `- Context: ${sessionState.workflow_reason ?? "n/a"}`,
+                `- Latest Signal: ${latestSignal}`
+              ];
+
+  const footer = [
+    "",
+    "## Source Request",
+    "",
+    ...sourceRequest,
+    "",
+    "## Related Links",
+    "",
+    ...(relationLines.length > 0 ? relationLines : ["- No parent or related artifact recorded yet."]),
+    "",
+    "## Session",
+    "",
+    `- Session ID: ${sessionState.session_id}`,
+    `- Started At: ${sessionState.started_at ?? "n/a"}`,
+    `- Updated At: ${sessionState.updated_at}`,
+    `- Completed At: ${sessionState.completed_at ?? "n/a"}`
+  ];
+
+  return [...commonHeader, ...typeSpecific, ...footer].join("\n");
+}
+
+export async function saveWorkflowArtifactNote(args: {
+  cwd: string;
+  trigger: Extract<SessionCheckpointTrigger, "workflow_change" | "stop">;
+  sessionState: SessionState;
+}): Promise<{
+  vault_root: string;
+  source: "env" | "project" | "user";
+  project: string;
+  type: VaultNoteType;
+  title: string;
+  path: string;
+  relative_path: string;
+  wikilink: string;
+  project_wikilink: string;
+  created: boolean;
+  updated: boolean;
+  index_updated: boolean;
+  index_path?: string;
+} | null> {
+  if (!shouldSaveWorkflowArtifact(args.sessionState.workflow, args.trigger)) {
+    return null;
+  }
+
+  const autosave = await resolveVaultAutosavePolicy(args.cwd);
+  if (!autosave.policy.enabled) {
+    return null;
+  }
+
+  if (autosave.policy.workflow_enabled[args.sessionState.workflow] === false) {
+    return null;
+  }
+
+  const runtimeRoot = resolveRuntimeRoot(args.cwd);
+  const project = basename(runtimeRoot);
+  const vault = await resolveVaultRoot(args.cwd);
+  if (!vault.vault_root || vault.source === "none") {
+    return null;
+  }
+
+  const projectWikiLink = resolveVaultProjectLayout(
+    vault.vault_root,
+    project
+  ).project_note_wikilink;
+  const noteType = resolveCheckpointType(
+    args.sessionState.workflow,
+    autosave.policy.workflow_types
+  );
+  const relations = resolveNoteRelations(noteType, args.sessionState);
+  const changedFiles = await collectChangedFiles(runtimeRoot, noteType, autosave.policy);
+  const verification = collectVerificationSummary(args.sessionState, autosave.policy);
+  const proposedTitle = buildArtifactTitle({
+    sessionState: args.sessionState,
+    noteType
+  });
+  const title =
+    args.sessionState.artifact_notes?.[args.sessionState.workflow]?.title ??
+    (await resolveUniqueTitle({
+      cwd: args.cwd,
+      project,
+      noteType,
+      proposedTitle,
+      sessionState: args.sessionState
+    }));
+  const frontmatter = buildArtifactFrontmatter({
+    title,
+    noteType,
+    project,
+    projectWikiLink,
+    trigger: args.trigger,
+    sessionState: args.sessionState,
+    parent: relations.parent,
+    related: relations.related,
+    changedFiles,
+    verification
+  }).join("\n");
+  const body = buildArtifactBody({
+    title,
+    noteType,
+    projectWikiLink,
+    trigger: args.trigger,
+    sessionState: args.sessionState,
+    parent: relations.parent,
+    related: relations.related,
+    changedFiles,
+    verification
+  });
+  const result = await upsertVaultTextNote(
+    {
+      type: noteType,
+      project,
+      title,
+      content: `${frontmatter}\n${body}\n`,
+      index: true,
+      update_mode: "overwrite"
+    },
+    runtimeRoot
+  );
+
+  await recordSessionArtifact({
+    cwd: args.cwd,
+    payload: { session_id: args.sessionState.session_id },
+    artifactAt: args.sessionState.completed_at ?? args.sessionState.updated_at,
+    workflow: args.sessionState.workflow,
+    noteRef: {
+      workflow: args.sessionState.workflow,
+      type: noteType,
+      title,
+      relative_path: result.relative_path,
+      wikilink: result.wikilink,
+      saved_at: args.sessionState.completed_at ?? args.sessionState.updated_at
+    }
+  });
+
+  await syncAutoLinks({
+    cwd: args.cwd,
+    noteType,
+    current: {
+      workflow: args.sessionState.workflow,
+      type: noteType,
+      title,
       relative_path: result.relative_path,
       wikilink: result.wikilink,
       saved_at: args.sessionState.completed_at ?? args.sessionState.updated_at

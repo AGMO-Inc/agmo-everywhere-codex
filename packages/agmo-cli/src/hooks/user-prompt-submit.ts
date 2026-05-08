@@ -5,7 +5,10 @@ import {
   type AgmoHookPayload,
   writeWorkflowActivation
 } from "./runtime-state.js";
-import { saveSessionCheckpointNote } from "../vault/checkpoint.js";
+import {
+  saveSessionCheckpointNote,
+  saveWorkflowArtifactNote
+} from "../vault/checkpoint.js";
 import { escalateToSameSessionTeam } from "../team/escalation.js";
 import type { AgmoTeamEscalationResult } from "../team/escalation.js";
 
@@ -448,6 +451,12 @@ function routeForIntent(intent: "implementation" | "verification" | "planning" |
   }
 }
 
+const NATIVE_SUBAGENT_LIFECYCLE_CONTEXT =
+  "Agmo native subagent lifecycle: when you spawn a native subagent, keep its agent id in scope and call `close_agent` after its completed result has been integrated or the lane is no longer needed, including failed or superseded lanes, so completed subagent sessions release thread slots before the next delegation.";
+
+const WORKFLOW_ARTIFACT_CONTEXT =
+  "Agmo workflow artifact contract: before ending a meaningful workflow stage, prepare an artifact-grade summary in the final response or delegated lane result with goal, decisions, changed files or evidence, verification, risks, and next handoff; Agmo stage-end artifact autosave uses this workflow context to preserve design/plan/implementation/research notes rather than relying only on terse hook checkpoints.";
+
 function buildWorkflowEnforcementContext(args: {
   route: WorkflowRoute;
   teamEscalation: AgmoTeamEscalationResult | null;
@@ -528,12 +537,18 @@ function buildWorkflowEnforcementContext(args: {
   })();
 
   if (!teamEscalation) {
-    return workflowContract;
+    return [
+      ...workflowContract,
+      WORKFLOW_ARTIFACT_CONTEXT,
+      NATIVE_SUBAGENT_LIFECYCLE_CONTEXT
+    ];
   }
 
   if (teamEscalation.status === "started") {
     return [
       ...workflowContract,
+      WORKFLOW_ARTIFACT_CONTEXT,
+      NATIVE_SUBAGENT_LIFECYCLE_CONTEXT,
       `Agmo runtime enforcement: the tmux team runtime \`${teamEscalation.teamName}\` is now the active worker lane.`,
       "Do not simulate replacement workers with ad-hoc in-process fanout; keep the leader on scope control, integration, monitoring, and follow-up dispatch while the live team executes."
     ];
@@ -541,6 +556,8 @@ function buildWorkflowEnforcementContext(args: {
 
   return [
     ...workflowContract,
+    WORKFLOW_ARTIFACT_CONTEXT,
+    NATIVE_SUBAGENT_LIFECYCLE_CONTEXT,
     `Agmo runtime enforcement: same-session team escalation was recognized but remains deferred (${teamEscalation.reason}).`,
     "Do not pretend durable tmux workers already exist; either continue with the non-team workflow contract or relaunch inside tmux before retrying the team request."
   ];
@@ -573,6 +590,16 @@ export async function handleUserPromptSubmit(args: {
     previousState.workflow &&
     previousState.workflow !== route.label
   ) {
+    try {
+      await saveWorkflowArtifactNote({
+        cwd: args.cwd,
+        trigger: "workflow_change",
+        sessionState: previousState
+      });
+    } catch (error) {
+      void error;
+    }
+
     try {
       await saveSessionCheckpointNote({
         cwd: args.cwd,
