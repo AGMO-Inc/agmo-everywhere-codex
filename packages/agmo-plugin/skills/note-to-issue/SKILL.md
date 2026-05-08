@@ -16,6 +16,10 @@ The leader should keep orchestration ownership.
 - delegate GitHub mutations and note-file updates to `agmo-executor`
 - verify both the created issue and the updated note before reporting completion
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Preflight
 
 Before conversion, verify:
@@ -75,3 +79,13 @@ When updating the note:
 - do not create a duplicate issue without explicit confirmation when the note already links to one
 - do not claim vault-note update success unless the file contents were re-read and verified
 - if vault configuration or GitHub permissions are missing, stop at the exact blocker and report it
+
+## Artifact save body
+
+Before ending this workflow, make the final response or delegated result save-ready:
+
+- source note path and canonical title
+- issue title/type/body summary
+- created issue URL and metadata
+- note backlink update result
+- blockers or follow-up

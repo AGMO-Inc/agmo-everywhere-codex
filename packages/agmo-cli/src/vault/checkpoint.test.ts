@@ -4,11 +4,16 @@ import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { SessionState } from "../hooks/runtime-state.js";
-import { saveSessionCheckpointNote } from "./checkpoint.js";
+import {
+  saveSessionCheckpointNote,
+  saveWorkflowArtifactNote
+} from "./checkpoint.js";
 
 async function withVaultRoot<T>(vaultRoot: string, run: () => Promise<T>): Promise<T> {
   const previous = process.env.AGMO_VAULT_ROOT;
+  const previousProjectRoot = process.env.AGMO_PROJECT_ROOT;
   process.env.AGMO_VAULT_ROOT = vaultRoot;
+  process.env.AGMO_PROJECT_ROOT = vaultRoot;
   try {
     return await run();
   } finally {
@@ -16,6 +21,11 @@ async function withVaultRoot<T>(vaultRoot: string, run: () => Promise<T>): Promi
       delete process.env.AGMO_VAULT_ROOT;
     } else {
       process.env.AGMO_VAULT_ROOT = previous;
+    }
+    if (previousProjectRoot === undefined) {
+      delete process.env.AGMO_PROJECT_ROOT;
+    } else {
+      process.env.AGMO_PROJECT_ROOT = previousProjectRoot;
     }
   }
 }
@@ -204,5 +214,101 @@ test("saveSessionCheckpointNote respects per-workflow autosave disable config", 
     assert.ok(preserved);
     assert.match(preserved.relative_path, /implementations\//);
     assert.deepEqual(await listMarkdownFiles(join(projectRoot, "memos")), []);
+  });
+});
+
+test("saveWorkflowArtifactNote writes stage-end artifacts separate from checkpoint memos", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-artifact-stage-end-"));
+  const project = "demo-project";
+  const projectRoot = join(tempRoot, project);
+  await mkdir(projectRoot, { recursive: true });
+
+  await withVaultRoot(projectRoot, async () => {
+    const plan = await saveWorkflowArtifactNote({
+      cwd: projectRoot,
+      trigger: "workflow_change",
+      sessionState: buildSessionState({
+        workflow: "plan",
+        workflow_reason: "planning/decomposition-oriented request",
+        prompt_excerpt: "Vault autosave 품질 개선 실행 계획을 정리하자.",
+        last_event: "PostToolUse",
+        last_tool_name: "Bash",
+        last_tool_status: "succeeded",
+        last_tool_summary: "Inspected checkpoint renderer and legacy archivist flow"
+      })
+    });
+
+    assert.ok(plan);
+    assert.match(plan.relative_path, /plans\/\[Plan\] /);
+    assert.doesNotMatch(plan.relative_path, /memos\//);
+    const note = await readFile(plan.path, "utf8");
+    assert.match(note, /schema: "agmo-artifact-plan-v1"/);
+    assert.match(note, /artifact_kind: "plan"/);
+    assert.match(note, /## Plan Record/);
+    assert.match(note, /## Execution Handoff/);
+    assert.match(note, /## Source Request/);
+    assert.match(note, /Inspected checkpoint renderer and legacy archivist flow/);
+    assert.doesNotMatch(note, /Auto-saved by Agmo native/);
+    assert.match(note, /  - "artifact"/);
+  });
+});
+
+test("saveWorkflowArtifactNote links implementation artifacts to prior plan artifacts", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-artifact-links-"));
+  const project = "demo-project";
+  const projectRoot = join(tempRoot, project);
+  await mkdir(projectRoot, { recursive: true });
+
+  await withVaultRoot(projectRoot, async () => {
+    const plan = await saveWorkflowArtifactNote({
+      cwd: projectRoot,
+      trigger: "workflow_change",
+      sessionState: buildSessionState({
+        workflow: "plan",
+        workflow_reason: "execution-ready planning",
+        prompt_excerpt: "Artifact save gate 계획을 수립하자."
+      })
+    });
+
+    assert.ok(plan);
+
+    const impl = await saveWorkflowArtifactNote({
+      cwd: projectRoot,
+      trigger: "stop",
+      sessionState: buildSessionState({
+        workflow: "execute",
+        workflow_reason: "implementation-oriented request",
+        prompt_excerpt: "Artifact save gate 구현을 완료하자.",
+        artifact_notes: {
+          plan: {
+            workflow: "plan",
+            type: plan.type,
+            title: plan.title,
+            relative_path: plan.relative_path,
+            wikilink: plan.wikilink,
+            saved_at: "2026-04-23T10:00:00.000Z"
+          }
+        },
+        verification_history: [
+          {
+            tool_name: "test",
+            tool_status: "succeeded",
+            tool_summary: "artifact tests passed",
+            recorded_at: "2026-04-23T10:00:00.000Z"
+          }
+        ]
+      })
+    });
+
+    assert.ok(impl);
+    assert.match(impl.relative_path, /implementations\/\[Impl\] /);
+    const note = await readFile(impl.path, "utf8");
+    assert.match(note, new RegExp(`parent: ${JSON.stringify(plan.wikilink).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(note, /## Implementation Record/);
+    assert.match(note, /artifact tests passed/);
+
+    const planNote = await readFile(plan.path, "utf8");
+    assert.match(planNote, /## Implementations/);
+    assert.match(planNote, new RegExp(impl.wikilink.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 });

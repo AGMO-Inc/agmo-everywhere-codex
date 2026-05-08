@@ -23,6 +23,10 @@ When `$plan-review` is invoked, the main session should:
    - revision support when needed: `agmo-planner`
 4. return a clear verdict: approve, revise, or reject/re-plan
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Review targets
 
 Check the plan for:
@@ -46,3 +50,13 @@ Check the plan for:
 - if approved, the next likely step is `execute`
 - if revisions are needed, return to `plan`
 - if the review exposes deeper uncertainty, go back to `brainstorming`
+
+## Artifact save body
+
+Before ending a meaningful plan-review stage, make the final response or delegated result save-ready:
+
+- reviewed plan target
+- verdict and rationale
+- required revisions or approval notes
+- verification concerns
+- next workflow handoff

@@ -16,6 +16,10 @@ Treat this as a compatibility alias of `execute`, not as a separate canonical wo
 4. keep the leader in orchestrator mode while `agmo-executor` handles coding and `agmo-verifier` provides the completion gate verdict
 5. escalate to `team` only when implementation and verification truly need durable parallel lanes
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Completion-gated posture
 
 `ralph` means:
@@ -24,6 +28,16 @@ Treat this as a compatibility alias of `execute`, not as a separate canonical wo
 - distinguish failure from missing proof
 - continue through safe, reversible next steps automatically
 - report a blocker only when the next move materially depends on user input, missing authority, or unavailable infrastructure
+
+## Artifact save body
+
+Before ending a meaningful completion-gated stage, make the final response or delegated result save-ready:
+
+- accepted goal and final outcome
+- implementation changes
+- verification loop evidence
+- fixes attempted after failures
+- remaining blocker or done state
 
 ## What it should not become
 

@@ -91,6 +91,13 @@ Default final-output shape: quality-first and execution-ready, with enough detai
 1. [Deliverable 1]
 2. [Deliverable 2]
 
+**Artifact Save Body:**
+- Goal and non-goals
+- Requirements and decision drivers
+- Ordered implementation steps
+- Acceptance criteria and verification path
+- Risks, dependencies, and next handoff
+
 **Consensus mode (if applicable):**
 - RALPLAN-DR: Principles (3-5), Drivers (top 3), Options (>=2 or explicit invalidation rationale)
 - ADR: Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups

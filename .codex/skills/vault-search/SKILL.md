@@ -12,6 +12,8 @@ Use this before planning or execution when prior durable context matters.
 
 The main session should delegate note lookup and synthesis to `agmo-wisdom`, then bring the result back into the active workflow.
 
+After the delegated result is integrated, call `close_agent` for the `agmo-wisdom` lane so the completed native subagent session releases its thread slot.
+
 Use this to:
 
 - find prior design / plan / implementation notes
@@ -47,3 +49,13 @@ When returning results, include:
 - why each candidate is relevant
 - the likely note family to update or extend
 - whether a fresh note is preferable to mutating an existing one
+
+## Artifact save body
+
+Before ending a meaningful vault-search stage, make the final response or delegated result save-ready:
+
+- search question
+- canonical result and alternatives
+- evidence found
+- inference and gaps
+- recommended next note update or workflow handoff

@@ -22,6 +22,10 @@ When `$execute` is invoked, the main session should:
 6. pull `agmo-verifier` for proof before claiming completion
 7. if proof fails or remains incomplete, keep the fix -> re-verify loop running until the task passes or a real blocker is identified
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Default posture
 
 - start with solo delegated execution
@@ -46,6 +50,16 @@ By the end of the workflow, the leader should be able to report:
 - what changed
 - what was verified
 - what remains or still risks follow-up
+
+## Artifact save body
+
+Before ending a meaningful execution stage, make the final response or delegated result save-ready:
+
+- accepted goal and scope
+- changed files and behavior changes
+- implementation decisions and rejected shortcuts
+- verification evidence
+- remaining risks and next handoff
 
 ## Compatibility alias
 

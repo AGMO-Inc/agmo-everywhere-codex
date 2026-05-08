@@ -21,6 +21,10 @@ When `$plan` is invoked, the main session should:
 5. define verification shape up front instead of leaving proof to the end
 6. end with the next concrete handoff, usually `plan-review` or `execute`
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Use this for
 
 - multi-file or multi-stage work
@@ -45,6 +49,16 @@ A strong plan should usually include:
 4. risks and mitigations
 5. verification steps
 6. the likely next workflow transition
+
+## Artifact save body
+
+Before ending a meaningful planning stage, make the final response or delegated result save-ready:
+
+- goal, scope, and non-goals
+- ordered implementation plan
+- acceptance criteria
+- verification path
+- risks, dependencies, and execution handoff
 
 ## Interview posture
 

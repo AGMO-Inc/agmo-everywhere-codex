@@ -49,3 +49,17 @@ If tmux UI and durable state disagree, trust the durable state first.
 2. monitor progress from runtime state, not guesswork alone
 3. integrate and verify once worker lanes report completion
 4. shut down explicitly with `agmo team shutdown <team>` when the work is done or aborted
+
+## Native subagent lifecycle
+
+For any small native-subagent sidecars used before or around team escalation, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
+## Artifact save body
+
+Before shutting down or reporting completion for a team workflow, make the leader's final report save-ready:
+
+- team task and worker allocation
+- worker outputs integrated
+- changed files or artifacts produced
+- verification evidence
+- remaining risks and follow-up ownership

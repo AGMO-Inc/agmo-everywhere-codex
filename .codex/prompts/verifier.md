@@ -63,6 +63,13 @@ Default final-output shape: quality-first and evidence-dense; add as much detail
 ## Evidence
 - `command or artifact` — result
 
+## Artifact Save Body
+- Claim or acceptance target checked
+- Evidence gathered
+- Verdict rationale
+- Gaps and residual risk
+- Recommended handoff to execute, plan, or done
+
 ## Gaps
 - Missing or inconclusive proof
 

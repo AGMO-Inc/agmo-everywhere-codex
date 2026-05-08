@@ -40,6 +40,7 @@ export type SessionState = {
   last_autosave_signature?: string;
   last_autosave_workflow?: string;
   autosave_notes?: Record<string, SessionWorkflowNoteRef>;
+  artifact_notes?: Record<string, SessionWorkflowNoteRef>;
   verification_history?: VerificationRecord[];
   updated_at: string;
   started_at?: string;
@@ -177,6 +178,7 @@ function mergeAutosaveState(
   | "last_autosave_signature"
   | "last_autosave_workflow"
   | "autosave_notes"
+  | "artifact_notes"
 > {
   return {
     ...(base?.last_autosave_at ? { last_autosave_at: base.last_autosave_at } : {}),
@@ -187,7 +189,8 @@ function mergeAutosaveState(
     ...(base?.last_autosave_workflow
       ? { last_autosave_workflow: base.last_autosave_workflow }
       : {}),
-    ...(base?.autosave_notes ? { autosave_notes: base.autosave_notes } : {})
+    ...(base?.autosave_notes ? { autosave_notes: base.autosave_notes } : {}),
+    ...(base?.artifact_notes ? { artifact_notes: base.artifact_notes } : {})
   };
 }
 
@@ -435,6 +438,59 @@ export async function recordSessionAutosave(args: {
           }
         }
       : {}),
+    ...mergeVerificationState(base),
+    ...mergeWisdomPersistenceState(base),
+    updated_at: updatedAt,
+    ...(base?.started_at ? { started_at: base.started_at } : {}),
+    ...(base?.completed_at ? { completed_at: base.completed_at } : {})
+  };
+
+  await Promise.all([
+    writeSessionState(args.cwd, sessionId, nextState),
+    writeWorkflowState(args.cwd, sessionId, nextState)
+  ]);
+
+  return {
+    sessionId,
+    workflowStatePathStem: safeFileStem(sessionId)
+  };
+}
+
+export async function recordSessionArtifact(args: {
+  cwd: string;
+  payload: AgmoHookPayload;
+  artifactAt: string;
+  workflow: string;
+  noteRef: SessionWorkflowNoteRef;
+}): Promise<{ sessionId: string; workflowStatePathStem: string }> {
+  const sessionId = readSessionId(args.payload);
+  const threadId = readThreadId(args.payload);
+  const turnId = readTurnId(args.payload);
+  const updatedAt = nowIso();
+  const [existingSession, existingWorkflow] = await Promise.all([
+    readExistingSessionState(args.cwd, sessionId),
+    readExistingWorkflowState(args.cwd, sessionId)
+  ]);
+  const base = existingWorkflow ?? existingSession;
+
+  const nextState: SessionState = {
+    version: 1,
+    session_id: sessionId,
+    ...(threadId ? { thread_id: threadId } : base?.thread_id ? { thread_id: base.thread_id } : {}),
+    ...(turnId ? { turn_id: turnId } : base?.turn_id ? { turn_id: base.turn_id } : {}),
+    active: base?.active ?? true,
+    last_event: base?.last_event ?? "UserPromptSubmit",
+    ...(base?.workflow ? { workflow: base.workflow } : {}),
+    ...(base?.workflow_reason ? { workflow_reason: base.workflow_reason } : {}),
+    ...(base?.prompt_excerpt ? { prompt_excerpt: base.prompt_excerpt } : {}),
+    ...(base?.last_tool_name ? { last_tool_name: base.last_tool_name } : {}),
+    ...(base?.last_tool_summary ? { last_tool_summary: base.last_tool_summary } : {}),
+    ...(base?.last_tool_status ? { last_tool_status: base.last_tool_status } : {}),
+    ...mergeAutosaveState(base),
+    artifact_notes: {
+      ...(base?.artifact_notes ?? {}),
+      [args.workflow]: args.noteRef
+    },
     ...mergeVerificationState(base),
     ...mergeWisdomPersistenceState(base),
     updated_at: updatedAt,

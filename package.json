@@ -1,7 +1,7 @@
 {
   "name": "agmo-everywhere-codex",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agmo Codex-native plugin and runtime monorepo",
   "packageManager": "pnpm@10.8.1",
   "scripts": {

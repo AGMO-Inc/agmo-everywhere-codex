@@ -12,6 +12,8 @@ Use this when the result should survive outside transient chat.
 
 The main session should delegate durable note preparation to `agmo-wisdom`, then persist the resulting summary through Agmo's vault path.
 
+After the delegated result is integrated or persisted, call `close_agent` for the `agmo-wisdom` lane so the completed native subagent session releases its thread slot.
+
 Use this for:
 
 - explicit checkpoint saves
@@ -47,3 +49,13 @@ Normalize obvious low-quality inputs such as:
 - aliases
 - tags
 - parent / related links when known
+
+## Artifact save body
+
+Before ending this workflow, make the final response or delegated result save-ready:
+
+- selected note family and title
+- durable body outline or final body
+- aliases and tags
+- parent / related links
+- persistence result or blocker

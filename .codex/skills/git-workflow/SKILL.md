@@ -16,6 +16,10 @@ The leader stays in orchestration mode.
 - use `agmo-verifier` before claiming a PR or release-ready branch is done when checks matter
 - read repo-local policy from `AGENTS.md`, `README`, or `.github` before assuming commit or PR conventions
 
+## Native subagent lifecycle
+
+When spawning native subagents for this workflow, keep each agent id until its result is integrated, then call `close_agent` for completed, failed, superseded, or no-longer-needed lanes so thread slots are released before the next delegation.
+
 ## Preflight
 
 Before mutating git state, verify:
@@ -70,3 +74,13 @@ Before mutating git state, verify:
 - never force-push `main`, `master`, or another protected release branch by default
 - if the worktree contains unrelated user changes, preserve them and stage only the requested scope
 - report the exact git/gh action taken, plus any verification gaps that remain
+
+## Artifact save body
+
+Before ending a meaningful git workflow stage, make the final response or delegated result save-ready:
+
+- branch and commit/PR intent
+- changed files included
+- commands run and results
+- PR or issue links when created
+- remaining CI/auth/review risks

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { detectWorkflowRoute } from "./user-prompt-submit.js";
+import { detectWorkflowRoute, handleUserPromptSubmit } from "./user-prompt-submit.js";
 
 test("detectWorkflowRoute prefers vault-search for prior note retrieval asks", () => {
   const route = detectWorkflowRoute("이전 설계 노트 찾아서 읽어줘", null);
@@ -94,4 +97,38 @@ test("detectWorkflowRoute keeps canonical execute on continuation prompts", () =
   assert.ok(route);
   assert.equal(route?.skill, "execute");
   assert.equal(route?.label, "execute");
+});
+
+test("handleUserPromptSubmit injects native subagent cleanup guidance for delegated workflows", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-user-prompt-subagent-cleanup-"));
+  const result = await handleUserPromptSubmit({
+    cwd: tempRoot,
+    payload: {
+      session_id: "subagent-cleanup-session",
+      prompt: "$execute implement the accepted fix"
+    }
+  });
+
+  assert.ok(result);
+  const context = result.hookSpecificOutput.additionalContext;
+  assert.match(context, /Agmo native subagent lifecycle:/);
+  assert.match(context, /call `close_agent`/);
+  assert.match(context, /release thread slots/);
+});
+
+test("handleUserPromptSubmit injects workflow artifact guidance for delegated workflows", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-user-prompt-artifact-"));
+  const result = await handleUserPromptSubmit({
+    cwd: tempRoot,
+    payload: {
+      session_id: "artifact-guidance-session",
+      prompt: "$plan design the durable vault save flow",
+    },
+  });
+
+  assert.ok(result);
+  const context = result.hookSpecificOutput.additionalContext;
+  assert.match(context, /Agmo workflow artifact contract:/);
+  assert.match(context, /artifact-grade summary/);
+  assert.match(context, /rather than relying only on terse hook checkpoints/);
 });

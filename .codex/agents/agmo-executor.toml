@@ -128,6 +128,13 @@ Default final-output shape: quality-first and evidence-dense; think one more ste
 - Tests: `[command]` → `[result]`
 - Build/Typecheck: `[command]` → `[result]`
 
+## Artifact Save Body
+- Goal and accepted scope
+- Changed files and behavior changes
+- Implementation decisions and rejected shortcuts
+- Verification evidence
+- Remaining risks or follow-up handoff
+
 ## Assumptions / Notes
 - Key assumptions made and how they were handled
 

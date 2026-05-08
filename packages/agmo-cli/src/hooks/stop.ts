@@ -1,5 +1,8 @@
 import { removeSessionComposedAgentsFile } from "../agents/agents-md.js";
-import { saveSessionCheckpointNote } from "../vault/checkpoint.js";
+import {
+  saveSessionCheckpointNote,
+  saveWorkflowArtifactNote
+} from "../vault/checkpoint.js";
 import { resolveVaultRoot } from "../vault/runtime.js";
 import { persistSessionWisdomOutcome } from "../wisdom/store.js";
 import { readOptionalSessionId } from "./runtime-state.js";
@@ -20,6 +23,16 @@ export async function handleStop(args: {
   if (stoppedState) {
     const vault = await resolveVaultRoot(args.cwd);
     if (vault.vault_root && vault.source !== "none") {
+      try {
+        await saveWorkflowArtifactNote({
+          cwd: args.cwd,
+          trigger: "stop",
+          sessionState: stoppedState
+        });
+      } catch (error) {
+        void error;
+      }
+
       try {
         await saveSessionCheckpointNote({
           cwd: args.cwd,
