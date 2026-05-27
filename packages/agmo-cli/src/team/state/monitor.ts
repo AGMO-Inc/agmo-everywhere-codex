@@ -13,6 +13,8 @@ export type AgmoWorkerStatus = {
 
 export type AgmoWorkerHealth = "healthy" | "stale" | "dead";
 
+export type AgmoTmuxPaneHealth = "live" | "missing" | "orphaned" | "unknown";
+
 export type AgmoWorkerMonitorSnapshot = {
   worker_name: string;
   role: string;
@@ -32,6 +34,14 @@ export type AgmoWorkerMonitorSnapshot = {
   reasons: string[];
 };
 
+export type AgmoTmuxPaneMonitorSnapshot = {
+  role: "leader" | "hud";
+  pane_id?: string | null;
+  session_id?: string | null;
+  health: AgmoTmuxPaneHealth;
+  reasons: string[];
+};
+
 export type AgmoTeamMonitorSnapshot = {
   team_name: string;
   checked_at: string;
@@ -42,4 +52,6 @@ export type AgmoTeamMonitorSnapshot = {
   stale_workers: number;
   dead_workers: number;
   workers: AgmoWorkerMonitorSnapshot[];
+  leader?: AgmoTmuxPaneMonitorSnapshot;
+  hud?: AgmoTmuxPaneMonitorSnapshot;
 };

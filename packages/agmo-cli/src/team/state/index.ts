@@ -31,6 +31,7 @@ export type AgmoTeamConfig = {
   tmux: {
     available: boolean;
     in_tmux_client: boolean;
+    session_id?: string | null;
     leader_pane_id: string | null;
     hud_pane_id?: string | null;
     hud_refresh_ms?: number | null;
@@ -97,6 +98,43 @@ export type AgmoTeamStatusSnapshot = {
   leader_escalations?: AgmoLeaderEscalationState | null;
   leader_nudges?: AgmoLeaderNudgeState | null;
   integrations?: AgmoTeamIntegrationState | null;
+  shutdown?: AgmoTeamShutdownState | null;
+  pane_close_retry?: AgmoPaneCloseRetryState | null;
+};
+
+export type AgmoTeamShutdownAck = {
+  worker_name: string;
+  pane_id?: string | null;
+  acked_at: string;
+};
+
+export type AgmoTeamShutdownState = {
+  requested: boolean;
+  request_id: string;
+  requested_at: string;
+  grace_ms: number;
+  hard_kill_after_at: string;
+  message: string;
+  acknowledgements: AgmoTeamShutdownAck[];
+};
+
+export type AgmoPaneCloseRetryEntry = {
+  pane_id: string;
+  team_name: string;
+  role: "worker" | "hud" | "unknown";
+  worker_name?: string;
+  session_id?: string | null;
+  leader_pane_id?: string | null;
+  attempts: number;
+  first_seen_at: string;
+  last_attempt_at?: string;
+  next_attempt_at: string;
+  last_error?: string;
+};
+
+export type AgmoPaneCloseRetryState = {
+  updated_at: string;
+  entries: AgmoPaneCloseRetryEntry[];
 };
 
 export function nowIso(): string {
@@ -317,6 +355,20 @@ export function resolveTeamIntegrationsPath(
   cwd = process.cwd()
 ): string {
   return join(resolveTeamDir(teamName, cwd), "integrations.json");
+}
+
+export function resolveTeamShutdownPath(
+  teamName: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "shutdown.json");
+}
+
+export function resolveTeamPaneCloseRetryPath(
+  teamName: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "pane-close-retry.json");
 }
 
 export function resolveTeamIntegrationAssistPath(

@@ -10,9 +10,12 @@ import {
 } from "./role-router.js";
 import {
   createTeamSession,
+  createHudPane,
   describeTmuxSessionTopology,
   destroyWorkerPanes,
+  listTmuxPanes,
   notifyPane,
+  type TmuxPaneInfo,
   type TmuxPaneDestructionSummary,
   type TmuxTopology
 } from "./tmux-session.js";
@@ -47,8 +50,10 @@ import {
   resolveTeamMonitorPolicyPath,
   resolveTeamMailboxDir,
   resolveTeamManifestPath,
+  resolveTeamPaneCloseRetryPath,
   resolveTeamMonitorSnapshotPath,
   resolveTeamPhasePath,
+  resolveTeamShutdownPath,
   resolveTeamStateRoot,
   resolveTeamTaskPath,
   resolveTeamTasksDir,
@@ -64,6 +69,10 @@ import {
   type AgmoTeamManifest,
   type AgmoTeamPhaseState,
   type AgmoTeamStatusSnapshot,
+  type AgmoPaneCloseRetryEntry,
+  type AgmoPaneCloseRetryState,
+  type AgmoTeamShutdownAck,
+  type AgmoTeamShutdownState,
   type AgmoWorkerIdentity
 } from "./state/index.js";
 import type {
@@ -91,6 +100,7 @@ import type {
 import type { AgmoMailboxMessage } from "./state/mailbox.js";
 import type {
   AgmoTeamMonitorSnapshot,
+  AgmoTmuxPaneMonitorSnapshot,
   AgmoWorkerHeartbeat,
   AgmoWorkerHealth,
   AgmoWorkerMonitorSnapshot,
@@ -138,6 +148,8 @@ const LEADER_ALERT_DELIVERY_HISTORY_LIMIT = 200;
 const DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail";
 const DEFAULT_EMAIL_FROM = "agmo@localhost";
 const DEFAULT_EMAIL_SUBJECT_PREFIX = "[AGMO Leader Alert]";
+const DEFAULT_SHUTDOWN_GRACE_MS = 0;
+const PANE_CLOSE_RETRY_DELAY_MS = 30_000;
 
 function emptyTmuxPaneDestructionSummary(): TmuxPaneDestructionSummary {
   return {
@@ -871,6 +883,276 @@ async function writeIntegrationState(
   cwd = process.cwd()
 ): Promise<void> {
   await writeJsonFile(resolveTeamIntegrationsPath(teamName, cwd), state);
+}
+
+async function readShutdownState(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoTeamShutdownState | null> {
+  return await readJsonFile<AgmoTeamShutdownState>(
+    resolveTeamShutdownPath(teamName, cwd)
+  );
+}
+
+async function writeShutdownState(
+  teamName: string,
+  state: AgmoTeamShutdownState,
+  cwd = process.cwd()
+): Promise<void> {
+  await writeJsonFile(resolveTeamShutdownPath(teamName, cwd), state);
+}
+
+async function readPaneCloseRetryState(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoPaneCloseRetryState | null> {
+  return await readJsonFile<AgmoPaneCloseRetryState>(
+    resolveTeamPaneCloseRetryPath(teamName, cwd)
+  );
+}
+
+async function writePaneCloseRetryState(
+  teamName: string,
+  state: AgmoPaneCloseRetryState,
+  cwd = process.cwd()
+): Promise<void> {
+  await writeJsonFile(resolveTeamPaneCloseRetryPath(teamName, cwd), state);
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function paneRetryDelayFromAttempts(attempts: number): number {
+  return PANE_CLOSE_RETRY_DELAY_MS * Math.max(attempts, 1);
+}
+
+function collectTrackedTmuxPanes(status: AgmoTeamStatusSnapshot): AgmoPaneCloseRetryEntry[] {
+  const timestamp = nowIso();
+  const entries: AgmoPaneCloseRetryEntry[] = [];
+  for (const worker of status.workers) {
+    const paneId = status.config.tmux.worker_pane_ids[worker.identity.name] ?? worker.identity.pane_id;
+    if (!paneId) {
+      continue;
+    }
+    entries.push({
+      pane_id: paneId,
+      team_name: status.config.name,
+      role: "worker",
+      worker_name: worker.identity.name,
+      session_id: status.config.tmux.session_id ?? null,
+      leader_pane_id: status.config.tmux.leader_pane_id,
+      attempts: 0,
+      first_seen_at: timestamp,
+      next_attempt_at: timestamp
+    });
+  }
+  if (status.config.tmux.hud_pane_id) {
+    entries.push({
+      pane_id: status.config.tmux.hud_pane_id,
+      team_name: status.config.name,
+      role: "hud",
+      session_id: status.config.tmux.session_id ?? null,
+      leader_pane_id: status.config.tmux.leader_pane_id,
+      attempts: 0,
+      first_seen_at: timestamp,
+      next_attempt_at: timestamp
+    });
+  }
+  return entries;
+}
+
+async function enqueuePaneCloseRetries(
+  teamName: string,
+  candidates: AgmoPaneCloseRetryEntry[],
+  summary: TmuxPaneDestructionSummary,
+  cwd = process.cwd()
+): Promise<AgmoPaneCloseRetryState> {
+  const timestamp = nowIso();
+  const current =
+    (await readPaneCloseRetryState(teamName, cwd)) ?? {
+      updated_at: timestamp,
+      entries: []
+    };
+  const currentByPane = new Map(current.entries.map((entry) => [entry.pane_id, entry]));
+  const candidateByPane = new Map(candidates.map((entry) => [entry.pane_id, entry]));
+  for (const result of summary.panes) {
+    if (result.status === "killed") {
+      currentByPane.delete(result.pane_id);
+      continue;
+    }
+    if (result.status !== "failed" && result.reason !== "topology_guard") {
+      continue;
+    }
+    const previous = currentByPane.get(result.pane_id);
+    const candidate = candidateByPane.get(result.pane_id);
+    if (!candidate) {
+      continue;
+    }
+    const attempts = (previous?.attempts ?? candidate.attempts) + 1;
+    currentByPane.set(result.pane_id, {
+      ...candidate,
+      ...previous,
+      attempts,
+      last_attempt_at: timestamp,
+      next_attempt_at: new Date(Date.parse(timestamp) + paneRetryDelayFromAttempts(attempts)).toISOString(),
+      last_error: result.error
+    });
+  }
+  const next = {
+    updated_at: timestamp,
+    entries: Array.from(currentByPane.values())
+  };
+  await writePaneCloseRetryState(teamName, next, cwd);
+  return next;
+}
+
+async function processPaneCloseRetryQueue(
+  teamName: string,
+  options: {
+    dryRun?: boolean;
+    force?: boolean;
+  } = {},
+  cwd = process.cwd()
+): Promise<{
+  pending: number;
+  due: AgmoPaneCloseRetryEntry[];
+  dry_run: boolean;
+  tmux_pane_destruction: TmuxPaneDestructionSummary;
+}> {
+  const retryState = await readPaneCloseRetryState(teamName, cwd);
+  const entries = retryState?.entries ?? [];
+  const timestamp = nowIso();
+  const timestampMs = Date.parse(timestamp);
+  const due = entries.filter(
+    (entry) => options.force || Date.parse(entry.next_attempt_at) <= timestampMs
+  );
+  if (due.length === 0 || options.dryRun) {
+    return {
+      pending: entries.length,
+      due,
+      dry_run: options.dryRun ?? false,
+      tmux_pane_destruction: emptyTmuxPaneDestructionSummary()
+    };
+  }
+
+  const bySession = new Map<string | null | undefined, AgmoPaneCloseRetryEntry[]>();
+  for (const entry of due) {
+    const key = entry.session_id ?? null;
+    bySession.set(key, [...(bySession.get(key) ?? []), entry]);
+  }
+  const summaries: TmuxPaneDestructionSummary[] = [];
+  for (const [sessionId, group] of bySession) {
+    summaries.push(
+      destroyWorkerPanes(
+        group.map((entry) => entry.pane_id),
+        undefined,
+        {
+          expectedSessionId: sessionId ?? null,
+          leaderPaneId: group[0]?.leader_pane_id,
+          currentPaneId: process.env.TMUX_PANE ?? null
+        }
+      )
+    );
+  }
+  const tmuxPaneDestruction = mergeTmuxPaneDestructionSummaries(summaries);
+  await enqueuePaneCloseRetries(teamName, due, tmuxPaneDestruction, cwd);
+  return {
+    pending: (await readPaneCloseRetryState(teamName, cwd))?.entries.length ?? 0,
+    due,
+    dry_run: false,
+    tmux_pane_destruction: tmuxPaneDestruction
+  };
+}
+
+function mergeTmuxPaneDestructionSummaries(
+  summaries: TmuxPaneDestructionSummary[]
+): TmuxPaneDestructionSummary {
+  const panes = summaries.flatMap((summary) => summary.panes);
+  return {
+    panes,
+    killed: panes.filter((pane) => pane.status === "killed").length,
+    failed: panes.filter((pane) => pane.status === "failed").length,
+    skipped: panes.filter((pane) => pane.status === "skipped").length
+  };
+}
+
+function buildTmuxPaneMonitor(
+  role: "leader" | "hud",
+  paneId: string | null | undefined,
+  expectedSessionId: string | null | undefined,
+  panes: TmuxPaneInfo[]
+): AgmoTmuxPaneMonitorSnapshot {
+  if (!paneId) {
+    return {
+      role,
+      pane_id: paneId ?? null,
+      session_id: expectedSessionId ?? null,
+      health: "unknown",
+      reasons: ["pane_not_configured"]
+    };
+  }
+
+  const pane = panes.find((entry) => entry.pane_id === paneId);
+  if (!pane) {
+    return {
+      role,
+      pane_id: paneId,
+      session_id: expectedSessionId ?? null,
+      health: "missing",
+      reasons: ["pane_not_found"]
+    };
+  }
+
+  const reasons: string[] = [];
+  if (expectedSessionId && pane.session_id !== expectedSessionId) {
+    reasons.push("session_mismatch");
+  }
+  if (pane.dead) {
+    reasons.push("pane_dead");
+  }
+
+  return {
+    role,
+    pane_id: paneId,
+    session_id: pane.session_id,
+    health: reasons.length > 0 ? "orphaned" : "live",
+    reasons
+  };
+}
+
+function isUnavailableTmuxPane(pane: AgmoTmuxPaneMonitorSnapshot | undefined): boolean {
+  return Boolean(pane && pane.health !== "live" && pane.health !== "unknown");
+}
+
+async function recordShutdownAckIfRequested(
+  teamName: string,
+  workerName: string,
+  cwd = process.cwd()
+): Promise<AgmoTeamShutdownAck | null> {
+  const shutdown = await readShutdownState(teamName, cwd);
+  if (!shutdown?.requested) {
+    return null;
+  }
+  const existing = shutdown.acknowledgements.find((ack) => ack.worker_name === workerName);
+  if (existing) {
+    return existing;
+  }
+  const identity = await readWorkerIdentity(teamName, workerName, cwd);
+  const ack: AgmoTeamShutdownAck = {
+    worker_name: workerName,
+    pane_id: identity.pane_id ?? null,
+    acked_at: nowIso()
+  };
+  await writeShutdownState(
+    teamName,
+    {
+      ...shutdown,
+      acknowledgements: [...shutdown.acknowledgements, ack]
+    },
+    cwd
+  );
+  return ack;
 }
 
 function runGit(
@@ -2050,6 +2332,12 @@ export async function buildLeaderMonitorView(
   const monitorByWorker = new Map(snapshot.workers.map((worker) => [worker.worker_name, worker]));
   const actions: string[] = [];
 
+  if (isUnavailableTmuxPane(snapshot.leader)) {
+    actions.push(`Leader tmux pane is ${snapshot.leader?.health}; run \`agmo team cleanup-stale --sweep-tmux\` or \`agmo team shutdown ${normalizedTeamName} --grace-ms 0\` after confirming durable state.`);
+  }
+  if (isUnavailableTmuxPane(snapshot.hud)) {
+    actions.push(`Run \`agmo team hud ${normalizedTeamName} --repair\` to recreate the HUD pane.`);
+  }
   if (snapshot.dead_workers > 0 || snapshot.stale_workers > 0) {
     actions.push(`Run \`agmo team monitor ${normalizedTeamName} --auto-nudge\` to nudge non-reporting workers.`);
   }
@@ -2131,6 +2419,12 @@ export async function buildLeaderMonitorView(
           .map((entry) => `${entry.channel}:${entry.status}`)
           .join(", ")}`
       : "- leader_alert_delivery: none";
+  const leaderPaneSummary = snapshot.leader
+    ? `- leader_pane: ${snapshot.leader.pane_id ?? "none"} ${snapshot.leader.health}${snapshot.leader.reasons.length > 0 ? ` (${snapshot.leader.reasons.join(",")})` : ""}`
+    : "- leader_pane: n/a";
+  const hudPaneSummary = snapshot.hud
+    ? `- hud_pane: ${snapshot.hud.pane_id ?? "none"} ${snapshot.hud.health}${snapshot.hud.reasons.length > 0 ? ` (${snapshot.hud.reasons.join(",")})` : ""}`
+    : "- hud_pane: n/a";
 
   const markdown = [
     `# Leader Monitor View`,
@@ -2143,6 +2437,8 @@ export async function buildLeaderMonitorView(
     `- tasks: pending=${taskCounts.pending}, in_progress=${taskCounts.in_progress}, blocked=${taskCounts.blocked}, completed=${taskCounts.completed}, failed=${taskCounts.failed}`,
     `- pending_dispatch_requests: ${pendingDispatch}`,
     `- open_load_delta: ${openLoadDelta}`,
+    leaderPaneSummary,
+    hudPaneSummary,
     nudgeSummary,
     recoverySummary,
     alertSummary,
@@ -2227,6 +2523,12 @@ export async function buildLeaderHudView(
   if (activeLeaderAlerts > 0) {
     topActions.push("alert");
   }
+  if (isUnavailableTmuxPane(snapshot.leader)) {
+    topActions.push("leader-orphan");
+  }
+  if (isUnavailableTmuxPane(snapshot.hud)) {
+    topActions.push("repair-hud");
+  }
 
   const workerLines = snapshot.workers
     .map((worker) => {
@@ -2241,6 +2543,7 @@ export async function buildLeaderHudView(
   const text = [
     `AGMO HUD | team=${normalizedTeamName} | checked=${snapshot.checked_at}`,
     `workers h=${snapshot.healthy_workers} s=${snapshot.stale_workers} d=${snapshot.dead_workers} active=${snapshot.active_workers} | tasks p=${taskCounts.pending} w=${taskCounts.in_progress} b=${taskCounts.blocked} c=${taskCounts.completed} f=${taskCounts.failed} | alerts=${activeLeaderAlerts}`,
+    `tmux leader=${snapshot.leader?.health ?? "n/a"} hud=${snapshot.hud?.health ?? "n/a"}`,
     `dispatch_pending=${pendingDispatch} | open_load_delta=${openLoadDelta} | actions=${topActions.length > 0 ? topActions.join(",") : "none"}`,
     "",
     workerLines || "no workers"
@@ -2253,6 +2556,110 @@ export async function buildLeaderHudView(
     team_name: normalizedTeamName,
     path,
     text
+  };
+}
+
+export async function repairTeamHudPane(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  status: "repaired" | "unchanged" | "skipped" | "failed";
+  reason?: string;
+  previous_hud_pane_id?: string | null;
+  hud_pane_id?: string | null;
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+
+  if (status.config.transport !== "tmux") {
+    return {
+      team_name: normalizedTeamName,
+      status: "skipped",
+      reason: "team_not_using_tmux"
+    };
+  }
+
+  if (!status.config.tmux.hud_refresh_ms) {
+    return {
+      team_name: normalizedTeamName,
+      status: "skipped",
+      reason: "hud_not_configured"
+    };
+  }
+
+  const snapshot = await monitorTeamRuntime(normalizedTeamName, {}, cwd);
+  if (snapshot.hud?.health === "live") {
+    return {
+      team_name: normalizedTeamName,
+      status: "unchanged",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+      hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    };
+  }
+
+  if (isUnavailableTmuxPane(snapshot.leader)) {
+    return {
+      team_name: normalizedTeamName,
+      status: "failed",
+      reason: "leader_pane_unavailable",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    };
+  }
+
+  const nextHudPaneId = createHudPane(
+    {
+      teamName: normalizedTeamName,
+      projectRoot: cwd,
+      cliEntryPath: agmoCliDistEntryPath(),
+      refreshMs: Math.max(status.config.tmux.hud_refresh_ms, 250),
+      clearScreen: status.config.tmux.hud_clear_screen ?? true
+    },
+    {
+      targetPaneId: status.config.tmux.leader_pane_id
+    }
+  );
+  if (!nextHudPaneId) {
+    return {
+      team_name: normalizedTeamName,
+      status: "failed",
+      reason: "hud_pane_create_failed",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    };
+  }
+
+  const timestamp = nowIso();
+  const nextConfig: AgmoTeamConfig = {
+    ...status.config,
+    updated_at: timestamp,
+    tmux: {
+      ...status.config.tmux,
+      hud_pane_id: nextHudPaneId
+    }
+  };
+  await Promise.all([
+    writeJsonFile(resolveTeamConfigPath(normalizedTeamName, cwd), nextConfig),
+    writeEvent(
+      normalizedTeamName,
+      {
+        timestamp,
+        type: "team_hud_repaired",
+        team_name: normalizedTeamName,
+        previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+        hud_pane_id: nextHudPaneId
+      },
+      cwd
+    )
+  ]);
+
+  return {
+    team_name: normalizedTeamName,
+    status: "repaired",
+    previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+    hud_pane_id: nextHudPaneId
   };
 }
 
@@ -2386,6 +2793,7 @@ export async function startTeamRuntime(
     tmux: {
       available: tmux.available,
       in_tmux_client: tmux.in_tmux_client,
+      session_id: tmux.session_id,
       leader_pane_id: tmux.leader_pane_id,
       hud_pane_id: null,
       hud_refresh_ms: request.hud ? Math.max(request.hudRefreshMs ?? 2000, 250) : null,
@@ -2554,6 +2962,7 @@ export async function startTeamRuntime(
     );
 
     config.transport = "tmux";
+    config.tmux.session_id = createdSession.sessionId;
     config.tmux.leader_pane_id = createdSession.leaderPaneId;
     config.tmux.hud_pane_id = createdSession.hudPaneId ?? null;
     config.tmux.worker_pane_ids = createdSession.workerPaneIds;
@@ -2650,6 +3059,8 @@ export async function readTeamStatus(
   const leaderEscalations = await readLeaderEscalationState(normalizedTeamName, cwd);
   const leaderAlertDelivery = await readLeaderAlertDeliveryConfig(normalizedTeamName, cwd);
   const integrations = await readIntegrationState(normalizedTeamName, cwd);
+  const shutdown = await readShutdownState(normalizedTeamName, cwd);
+  const paneCloseRetry = await readPaneCloseRetryState(normalizedTeamName, cwd);
 
   const tasks = await Promise.all(
     config.worker_names.map(async (_, index) => {
@@ -2715,14 +3126,23 @@ export async function readTeamStatus(
     leader_alert_delivery: leaderAlertDelivery,
     leader_escalations: leaderEscalations,
     leader_nudges: leaderNudges,
-    integrations
+    integrations,
+    shutdown,
+    pane_close_retry: paneCloseRetry
   };
 }
 
 export async function shutdownTeamRuntime(
   teamName: string,
-  cwd = process.cwd()
+  optionsOrCwd:
+    | {
+        graceMs?: number;
+      }
+    | string = {},
+  cwdArg = process.cwd()
 ): Promise<Record<string, unknown>> {
+  const options = typeof optionsOrCwd === "string" ? {} : optionsOrCwd;
+  const cwd = typeof optionsOrCwd === "string" ? optionsOrCwd : cwdArg;
   const status = await readTeamStatus(teamName, cwd);
 
   if (!status) {
@@ -2730,6 +3150,50 @@ export async function shutdownTeamRuntime(
   }
 
   const timestamp = nowIso();
+  const graceMs = Math.max(options.graceMs ?? DEFAULT_SHUTDOWN_GRACE_MS, 0);
+  const shutdownState: AgmoTeamShutdownState = {
+    requested: true,
+    request_id: `shutdown-${randomUUID()}`,
+    requested_at: timestamp,
+    grace_ms: graceMs,
+    hard_kill_after_at: new Date(Date.parse(timestamp) + graceMs).toISOString(),
+    message: "Team runtime shutdown requested. Finish current note, report idle, and exit this worker pane.",
+    acknowledgements: []
+  };
+  await writeShutdownState(status.config.name, shutdownState, cwd);
+
+  const shutdownNotifications = await Promise.all(
+    status.workers.map(async (worker) => {
+      const message: AgmoMailboxMessage = {
+        message_id: createMessageId(),
+        from_worker: "leader-fixed",
+        to_worker: worker.identity.name,
+        body: shutdownState.message,
+        created_at: timestamp
+      };
+      await appendMailboxMessage(status.config.name, worker.identity.name, message, cwd);
+      const paneId =
+        status.config.tmux.worker_pane_ids[worker.identity.name] ?? worker.identity.pane_id;
+      return {
+        worker_name: worker.identity.name,
+        pane_id: paneId ?? null,
+        notified: paneId ? notifyPane(paneId, shutdownState.message) : false
+      };
+    })
+  );
+
+  if (graceMs > 0) {
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline) {
+      const latest = await readShutdownState(status.config.name, cwd);
+      if ((latest?.acknowledgements.length ?? 0) >= status.workers.length) {
+        break;
+      }
+      await sleepMs(Math.min(100, Math.max(0, deadline - Date.now())));
+    }
+  }
+
+  const latestShutdownState = (await readShutdownState(status.config.name, cwd)) ?? shutdownState;
   const nextConfig: AgmoTeamConfig = {
     ...status.config,
     active: false,
@@ -2775,11 +3239,28 @@ export async function shutdownTeamRuntime(
 
   const tmuxPaneDestruction =
     status.config.transport === "tmux"
-      ? destroyWorkerPanes([
-          ...Object.values(status.config.tmux.worker_pane_ids),
-          ...(status.config.tmux.hud_pane_id ? [status.config.tmux.hud_pane_id] : [])
-        ])
+      ? destroyWorkerPanes(
+          [
+            ...Object.values(status.config.tmux.worker_pane_ids),
+            ...(status.config.tmux.hud_pane_id ? [status.config.tmux.hud_pane_id] : [])
+          ],
+          undefined,
+          {
+            expectedSessionId: status.config.tmux.session_id ?? null,
+            leaderPaneId: status.config.tmux.leader_pane_id,
+            currentPaneId: process.env.TMUX_PANE ?? null
+          }
+        )
       : emptyTmuxPaneDestructionSummary();
+  const paneCloseRetry =
+    status.config.transport === "tmux"
+      ? await enqueuePaneCloseRetries(
+          status.config.name,
+          collectTrackedTmuxPanes(status),
+          tmuxPaneDestruction,
+          cwd
+        )
+      : null;
 
   await writeEvent(
     status.config.name,
@@ -2787,6 +3268,9 @@ export async function shutdownTeamRuntime(
       timestamp,
       type: "team_shutdown",
       team_name: status.config.name,
+      shutdown_request_id: latestShutdownState.request_id,
+      shutdown_ack_count: latestShutdownState.acknowledgements.length,
+      shutdown_notifications: shutdownNotifications,
       tmux_pane_destruction: tmuxPaneDestruction
     },
     cwd
@@ -2799,10 +3283,17 @@ export async function shutdownTeamRuntime(
     tasks_failed: nextTasks.filter((task) => task.status === "failed").length,
     dispatch_requests_failed: nextDispatchRequests.filter((request) => request.status === "failed")
       .length,
+    shutdown_request: latestShutdownState,
+    shutdown_notifications: shutdownNotifications,
     tmux_pane_destruction: tmuxPaneDestruction,
+    pane_close_retry: paneCloseRetry,
     preserved_state_root: resolveTeamDir(status.config.name, cwd)
   };
 }
+
+type CleanupStaleReason = "all_workers_dead" | "no_healthy_workers" | "leader_orphaned";
+
+type PaneCloseRetryResult = Awaited<ReturnType<typeof processPaneCloseRetryQueue>>;
 
 export async function cleanupStaleTeamRuntimes(
   options: {
@@ -2810,6 +3301,8 @@ export async function cleanupStaleTeamRuntimes(
     deadAfterMs?: number;
     includeStale?: boolean;
     dryRun?: boolean;
+    retryPaneCloses?: boolean;
+    sweepTmux?: boolean;
   } = {},
   cwd = process.cwd()
 ): Promise<{
@@ -2818,29 +3311,103 @@ export async function cleanupStaleTeamRuntimes(
   active_team_count: number;
   cleaned: Array<{
     team_name: string;
-    reason: "all_workers_dead" | "no_healthy_workers";
+    reason: CleanupStaleReason;
     healthy_workers: number;
     stale_workers: number;
     dead_workers: number;
+    leader_health?: string;
     dry_run: boolean;
     shutdown?: Record<string, unknown>;
   }>;
+  tmux_sweep: {
+    retry_queues: Array<PaneCloseRetryResult & { team_name: string }>;
+    stale_panes: Array<{
+      team_name: string;
+      pane_count: number;
+      dry_run: boolean;
+      tmux_pane_destruction: TmuxPaneDestructionSummary;
+      pane_close_retry?: AgmoPaneCloseRetryState;
+    }>;
+  };
 }> {
   const checkedAt = nowIso();
   const teamNames = await listTeamNames(cwd);
   const cleaned: Array<{
     team_name: string;
-    reason: "all_workers_dead" | "no_healthy_workers";
+    reason: CleanupStaleReason;
     healthy_workers: number;
     stale_workers: number;
     dead_workers: number;
+    leader_health?: string;
     dry_run: boolean;
     shutdown?: Record<string, unknown>;
+  }> = [];
+  const retryQueueResults: Array<PaneCloseRetryResult & { team_name: string }> = [];
+  const stalePaneSweeps: Array<{
+    team_name: string;
+    pane_count: number;
+    dry_run: boolean;
+    tmux_pane_destruction: TmuxPaneDestructionSummary;
+    pane_close_retry?: AgmoPaneCloseRetryState;
   }> = [];
   let activeTeamCount = 0;
 
   for (const teamName of teamNames) {
     const status = await readTeamStatus(teamName, cwd);
+    if (!status) {
+      continue;
+    }
+
+    if (options.retryPaneCloses !== false) {
+      const retryResult = await processPaneCloseRetryQueue(
+        teamName,
+        { dryRun: options.dryRun },
+        cwd
+      );
+      if (retryResult.pending > 0 || retryResult.due.length > 0) {
+        retryQueueResults.push({
+          team_name: teamName,
+          ...retryResult
+        });
+      }
+    }
+
+    if (
+      options.sweepTmux &&
+      (!status.config.active || !status.phase.active) &&
+      status.config.transport === "tmux"
+    ) {
+      const candidates = collectTrackedTmuxPanes(status);
+      if (candidates.length > 0) {
+        const tmuxPaneDestruction = options.dryRun
+          ? emptyTmuxPaneDestructionSummary()
+          : destroyWorkerPanes(
+              candidates.map((entry) => entry.pane_id),
+              undefined,
+              {
+                expectedSessionId: status.config.tmux.session_id ?? null,
+                leaderPaneId: status.config.tmux.leader_pane_id,
+                currentPaneId: process.env.TMUX_PANE ?? null
+              }
+            );
+        const paneCloseRetry = options.dryRun
+          ? undefined
+          : await enqueuePaneCloseRetries(
+              teamName,
+              candidates,
+              tmuxPaneDestruction,
+              cwd
+            );
+        stalePaneSweeps.push({
+          team_name: teamName,
+          pane_count: candidates.length,
+          dry_run: options.dryRun ?? false,
+          tmux_pane_destruction: tmuxPaneDestruction,
+          ...(paneCloseRetry ? { pane_close_retry: paneCloseRetry } : {})
+        });
+      }
+    }
+
     if (!status || !status.config.active || !status.phase.active) {
       continue;
     }
@@ -2861,19 +3428,26 @@ export async function cleanupStaleTeamRuntimes(
 
     const deadOnly = snapshot.dead_workers === workerCount;
     const staleOnly = options.includeStale && snapshot.healthy_workers === 0;
-    if (!deadOnly && !staleOnly) {
+    const leaderOrphaned = isUnavailableTmuxPane(snapshot.leader);
+    if (!deadOnly && !staleOnly && !leaderOrphaned) {
       continue;
     }
 
+    const reason: CleanupStaleReason = leaderOrphaned
+      ? "leader_orphaned"
+      : deadOnly
+        ? "all_workers_dead"
+        : "no_healthy_workers";
     cleaned.push({
       team_name: teamName,
-      reason: deadOnly ? "all_workers_dead" : "no_healthy_workers",
+      reason,
       healthy_workers: snapshot.healthy_workers,
       stale_workers: snapshot.stale_workers,
       dead_workers: snapshot.dead_workers,
+      ...(snapshot.leader ? { leader_health: snapshot.leader.health } : {}),
       dry_run: options.dryRun ?? false,
       ...(!(options.dryRun ?? false)
-        ? { shutdown: await shutdownTeamRuntime(teamName, cwd) }
+        ? { shutdown: await shutdownTeamRuntime(teamName, { graceMs: 0 }, cwd) }
         : {})
     });
   }
@@ -2882,7 +3456,11 @@ export async function cleanupStaleTeamRuntimes(
     checked_at: checkedAt,
     team_count: teamNames.length,
     active_team_count: activeTeamCount,
-    cleaned
+    cleaned,
+    tmux_sweep: {
+      retry_queues: retryQueueResults,
+      stale_panes: stalePaneSweeps
+    }
   };
 }
 
@@ -3399,6 +3977,7 @@ export async function heartbeatWorker(
       { pid: resolveReportedWorkerPid() },
       cwd
     ),
+    recordShutdownAckIfRequested(normalizedTeamName, workerName, cwd),
     writeEvent(
       normalizedTeamName,
       {
@@ -3455,6 +4034,7 @@ export async function reportWorkerStatus(
       { pid: resolveReportedWorkerPid() },
       cwd
     ),
+    recordShutdownAckIfRequested(normalizedTeamName, workerName, cwd),
     writeEvent(
       normalizedTeamName,
       {
@@ -3537,6 +4117,7 @@ export async function recordWorkerHookActivity(
     nextStatus
       ? writeWorkerStatus(normalizedTeamName, workerName, nextStatus, cwd)
       : Promise.resolve(),
+    recordShutdownAckIfRequested(normalizedTeamName, workerName, cwd),
     writeEvent(
       normalizedTeamName,
       {
@@ -3656,6 +4237,26 @@ export async function monitorTeamRuntime(
     });
   }
 
+  const tmuxPanes = status.config.transport === "tmux" ? listTmuxPanes() : [];
+  const leader =
+    status.config.transport === "tmux"
+      ? buildTmuxPaneMonitor(
+          "leader",
+          status.config.tmux.leader_pane_id,
+          status.config.tmux.session_id ?? null,
+          tmuxPanes
+        )
+      : undefined;
+  const hud =
+    status.config.transport === "tmux" && status.config.tmux.hud_pane_id
+      ? buildTmuxPaneMonitor(
+          "hud",
+          status.config.tmux.hud_pane_id,
+          status.config.tmux.session_id ?? null,
+          tmuxPanes
+        )
+      : undefined;
+
   const snapshot: AgmoTeamMonitorSnapshot = {
     team_name: normalizedTeamName,
     checked_at: checkedAt,
@@ -3665,7 +4266,9 @@ export async function monitorTeamRuntime(
     healthy_workers: workers.filter((worker) => worker.health === "healthy").length,
     stale_workers: workers.filter((worker) => worker.health === "stale").length,
     dead_workers: workers.filter((worker) => worker.health === "dead").length,
-    workers
+    workers,
+    ...(leader ? { leader } : {}),
+    ...(hud ? { hud } : {})
   };
 
   await Promise.all([
@@ -3677,7 +4280,9 @@ export async function monitorTeamRuntime(
         type: "team_monitor_snapshot",
         team_name: normalizedTeamName,
         stale_workers: snapshot.stale_workers,
-        dead_workers: snapshot.dead_workers
+        dead_workers: snapshot.dead_workers,
+        leader_health: snapshot.leader?.health,
+        hud_health: snapshot.hud?.health
       },
       cwd
     )

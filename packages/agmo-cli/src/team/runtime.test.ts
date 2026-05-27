@@ -7,6 +7,7 @@ import {
   claimTaskForWorker,
   cleanupStaleTeamRuntimes,
   completeTaskForWorker,
+  monitorTeamRuntime,
   readTeamStatus,
   shutdownTeamRuntime,
   shouldSpawnTeamTmuxPanes,
@@ -15,6 +16,7 @@ import {
 import {
   resolveTeamConfigPath,
   resolveTeamDispatchPath,
+  resolveTeamPaneCloseRetryPath,
   resolveTeamTaskPath,
   resolveWorkerHeartbeatPath,
   resolveWorkerStatusPath
@@ -131,9 +133,11 @@ test("shutdownTeamRuntime clears active worker, task, and dispatch state", async
   assert.equal(result.current_phase, "shutdown");
   assert.equal(result.tasks_failed, 2);
   assert.equal(result.dispatch_requests_failed, 1);
+  assert.equal((result.shutdown_request as { requested?: boolean }).requested, true);
 
   const status = await readTeamStatus(teamName, tempRoot);
   assert.ok(status);
+  assert.equal(status.shutdown?.requested, true);
   assert.equal(status.config.active, false);
   assert.equal(status.config.phase, "shutdown");
   assert.equal(status.phase.active, false);
@@ -255,6 +259,53 @@ test("completeTaskForWorker shuts down the team after the last task completes", 
   assert.match(events, /"type":"task_completed"/);
   assert.match(events, /"type":"team_shutdown"/);
   assert.match(events, /"tmux_pane_destruction"/);
+});
+
+test("shutdownTeamRuntime records pane-close retries when guarded tmux panes remain", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-pane-retry-"));
+  const teamName = "pane-retry-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Retry guarded pane closes",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const configPath = resolveTeamConfigPath(teamName, tempRoot);
+  const config = JSON.parse(await readFile(configPath, "utf8")) as {
+    transport: string;
+    tmux: {
+      session_id?: string | null;
+      worker_pane_ids: Record<string, string>;
+      hud_pane_id?: string | null;
+    };
+  };
+  config.transport = "tmux";
+  config.tmux.session_id = "$missing-session";
+  config.tmux.worker_pane_ids = {
+    "worker-1": "%998"
+  };
+  config.tmux.hud_pane_id = "%999";
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+  const result = await shutdownTeamRuntime(teamName, { graceMs: 0 }, tempRoot);
+  const destruction = result.tmux_pane_destruction as { skipped: number; killed: number };
+  assert.equal(destruction.killed, 0);
+  assert.equal(destruction.skipped, 2);
+
+  const retryState = JSON.parse(
+    await readFile(resolveTeamPaneCloseRetryPath(teamName, tempRoot), "utf8")
+  ) as { entries: Array<{ pane_id: string; attempts: number; last_error?: string }> };
+  assert.deepEqual(
+    retryState.entries.map((entry) => entry.pane_id).sort(),
+    ["%998", "%999"]
+  );
+  assert.equal(retryState.entries[0]?.attempts, 1);
+  assert.match(retryState.entries[0]?.last_error ?? "", /not found/);
 });
 
 test("completeTaskForWorker keeps the team active while other tasks remain incomplete", async () => {
@@ -583,4 +634,58 @@ test("cleanupStaleTeamRuntimes keeps stale-only teams by default and cleans dead
   assert.equal(staleStatus.phase.active, true);
   assert.equal(healthyStatus.config.active, true);
   assert.equal(healthyStatus.phase.active, true);
+});
+
+test("monitor and cleanup detect orphaned leader tmux panes", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-leader-orphan-"));
+  const teamName = "leader-orphan-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Detect leader orphan",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const configPath = resolveTeamConfigPath(teamName, tempRoot);
+  const config = JSON.parse(await readFile(configPath, "utf8")) as {
+    transport: string;
+    tmux: {
+      session_id?: string | null;
+      leader_pane_id: string | null;
+      worker_pane_ids: Record<string, string>;
+    };
+  };
+  config.transport = "tmux";
+  config.tmux.session_id = "$missing-session";
+  config.tmux.leader_pane_id = "%997";
+  config.tmux.worker_pane_ids = {};
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+  const snapshot = await monitorTeamRuntime(
+    teamName,
+    {
+      staleAfterMs: Number.MAX_SAFE_INTEGER,
+      deadAfterMs: Number.MAX_SAFE_INTEGER
+    },
+    tempRoot
+  );
+  assert.equal(snapshot.leader?.health, "missing");
+  assert.deepEqual(snapshot.leader?.reasons, ["pane_not_found"]);
+
+  const cleanup = await cleanupStaleTeamRuntimes(
+    {
+      staleAfterMs: Number.MAX_SAFE_INTEGER,
+      deadAfterMs: Number.MAX_SAFE_INTEGER,
+      dryRun: true
+    },
+    tempRoot
+  );
+  assert.equal(cleanup.cleaned.length, 1);
+  assert.equal(cleanup.cleaned[0]?.team_name, teamName);
+  assert.equal(cleanup.cleaned[0]?.reason, "leader_orphaned");
+  assert.equal(cleanup.cleaned[0]?.leader_health, "missing");
 });

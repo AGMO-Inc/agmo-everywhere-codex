@@ -14,6 +14,7 @@ import {
   heartbeatWorker,
   integrateTeamChanges,
   monitorTeamRuntime,
+  repairTeamHudPane,
   resolveMonitorPolicy,
   reclaimTeamClaims,
   readTeamStatus,
@@ -229,7 +230,11 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       if (!teamName) {
         throw new Error("team name is required");
       }
-      const result = await shutdownTeamRuntime(teamName, cwd);
+      const graceMs = parseIntegerOption(args.slice(2), "--grace-ms") ?? 2000;
+      if (graceMs < 0) {
+        throw new Error("--grace-ms must be at least 0");
+      }
+      const result = await shutdownTeamRuntime(teamName, { graceMs }, cwd);
       console.log(
         JSON.stringify(
           { command: "team shutdown", ...result },
@@ -248,12 +253,20 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         "--no-include-stale"
       );
       const dryRun = parseBooleanFlag(args.slice(1), "--dry-run", "--no-dry-run");
+      const retryPaneCloses = parseBooleanFlag(
+        args.slice(1),
+        "--retry-pane-closes",
+        "--no-retry-pane-closes"
+      );
+      const sweepTmux = parseBooleanFlag(args.slice(1), "--sweep-tmux", "--no-sweep-tmux");
       const result = await cleanupStaleTeamRuntimes(
         {
           staleAfterMs,
           deadAfterMs,
           includeStale,
-          dryRun
+          dryRun,
+          retryPaneCloses,
+          sweepTmux
         },
         cwd
       );
@@ -422,7 +435,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--leader-view]"
+          "usage: agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]"
         );
       }
       const preset = parseOption(args.slice(2), "--preset");
@@ -469,6 +482,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         "--no-notify-on-claim-risk"
       );
       const leaderView = args.slice(2).includes("--leader-view");
+      const repairHud = args.slice(2).includes("--repair-hud");
       const cooldownRaw = parseOption(args.slice(2), "--nudge-cooldown-ms");
       const reclaimLeaseRaw = parseOption(args.slice(2), "--reclaim-lease-ms");
       const leaderAlertCooldownRaw = parseOption(args.slice(2), "--leader-alert-cooldown-ms");
@@ -567,7 +581,8 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             cwd
           )
         : null;
-      const finalSnapshot = autoRecovery
+      const hudRepair = repairHud ? await repairTeamHudPane(teamName, cwd) : null;
+      const finalSnapshot = autoRecovery || hudRepair?.status === "repaired"
         ? await monitorTeamRuntime(
             teamName,
             {
@@ -632,7 +647,8 @@ export async function runTeamCommand(args: string[]): Promise<void> {
                 ? { leader_alert_delivery: leaderAlertDelivery }
                 : {}),
               ...(autoNudges ? { auto_nudges: autoNudges.nudges } : {}),
-              ...(autoRecovery ? { auto_recovery: autoRecovery.reclaimed } : {})
+              ...(autoRecovery ? { auto_recovery: autoRecovery.reclaimed } : {}),
+              ...(hudRepair ? { hud_repair: hudRepair } : {})
             },
             null,
             2
@@ -702,7 +718,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--clear|--no-clear]"
+          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear]"
         );
       }
       const staleRaw = parseOption(args.slice(2), "--stale-ms");
@@ -711,6 +727,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const iterations = parseIntegerOption(args.slice(2), "--iterations");
       const clearScreen = parseBooleanFlag(args.slice(2), "--clear", "--no-clear") ?? true;
       const watch = args.slice(2).includes("--watch");
+      const repair = args.slice(2).includes("--repair");
       const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
       const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
       if (staleRaw && !Number.isFinite(staleAfterMs)) {
@@ -726,6 +743,9 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("--iterations must be at least 1");
       }
       const runHudOnce = async (): Promise<void> => {
+        if (repair) {
+          await repairTeamHudPane(teamName, cwd);
+        }
         const hud = await buildLeaderHudView(
           teamName,
           { staleAfterMs, deadAfterMs },
@@ -946,18 +966,18 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       console.log(`Usage:
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
   agmo team status <team-name>
-  agmo team shutdown <team-name>
-  agmo team cleanup-stale [--stale-ms <ms>] [--dead-ms <ms>] [--include-stale|--no-include-stale] [--dry-run|--no-dry-run]
+  agmo team shutdown <team-name> [--grace-ms <ms>]
+  agmo team cleanup-stale [--stale-ms <ms>] [--dead-ms <ms>] [--include-stale|--no-include-stale] [--dry-run|--no-dry-run] [--retry-pane-closes|--no-retry-pane-closes] [--sweep-tmux|--no-sweep-tmux]
   agmo team send <team> <worker> "<message>"
   agmo team claim <team> <task-id> <worker> [--ignore-dependencies]
   agmo team complete <team> <task-id> <worker> [result text] [--auto-integrate] [--integrate-strategy cherry-pick|squash] [--integrate-max-commits <n>] [--integrate-target-ref <ref|@base|@current>] [--integrate-checkout-target] [--integrate-on-conflict continue|stop] [--integrate-on-empty skip|fail]
   agmo team fail <team> <task-id> <worker> [error text]
   agmo team heartbeat <team> <worker>
   agmo team report <team> <worker> <idle|working|done|blocked> [--task <id>] [--note <text>]
-  agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--leader-view]
+  agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--slack-username <name>] [--slack-icon-emoji <emoji>] [--email|--no-email] [--email-to <a,b>] [--email-from <addr>] [--email-sendmail-path <path>] [--email-subject-prefix <prefix>]
-  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--clear|--no-clear]
+  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear]
   agmo team dispatch-ack <team> <request-id>
   agmo team dispatch-retry <team> [worker]
   agmo team reclaim <team> [--worker <name>] [--task <id>] [--stale-ms <ms>] [--dead-ms <ms>] [--lease-ms <ms>] [--reassign] [--include-stale]
