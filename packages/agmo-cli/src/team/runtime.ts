@@ -118,7 +118,10 @@ import type {
   AgmoTeamMonitorPolicyState
 } from "./state/policy.js";
 import type { AgmoTeamTaskRecord, AgmoTeamTaskStatus } from "./state/tasks.js";
-import { DEFAULT_TASK_CLAIM_LEASE_MS } from "./state/locks.js";
+import {
+  DEFAULT_TASK_CLAIM_LEASE_MS,
+  withTeamStateLock
+} from "./state/locks.js";
 import { ensureDir, readTextFileIfExists, writeJsonFile, writeTextFile } from "../utils/fs.js";
 
 export type TeamRuntimeMode = "interactive";
@@ -1298,40 +1301,50 @@ async function recordShutdownAckIfRequested(
   } = {},
   cwd = process.cwd()
 ): Promise<AgmoTeamShutdownAck | null> {
-  const shutdown = await readShutdownState(teamName, cwd);
-  if (!shutdown?.requested) {
-    return null;
-  }
-  const identity = await readWorkerIdentity(teamName, workerName, cwd);
-  const source = options.source ?? "auto";
-  const existing = shutdown.acknowledgements.find((entry) => entry.worker_name === workerName);
-  if (source === "auto" && shouldPreserveShutdownAckForAutomaticUpdate(existing)) {
-    return existing;
-  }
-
-  const ack: AgmoTeamShutdownAck = {
-    worker_name: workerName,
-    pane_id: identity.pane_id ?? null,
-    status: options.status ?? "accepted",
-    source,
-    ...(options.reason ? { reason: options.reason } : {}),
-    ...(options.taskId ? { task_id: options.taskId } : {}),
-    acked_at: nowIso()
-  };
-  const acknowledgements = [
-    ...shutdown.acknowledgements.filter((entry) => entry.worker_name !== workerName),
-    ack
-  ];
-  await writeShutdownState(
+  return await withTeamStateLock(
     teamName,
-    {
-      ...shutdown,
-      acknowledgements,
-      aggregate: buildShutdownAckAggregate(acknowledgements)
+    "team-state",
+    `acknowledge shutdown for ${workerName}`,
+    async () => {
+      const shutdown = await readShutdownState(teamName, cwd);
+      if (!shutdown?.requested) {
+        return null;
+      }
+      const identity = await readWorkerIdentity(teamName, workerName, cwd);
+      const source = options.source ?? "auto";
+      const existing = shutdown.acknowledgements.find(
+        (entry) => entry.worker_name === workerName
+      );
+      if (source === "auto" && shouldPreserveShutdownAckForAutomaticUpdate(existing)) {
+        return existing;
+      }
+
+      const ack: AgmoTeamShutdownAck = {
+        worker_name: workerName,
+        pane_id: identity.pane_id ?? null,
+        status: options.status ?? "accepted",
+        source,
+        ...(options.reason ? { reason: options.reason } : {}),
+        ...(options.taskId ? { task_id: options.taskId } : {}),
+        acked_at: nowIso()
+      };
+      const acknowledgements = [
+        ...shutdown.acknowledgements.filter((entry) => entry.worker_name !== workerName),
+        ack
+      ];
+      await writeShutdownState(
+        teamName,
+        {
+          ...shutdown,
+          acknowledgements,
+          aggregate: buildShutdownAckAggregate(acknowledgements)
+        },
+        cwd
+      );
+      return ack;
     },
     cwd
   );
-  return ack;
 }
 
 export async function acknowledgeShutdownRequest(
@@ -3421,30 +3434,45 @@ export async function shutdownTeamRuntime(
 ): Promise<Record<string, unknown>> {
   const options = typeof optionsOrCwd === "string" ? {} : optionsOrCwd;
   const cwd = typeof optionsOrCwd === "string" ? optionsOrCwd : cwdArg;
-  const status = await readTeamStatus(teamName, cwd);
+  const requested = await withTeamStateLock(
+    teamName,
+    "team-state",
+    "request team shutdown",
+    async () => {
+      const status = await readTeamStatus(teamName, cwd);
 
-  if (!status) {
-    throw new Error(`team not found: ${teamName}`);
-  }
+      if (!status) {
+        throw new Error(`team not found: ${teamName}`);
+      }
 
-  const timestamp = nowIso();
-  const graceMs = Math.max(options.graceMs ?? DEFAULT_SHUTDOWN_GRACE_MS, 0);
-  const shutdownState: AgmoTeamShutdownState = {
-    requested: true,
-    request_id: `shutdown-${randomUUID()}`,
-    requested_at: timestamp,
-    grace_ms: graceMs,
-    hard_kill_after_at: new Date(Date.parse(timestamp) + graceMs).toISOString(),
-    message: "Team runtime shutdown requested. Finish current note, report idle, and exit this worker pane.",
-    acknowledgements: [],
-    aggregate: {
-      accepted: 0,
-      busy: 0,
-      rejected: 0,
-      total: 0
-    }
-  };
-  await writeShutdownState(status.config.name, shutdownState, cwd);
+      const timestamp = nowIso();
+      const graceMs = Math.max(options.graceMs ?? DEFAULT_SHUTDOWN_GRACE_MS, 0);
+      const shutdownState: AgmoTeamShutdownState = {
+        requested: true,
+        request_id: `shutdown-${randomUUID()}`,
+        requested_at: timestamp,
+        grace_ms: graceMs,
+        hard_kill_after_at: new Date(Date.parse(timestamp) + graceMs).toISOString(),
+        message: "Team runtime shutdown requested. Finish current note, report idle, and exit this worker pane.",
+        acknowledgements: [],
+        aggregate: {
+          accepted: 0,
+          busy: 0,
+          rejected: 0,
+          total: 0
+        }
+      };
+      await writeShutdownState(status.config.name, shutdownState, cwd);
+      return {
+        status,
+        timestamp,
+        graceMs,
+        shutdownState
+      };
+    },
+    cwd
+  );
+  const { status, timestamp, graceMs, shutdownState } = requested;
 
   const shutdownNotifications = await Promise.all(
     status.workers.map(async (worker) => {
@@ -3477,81 +3505,113 @@ export async function shutdownTeamRuntime(
     }
   }
 
-  const latestShutdownState = (await readShutdownState(status.config.name, cwd)) ?? shutdownState;
-  const nextConfig: AgmoTeamConfig = {
-    ...status.config,
-    active: false,
-    phase: "shutdown",
-    updated_at: timestamp
-  };
-  const nextPhase: AgmoTeamPhaseState = {
-    current_phase: "shutdown",
-    updated_at: timestamp,
-    active: false
-  };
-  const nextTasks = status.tasks.map((task) => buildShutdownTaskRecord(task, timestamp));
-  const nextDispatchRequests = status.dispatch_requests.map((request) =>
-    request.status === "delivered" || request.status === "failed"
-      ? request
-      : {
-          ...request,
-          status: "failed" as const,
-          failed_at: timestamp
-        }
-  );
+  const finalized = await withTeamStateLock(
+    status.config.name,
+    "team-state",
+    "finalize team shutdown",
+    async () => {
+      const latestStatus = await readTeamStatus(status.config.name, cwd);
+      if (!latestStatus) {
+        throw new Error(`team not found: ${status.config.name}`);
+      }
+      const latestShutdownState =
+        (await readShutdownState(status.config.name, cwd)) ?? shutdownState;
+      const nextConfig: AgmoTeamConfig = {
+        ...latestStatus.config,
+        active: false,
+        phase: "shutdown",
+        updated_at: timestamp
+      };
+      const nextPhase: AgmoTeamPhaseState = {
+        current_phase: "shutdown",
+        updated_at: timestamp,
+        active: false
+      };
+      const nextTasks = latestStatus.tasks.map((task) =>
+        buildShutdownTaskRecord(task, timestamp)
+      );
+      const nextDispatchRequests = latestStatus.dispatch_requests.map((request) =>
+        request.status === "delivered" || request.status === "failed"
+          ? request
+          : {
+              ...request,
+              status: "failed" as const,
+              failed_at: timestamp
+            }
+      );
 
-  await Promise.all([
-    writeJsonFile(resolveTeamConfigPath(status.config.name, cwd), nextConfig),
-    writeJsonFile(resolveTeamPhasePath(status.config.name, cwd), nextPhase),
-    writeDispatchRequests(status.config.name, nextDispatchRequests, cwd),
-    ...nextTasks.map((task) => writeTaskRecord(status.config.name, task, cwd)),
-    ...status.workers.flatMap((worker) => [
-      writeWorkerStatus(
-        status.config.name,
-        worker.identity.name,
-        buildShutdownWorkerStatus(timestamp),
-        cwd
-      ),
-      writeWorkerHeartbeat(
-        status.config.name,
-        worker.identity.name,
-        buildShutdownWorkerHeartbeat(worker.heartbeat, timestamp),
-        cwd
-      )
-    ])
-  ]);
+      await Promise.all([
+        writeJsonFile(resolveTeamConfigPath(latestStatus.config.name, cwd), nextConfig),
+        writeJsonFile(resolveTeamPhasePath(latestStatus.config.name, cwd), nextPhase),
+        writeDispatchRequests(latestStatus.config.name, nextDispatchRequests, cwd),
+        ...nextTasks.map((task) => writeTaskRecord(latestStatus.config.name, task, cwd)),
+        ...latestStatus.workers.flatMap((worker) => [
+          writeWorkerStatus(
+            latestStatus.config.name,
+            worker.identity.name,
+            buildShutdownWorkerStatus(timestamp),
+            cwd
+          ),
+          writeWorkerHeartbeat(
+            latestStatus.config.name,
+            worker.identity.name,
+            buildShutdownWorkerHeartbeat(worker.heartbeat, timestamp),
+            cwd
+          )
+        ])
+      ]);
+
+      return {
+        latestStatus,
+        latestShutdownState,
+        nextPhase,
+        nextTasks,
+        nextDispatchRequests
+      };
+    },
+    cwd
+  );
+  const {
+    latestStatus,
+    latestShutdownState,
+    nextPhase,
+    nextTasks,
+    nextDispatchRequests
+  } = finalized;
 
   const tmuxPaneDestruction =
-    status.config.transport === "tmux"
+    latestStatus.config.transport === "tmux"
       ? destroyWorkerPanes(
           [
-            ...Object.values(status.config.tmux.worker_pane_ids),
-            ...(status.config.tmux.hud_pane_id ? [status.config.tmux.hud_pane_id] : [])
+            ...Object.values(latestStatus.config.tmux.worker_pane_ids),
+            ...(latestStatus.config.tmux.hud_pane_id
+              ? [latestStatus.config.tmux.hud_pane_id]
+              : [])
           ],
           undefined,
           {
-            expectedSessionId: status.config.tmux.session_id ?? null,
-            leaderPaneId: status.config.tmux.leader_pane_id,
+            expectedSessionId: latestStatus.config.tmux.session_id ?? null,
+            leaderPaneId: latestStatus.config.tmux.leader_pane_id,
             currentPaneId: process.env.TMUX_PANE ?? null
           }
         )
       : emptyTmuxPaneDestructionSummary();
   const paneCloseRetry =
-    status.config.transport === "tmux"
+    latestStatus.config.transport === "tmux"
       ? await enqueuePaneCloseRetries(
-          status.config.name,
-          collectTrackedTmuxPanes(status),
+          latestStatus.config.name,
+          collectTrackedTmuxPanes(latestStatus),
           tmuxPaneDestruction,
           cwd
         )
       : null;
 
   await writeEvent(
-    status.config.name,
+    latestStatus.config.name,
     {
       timestamp,
       type: "team_shutdown",
-      team_name: status.config.name,
+      team_name: latestStatus.config.name,
       shutdown_request_id: latestShutdownState.request_id,
       shutdown_ack_count: latestShutdownState.acknowledgements.length,
       shutdown_ack_aggregate:
@@ -3564,8 +3624,8 @@ export async function shutdownTeamRuntime(
   );
 
   return {
-    team_name: status.config.name,
-    previous_phase: status.phase.current_phase,
+    team_name: latestStatus.config.name,
+    previous_phase: latestStatus.phase.current_phase,
     current_phase: nextPhase.current_phase,
     tasks_failed: nextTasks.filter((task) => task.status === "failed").length,
     dispatch_requests_failed: nextDispatchRequests.filter((request) => request.status === "failed")
@@ -3577,7 +3637,7 @@ export async function shutdownTeamRuntime(
     shutdown_notifications: shutdownNotifications,
     tmux_pane_destruction: tmuxPaneDestruction,
     pane_close_retry: paneCloseRetry,
-    preserved_state_root: resolveTeamDir(status.config.name, cwd)
+    preserved_state_root: resolveTeamDir(latestStatus.config.name, cwd)
   };
 }
 
@@ -4085,101 +4145,109 @@ export async function claimTaskForWorker(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
-  const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
-  assertWorkerOwnsTask(task, workerName);
-  const status = await readTeamStatus(normalizedTeamName, cwd);
-  if (!status) {
-    throw new Error(`team not found: ${normalizedTeamName}`);
-  }
-  const blockers = computeTaskDependencyBlockers(
-    task,
-    new Map(status.tasks.map((entry) => [entry.id, entry]))
-  );
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `claim task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      const blockers = computeTaskDependencyBlockers(
+        task,
+        new Map(status.tasks.map((entry) => [entry.id, entry]))
+      );
 
-  if (blockers.length > 0 && !options.ignoreDependencies) {
-    const blockedTask: AgmoTeamTaskRecord = {
-      ...task,
-      status: "blocked",
-      blocked_by_dependencies: blockers,
-      version: task.version + 1,
-      updated_at: nowIso()
-    };
-    await Promise.all([
-      writeTaskRecord(normalizedTeamName, blockedTask, cwd),
-      writeEvent(
-        normalizedTeamName,
-        {
-          timestamp: blockedTask.updated_at,
-          type: "task_claim_blocked",
-          team_name: normalizedTeamName,
-          worker_name: workerName,
-          task_id: taskId,
-          blocked_by_dependencies: blockers
+      if (blockers.length > 0 && !options.ignoreDependencies) {
+        const blockedTask: AgmoTeamTaskRecord = {
+          ...task,
+          status: "blocked",
+          blocked_by_dependencies: blockers,
+          version: task.version + 1,
+          updated_at: nowIso()
+        };
+        await Promise.all([
+          writeTaskRecord(normalizedTeamName, blockedTask, cwd),
+          writeEvent(
+            normalizedTeamName,
+            {
+              timestamp: blockedTask.updated_at,
+              type: "task_claim_blocked",
+              team_name: normalizedTeamName,
+              worker_name: workerName,
+              task_id: taskId,
+              blocked_by_dependencies: blockers
+            },
+            cwd
+          )
+        ]);
+        const blockerSummary = blockers
+          .map((entry) => `${entry.task_id}:${entry.status}`)
+          .join(", ");
+        throw new Error(
+          `task ${taskId} is blocked by unresolved dependencies: ${blockerSummary}`
+        );
+      }
+
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: workerName,
+        status: "in_progress",
+        blocked_by_dependencies: undefined,
+        claim: {
+          owner: workerName,
+          claimed_at: timestamp
         },
-        cwd
-      )
-    ]);
-    const blockerSummary = blockers
-      .map((entry) => `${entry.task_id}:${entry.status}`)
-      .join(", ");
-    throw new Error(
-      `task ${taskId} is blocked by unresolved dependencies: ${blockerSummary}`
-    );
-  }
-
-  const timestamp = nowIso();
-  const nextTask: AgmoTeamTaskRecord = {
-    ...task,
-    owner: workerName,
-    status: "in_progress",
-    blocked_by_dependencies: undefined,
-    claim: {
-      owner: workerName,
-      claimed_at: timestamp
-    },
-    error: undefined,
-    version: task.version + 1,
-    updated_at: timestamp
-  };
-
-  await Promise.all([
-    writeTaskRecord(normalizedTeamName, nextTask, cwd),
-    writeWorkerStatus(
-      normalizedTeamName,
-      workerName,
-      {
-        state: "working",
-        current_task_id: taskId,
+        error: undefined,
+        version: task.version + 1,
         updated_at: timestamp
-      },
-      cwd
-    ),
-    bumpWorkerHeartbeat(
-      normalizedTeamName,
-      workerName,
-      { pid: resolveReportedWorkerPid() },
-      cwd
-    ),
-    writeEvent(
-      normalizedTeamName,
-      {
-        timestamp,
-        type: "task_claimed",
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeWorkerStatus(
+          normalizedTeamName,
+          workerName,
+          {
+            state: "working",
+            current_task_id: taskId,
+            updated_at: timestamp
+          },
+          cwd
+        ),
+        bumpWorkerHeartbeat(
+          normalizedTeamName,
+          workerName,
+          { pid: resolveReportedWorkerPid() },
+          cwd
+        ),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_claimed",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId,
+            ignore_dependencies: options.ignoreDependencies ?? false
+          },
+          cwd
+        )
+      ]);
+
+      return {
         team_name: normalizedTeamName,
         worker_name: workerName,
-        task_id: taskId,
-        ignore_dependencies: options.ignoreDependencies ?? false
-      },
-      cwd
-    )
-  ]);
-
-  return {
-    team_name: normalizedTeamName,
-    worker_name: workerName,
-    ignored_dependencies: options.ignoreDependencies ?? false,
-    task: nextTask
-  };
+        ignored_dependencies: options.ignoreDependencies ?? false,
+        task: nextTask
+      };
+    },
+    cwd
+  );
 }
 
 export async function completeTaskForWorker(
@@ -4190,70 +4258,80 @@ export async function completeTaskForWorker(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
-  const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
-  assertWorkerOwnsTask(task, workerName);
+  const completed = await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `complete task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
 
-  const timestamp = nowIso();
-  const nextTask: AgmoTeamTaskRecord = {
-    ...task,
-    owner: workerName,
-    status: "completed",
-    claim_history: task.claim
-      ? [
-          ...(task.claim_history ?? []),
-          {
-            owner: task.claim.owner,
-            claimed_at: task.claim.claimed_at,
-            released_at: timestamp,
-            release_reason: "completed",
-            successor_owner: workerName
-          }
-        ]
-      : task.claim_history,
-    claim: undefined,
-    result,
-    error: undefined,
-    version: task.version + 1,
-    updated_at: timestamp
-  };
-
-  await Promise.all([
-    writeTaskRecord(normalizedTeamName, nextTask, cwd),
-    writeWorkerStatus(
-      normalizedTeamName,
-      workerName,
-      {
-        state: "done",
-        current_task_id: taskId,
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: workerName,
+        status: "completed",
+        claim_history: task.claim
+          ? [
+              ...(task.claim_history ?? []),
+              {
+                owner: task.claim.owner,
+                claimed_at: task.claim.claimed_at,
+                released_at: timestamp,
+                release_reason: "completed",
+                successor_owner: workerName
+              }
+            ]
+          : task.claim_history,
+        claim: undefined,
+        result,
+        error: undefined,
+        version: task.version + 1,
         updated_at: timestamp
-      },
-      cwd
-    ),
-    bumpWorkerHeartbeat(
-      normalizedTeamName,
-      workerName,
-      { pid: resolveReportedWorkerPid() },
-      cwd
-    ),
-    writeEvent(
-      normalizedTeamName,
-      {
-        timestamp,
-        type: "task_completed",
-        team_name: normalizedTeamName,
-        worker_name: workerName,
-        task_id: taskId
-      },
-      cwd
-    )
-  ]);
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeWorkerStatus(
+          normalizedTeamName,
+          workerName,
+          {
+            state: "done",
+            current_task_id: taskId,
+            updated_at: timestamp
+          },
+          cwd
+        ),
+        bumpWorkerHeartbeat(
+          normalizedTeamName,
+          workerName,
+          { pid: resolveReportedWorkerPid() },
+          cwd
+        ),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_completed",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId
+          },
+          cwd
+        )
+      ]);
+
+      return nextTask;
+    },
+    cwd
+  );
   const dependencyUpdates = await refreshTeamDependencyStates(normalizedTeamName, cwd);
   const autoShutdown = await maybeShutdownCompletedTeamRuntime(normalizedTeamName, cwd);
 
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
-    task: nextTask,
+    task: completed,
     dependency_updates: dependencyUpdates.updated,
     auto_shutdown: autoShutdown,
     ...(autoShutdown.triggered ? { shutdown: autoShutdown.shutdown } : {})
@@ -4268,69 +4346,79 @@ export async function failTaskForWorker(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
-  const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
-  assertWorkerOwnsTask(task, workerName);
+  const failed = await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `fail task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
 
-  const timestamp = nowIso();
-  const nextTask: AgmoTeamTaskRecord = {
-    ...task,
-    owner: workerName,
-    status: "failed",
-    claim_history: task.claim
-      ? [
-          ...(task.claim_history ?? []),
-          {
-            owner: task.claim.owner,
-            claimed_at: task.claim.claimed_at,
-            released_at: timestamp,
-            release_reason: "failed",
-            successor_owner: workerName
-          }
-        ]
-      : task.claim_history,
-    claim: undefined,
-    error: error ?? "task failed",
-    version: task.version + 1,
-    updated_at: timestamp
-  };
-
-  await Promise.all([
-    writeTaskRecord(normalizedTeamName, nextTask, cwd),
-    writeWorkerStatus(
-      normalizedTeamName,
-      workerName,
-      {
-        state: "blocked",
-        current_task_id: taskId,
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: workerName,
+        status: "failed",
+        claim_history: task.claim
+          ? [
+              ...(task.claim_history ?? []),
+              {
+                owner: task.claim.owner,
+                claimed_at: task.claim.claimed_at,
+                released_at: timestamp,
+                release_reason: "failed",
+                successor_owner: workerName
+              }
+            ]
+          : task.claim_history,
+        claim: undefined,
+        error: error ?? "task failed",
+        version: task.version + 1,
         updated_at: timestamp
-      },
-      cwd
-    ),
-    bumpWorkerHeartbeat(
-      normalizedTeamName,
-      workerName,
-      { pid: resolveReportedWorkerPid() },
-      cwd
-    ),
-    writeEvent(
-      normalizedTeamName,
-      {
-        timestamp,
-        type: "task_failed",
-        team_name: normalizedTeamName,
-        worker_name: workerName,
-        task_id: taskId,
-        error: nextTask.error
-      },
-      cwd
-    )
-  ]);
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeWorkerStatus(
+          normalizedTeamName,
+          workerName,
+          {
+            state: "blocked",
+            current_task_id: taskId,
+            updated_at: timestamp
+          },
+          cwd
+        ),
+        bumpWorkerHeartbeat(
+          normalizedTeamName,
+          workerName,
+          { pid: resolveReportedWorkerPid() },
+          cwd
+        ),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_failed",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId,
+            error: nextTask.error
+          },
+          cwd
+        )
+      ]);
+
+      return nextTask;
+    },
+    cwd
+  );
   const dependencyUpdates = await refreshTeamDependencyStates(normalizedTeamName, cwd);
 
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
-    task: nextTask,
+    task: failed,
     dependency_updates: dependencyUpdates.updated
   };
 }

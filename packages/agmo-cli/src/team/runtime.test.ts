@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,6 +29,10 @@ import {
   resolveWorkerHeartbeatPath,
   resolveWorkerStatusPath
 } from "./state/index.js";
+import {
+  acquireTeamStateLock,
+  resolveTeamStateLockPath
+} from "./state/locks.js";
 
 test("shutdownTeamRuntime clears active worker, task, and dispatch state", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-shutdown-"));
@@ -199,6 +203,214 @@ test("startTeamRuntime persists session ownership metadata when provided", async
   assert.equal(status.config.session_id, "session-owned-123");
   assert.equal(status.config.transport, "none");
   assert.deepEqual(status.config.tmux.worker_pane_ids, {});
+});
+
+test("concurrent task claims serialize so only one worker owns an unassigned task", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-concurrent-claim-"));
+  const teamName = "concurrent-claim-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Claim the same unassigned task",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const taskPath = resolveTeamTaskPath(teamName, "1", tempRoot);
+  const task = JSON.parse(await readFile(taskPath, "utf8")) as Record<string, unknown>;
+  delete task.owner;
+  await writeFile(taskPath, `${JSON.stringify(task, null, 2)}\n`, "utf8");
+
+  const results = await Promise.allSettled([
+    claimTaskForWorker(teamName, "1", "worker-1", {}, tempRoot),
+    claimTaskForWorker(teamName, "1", "worker-2", {}, tempRoot)
+  ]);
+  const fulfilled = results.filter((result) => result.status === "fulfilled");
+  const rejected = results.filter((result) => result.status === "rejected");
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.match(
+    rejected[0]?.reason instanceof Error ? rejected[0].reason.message : String(rejected[0]?.reason),
+    /owned by worker-[12]/
+  );
+
+  const finalTask = JSON.parse(await readFile(taskPath, "utf8")) as {
+    owner?: string;
+    status?: string;
+    claim?: { owner?: string };
+  };
+  assert.equal(finalTask.status, "in_progress");
+  assert.equal(finalTask.owner, finalTask.claim?.owner);
+  assert.ok(["worker-1", "worker-2"].includes(finalTask.owner ?? ""));
+});
+
+test("stale team-state lock is recovered and task mutation proceeds", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-stale-lock-"));
+  const teamName = "stale-lock-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Recover stale lock",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const lockPath = resolveTeamStateLockPath(teamName, "team-state", tempRoot);
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(
+    join(lockPath, "metadata.json"),
+    `${JSON.stringify(
+      {
+        lock_name: "team-state",
+        owner_id: "stale-owner",
+        operation: "abandoned operation",
+        acquired_at: "2026-04-23T12:00:00.000Z",
+        expires_at: "2026-04-23T12:00:00.001Z",
+        stale_after_ms: 1,
+        pid: 999999
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = await claimTaskForWorker(teamName, "1", "worker-1", {}, tempRoot);
+  assert.equal((result.task as { status?: string }).status, "in_progress");
+
+  const task = JSON.parse(
+    await readFile(resolveTeamTaskPath(teamName, "1", tempRoot), "utf8")
+  ) as { claim?: { owner?: string } };
+  assert.equal(task.claim?.owner, "worker-1");
+});
+
+test("malformed team-state lock is recovered and task mutation proceeds", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-malformed-lock-"));
+  const teamName = "malformed-lock-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Recover malformed lock",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const lockPath = resolveTeamStateLockPath(teamName, "team-state", tempRoot);
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, "metadata.json"), "{not-json", "utf8");
+
+  const result = await claimTaskForWorker(teamName, "1", "worker-1", {}, tempRoot);
+  assert.equal((result.task as { status?: string }).status, "in_progress");
+
+  const task = JSON.parse(
+    await readFile(resolveTeamTaskPath(teamName, "1", tempRoot), "utf8")
+  ) as { claim?: { owner?: string } };
+  assert.equal(task.claim?.owner, "worker-1");
+});
+
+test("lock takeover metadata records stale and malformed recovery signals", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-lock-metadata-"));
+  const teamName = "lock-metadata-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose lock metadata",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const staleLockPath = resolveTeamStateLockPath(teamName, "team-state", tempRoot);
+  await mkdir(staleLockPath, { recursive: true });
+  await writeFile(
+    join(staleLockPath, "metadata.json"),
+    `${JSON.stringify(
+      {
+        lock_name: "team-state",
+        owner_id: "stale-owner",
+        operation: "stale operation",
+        acquired_at: "2026-04-23T12:00:00.000Z",
+        expires_at: "2026-04-23T12:00:00.001Z",
+        stale_after_ms: 1
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const staleRecovered = await acquireTeamStateLock(
+    teamName,
+    "team-state",
+    "metadata stale recovery",
+    tempRoot
+  );
+  const staleMetadata = JSON.parse(
+    await readFile(staleRecovered.metadataPath, "utf8")
+  ) as { recovered_from?: { reason?: string; metadata?: { owner_id?: string } } };
+  assert.equal(staleMetadata.recovered_from?.reason, "stale");
+  assert.equal(staleMetadata.recovered_from?.metadata?.owner_id, "stale-owner");
+  await staleRecovered.release();
+
+  const malformedLockPath = resolveTeamStateLockPath(teamName, "team-state", tempRoot);
+  await mkdir(malformedLockPath, { recursive: true });
+  await writeFile(join(malformedLockPath, "metadata.json"), "[]", "utf8");
+
+  const malformedRecovered = await acquireTeamStateLock(
+    teamName,
+    "team-state",
+    "metadata malformed recovery",
+    tempRoot
+  );
+  const malformedMetadata = JSON.parse(
+    await readFile(malformedRecovered.metadataPath, "utf8")
+  ) as { recovered_from?: { reason?: string; error?: string } };
+  assert.equal(malformedMetadata.recovered_from?.reason, "malformed");
+  assert.match(malformedMetadata.recovered_from?.error ?? "", /required fields/);
+  await malformedRecovered.release();
+});
+
+test("recent malformed team-state lock is treated as initializing", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-initializing-lock-"));
+  const teamName = "initializing-lock-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Wait for initializing lock",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const lockPath = resolveTeamStateLockPath(teamName, "team-state", tempRoot);
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, "metadata.json"), "{not-json", "utf8");
+
+  await assert.rejects(
+    acquireTeamStateLock(
+      teamName,
+      "team-state",
+      "wait for initializing metadata",
+      tempRoot,
+      { timeoutMs: 5, retryMs: 1 }
+    ),
+    /holder=initializing/
+  );
+
+  assert.equal(await readFile(join(lockPath, "metadata.json"), "utf8"), "{not-json");
 });
 
 test("completeTaskForWorker shuts down the team after the last task completes", async () => {
@@ -960,6 +1172,72 @@ test("shutdown acknowledgement protocol records accepted, busy, and rejected sta
   assert.deepEqual(
     status?.shutdown?.acknowledgements.map((ack) => ack.source),
     ["explicit", "explicit", "explicit"]
+  );
+});
+
+test("concurrent explicit shutdown acknowledgements preserve all workers and aggregate", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-concurrent-acks-"));
+  const teamName = "concurrent-shutdown-acks-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 3,
+      task: "Acknowledge shutdown concurrently",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  const acknowledgeWhenReady = async (
+    workerName: string,
+    status: "accepted" | "busy" | "rejected"
+  ): Promise<Record<string, unknown>> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        return await acknowledgeShutdownRequest(
+          teamName,
+          workerName,
+          status,
+          { reason: `${workerName} ${status}` },
+          tempRoot
+        );
+      } catch (error) {
+        lastError = error;
+        if (
+          !(error instanceof Error) ||
+          !/shutdown not requested/i.test(error.message)
+        ) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("shutdown acknowledgement did not become ready");
+  };
+
+  const shutdownPromise = shutdownTeamRuntime(teamName, { graceMs: 200 }, tempRoot);
+  await Promise.all([
+    acknowledgeWhenReady("worker-1", "accepted"),
+    acknowledgeWhenReady("worker-2", "busy"),
+    acknowledgeWhenReady("worker-3", "rejected")
+  ]);
+  await shutdownPromise;
+
+  const status = await readTeamStatus(teamName, tempRoot);
+  assert.deepEqual(status?.shutdown?.aggregate, {
+    accepted: 1,
+    busy: 1,
+    rejected: 1,
+    total: 3
+  });
+  assert.deepEqual(
+    status?.shutdown?.acknowledgements
+      .map((ack) => `${ack.worker_name}:${ack.status}`)
+      .sort(),
+    ["worker-1:accepted", "worker-2:busy", "worker-3:rejected"]
   );
 });
 
