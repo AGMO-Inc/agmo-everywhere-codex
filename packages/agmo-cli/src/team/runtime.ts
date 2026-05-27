@@ -13,6 +13,7 @@ import {
   describeTmuxSessionTopology,
   destroyWorkerPanes,
   notifyPane,
+  type TmuxPaneDestructionSummary,
   type TmuxTopology
 } from "./tmux-session.js";
 import {
@@ -137,6 +138,30 @@ const LEADER_ALERT_DELIVERY_HISTORY_LIMIT = 200;
 const DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail";
 const DEFAULT_EMAIL_FROM = "agmo@localhost";
 const DEFAULT_EMAIL_SUBJECT_PREFIX = "[AGMO Leader Alert]";
+
+function emptyTmuxPaneDestructionSummary(): TmuxPaneDestructionSummary {
+  return {
+    panes: [],
+    killed: 0,
+    failed: 0,
+    skipped: 0
+  };
+}
+
+type TeamAutoShutdownResult =
+  | {
+      triggered: true;
+      reason: "all_tasks_completed";
+      shutdown: Record<string, unknown>;
+    }
+  | {
+      triggered: false;
+      reason:
+        | "team_not_active"
+        | "no_tasks"
+        | "tasks_not_all_completed"
+        | "team_not_found";
+    };
 
 function assertValidWorkerCount(workerCount: number): void {
   if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > 20) {
@@ -701,6 +726,46 @@ async function refreshTeamDependencyStates(
   return {
     team_name: normalizedTeamName,
     updated
+  };
+}
+
+async function maybeShutdownCompletedTeamRuntime(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<TeamAutoShutdownResult> {
+  const status = await readTeamStatus(teamName, cwd);
+  if (!status) {
+    return {
+      triggered: false,
+      reason: "team_not_found"
+    };
+  }
+
+  if (!status.config.active || !status.phase.active) {
+    return {
+      triggered: false,
+      reason: "team_not_active"
+    };
+  }
+
+  if (status.tasks.length === 0) {
+    return {
+      triggered: false,
+      reason: "no_tasks"
+    };
+  }
+
+  if (!status.tasks.every((task) => task.status === "completed")) {
+    return {
+      triggered: false,
+      reason: "tasks_not_all_completed"
+    };
+  }
+
+  return {
+    triggered: true,
+    reason: "all_tasks_completed",
+    shutdown: await shutdownTeamRuntime(teamName, cwd)
   };
 }
 
@@ -2708,21 +2773,21 @@ export async function shutdownTeamRuntime(
     ])
   ]);
 
-  if (status.config.transport === "tmux") {
-    destroyWorkerPanes(
-      [
-        ...Object.values(status.config.tmux.worker_pane_ids),
-        ...(status.config.tmux.hud_pane_id ? [status.config.tmux.hud_pane_id] : [])
-      ]
-    );
-  }
+  const tmuxPaneDestruction =
+    status.config.transport === "tmux"
+      ? destroyWorkerPanes([
+          ...Object.values(status.config.tmux.worker_pane_ids),
+          ...(status.config.tmux.hud_pane_id ? [status.config.tmux.hud_pane_id] : [])
+        ])
+      : emptyTmuxPaneDestructionSummary();
 
   await writeEvent(
     status.config.name,
     {
       timestamp,
       type: "team_shutdown",
-      team_name: status.config.name
+      team_name: status.config.name,
+      tmux_pane_destruction: tmuxPaneDestruction
     },
     cwd
   );
@@ -2734,6 +2799,7 @@ export async function shutdownTeamRuntime(
     tasks_failed: nextTasks.filter((task) => task.status === "failed").length,
     dispatch_requests_failed: nextDispatchRequests.filter((request) => request.status === "failed")
       .length,
+    tmux_pane_destruction: tmuxPaneDestruction,
     preserved_state_root: resolveTeamDir(status.config.name, cwd)
   };
 }
@@ -3232,12 +3298,15 @@ export async function completeTaskForWorker(
     )
   ]);
   const dependencyUpdates = await refreshTeamDependencyStates(normalizedTeamName, cwd);
+  const autoShutdown = await maybeShutdownCompletedTeamRuntime(normalizedTeamName, cwd);
 
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
     task: nextTask,
-    dependency_updates: dependencyUpdates.updated
+    dependency_updates: dependencyUpdates.updated,
+    auto_shutdown: autoShutdown,
+    ...(autoShutdown.triggered ? { shutdown: autoShutdown.shutdown } : {})
   };
 }
 

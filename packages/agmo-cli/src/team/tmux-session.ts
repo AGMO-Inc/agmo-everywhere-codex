@@ -29,6 +29,27 @@ export type CreatedTmuxSession = {
   hudPaneId?: string | null;
 };
 
+export type TmuxPaneDestructionResult = {
+  pane_id: string;
+  status: "killed" | "failed" | "skipped";
+  error?: string;
+};
+
+export type TmuxPaneDestructionSummary = {
+  panes: TmuxPaneDestructionResult[];
+  killed: number;
+  failed: number;
+  skipped: number;
+};
+
+type TmuxCommandResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+};
+
+type TmuxRunner = (args: string[]) => TmuxCommandResult;
+
 export type TmuxHudSpec = {
   teamName: string;
   projectRoot: string;
@@ -37,7 +58,7 @@ export type TmuxHudSpec = {
   clearScreen?: boolean;
 };
 
-function runTmux(args: string[]): { ok: boolean; stdout: string; stderr: string } {
+function runTmux(args: string[]): TmuxCommandResult {
   try {
     const stdout = execFileSync("tmux", args, { encoding: "utf-8" }).trim();
     return { ok: true, stdout, stderr: "" };
@@ -217,13 +238,43 @@ export function createTeamSession(
   };
 }
 
-export function destroyWorkerPanes(paneIds: string[]): void {
+export function destroyWorkerPanes(
+  paneIds: string[],
+  runner: TmuxRunner = runTmux
+): TmuxPaneDestructionSummary {
+  const panes: TmuxPaneDestructionResult[] = [];
+
   for (const paneId of paneIds) {
     if (!paneId.startsWith("%")) {
+      panes.push({
+        pane_id: paneId,
+        status: "skipped",
+        error: "invalid tmux pane id"
+      });
       continue;
     }
-    runTmux(["kill-pane", "-t", paneId]);
+
+    const result = runner(["kill-pane", "-t", paneId]);
+    if (result.ok) {
+      panes.push({
+        pane_id: paneId,
+        status: "killed"
+      });
+    } else {
+      panes.push({
+        pane_id: paneId,
+        status: "failed",
+        error: result.stderr || "tmux kill-pane failed"
+      });
+    }
   }
+
+  return {
+    panes,
+    killed: panes.filter((pane) => pane.status === "killed").length,
+    failed: panes.filter((pane) => pane.status === "failed").length,
+    skipped: panes.filter((pane) => pane.status === "skipped").length
+  };
 }
 
 export function notifyPane(paneId: string, message: string): boolean {
