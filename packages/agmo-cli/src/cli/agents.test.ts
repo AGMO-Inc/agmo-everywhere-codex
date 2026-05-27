@@ -6,13 +6,43 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   MANAGED_PROMPT_MIRROR_FILES,
+  buildInitialAgentTomlMap,
   listManagedSkillMirrorNames,
   readPromptContent,
   readSkillContent,
 } from "../agents/native-config.js";
+import { AGMO_AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { buildAgmoRuntimeConfig } from "../config/generator.js";
 import { syncAgents } from "./agents.js";
 import { agmoCliPackageRoot, resolveInstallPaths } from "../utils/paths.js";
+
+function parseGeneratedAgentToml(content: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  const lines = content.split(/\r?\n/);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const tripleQuoted = line.match(/^([A-Za-z0-9_-]+) = """$/);
+    if (tripleQuoted) {
+      const valueLines: string[] = [];
+      index += 1;
+      while (index < lines.length && lines[index] !== '"""') {
+        valueLines.push(lines[index] ?? "");
+        index += 1;
+      }
+      assert.equal(lines[index], '"""', `${tripleQuoted[1]} should close triple-quoted TOML`);
+      parsed[tripleQuoted[1] ?? ""] = valueLines.join("\n");
+      continue;
+    }
+
+    const quoted = line.match(/^([A-Za-z0-9_-]+) = "([^"]*)"$/);
+    if (quoted) {
+      parsed[quoted[1] ?? ""] = quoted[2] ?? "";
+    }
+  }
+
+  return parsed;
+}
 
 test("syncAgents writes agmo-prefixed managed agents and removes renamed legacy managed files", async () => {
   const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-agents-sync-"));
@@ -81,6 +111,82 @@ test("syncAgents embeds expanded managed prompt contracts into generated agent T
   const wisdom = readAgent("agmo-wisdom");
   assert.match(wisdom, /## Save-ready Note Proposal/);
   assert.match(wisdom, /canonical note/);
+});
+
+test("managed native agent TOMLs keep expected defaults and remain parseable", async () => {
+  const agentTomls = await buildInitialAgentTomlMap();
+
+  const expectedDefaults = {
+    "agmo-planner": {
+      model: "gpt-5.5",
+      model_reasoning_effort: "medium",
+      posture: "frontier-orchestrator",
+      modelClass: "frontier",
+    },
+    "agmo-executor": {
+      model: "gpt-5.5",
+      model_reasoning_effort: "medium",
+      posture: "deep-worker",
+      modelClass: "standard",
+    },
+    "agmo-verifier": {
+      model: "gpt-5.5",
+      model_reasoning_effort: "medium",
+      posture: "frontier-orchestrator",
+      modelClass: "standard",
+    },
+    "agmo-wisdom": {
+      model: "gpt-5.4-mini",
+      model_reasoning_effort: "medium",
+      posture: "fast-lane",
+      modelClass: "fast",
+    },
+    "agmo-architect": {
+      model: "gpt-5.5",
+      model_reasoning_effort: "medium",
+      posture: "frontier-orchestrator",
+      modelClass: "frontier",
+    },
+    "agmo-critic": {
+      model: "gpt-5.5",
+      model_reasoning_effort: "medium",
+      posture: "frontier-orchestrator",
+      modelClass: "frontier",
+    },
+    "agmo-explore": {
+      model: "gpt-5.3-codex-spark",
+      model_reasoning_effort: "low",
+      posture: "fast-lane",
+      modelClass: "fast",
+    },
+  };
+
+  assert.deepEqual(
+    Object.keys(expectedDefaults).sort(),
+    AGMO_AGENT_DEFINITIONS.map((agent) => agent.name).sort(),
+  );
+
+  for (const [agentName, expected] of Object.entries(expectedDefaults)) {
+    const parsed = parseGeneratedAgentToml(agentTomls[agentName] ?? "");
+    assert.equal(parsed.name, agentName);
+    assert.equal(parsed.model, expected.model);
+    assert.equal(parsed.model_reasoning_effort, expected.model_reasoning_effort);
+    assert.match(parsed.description, /\S/);
+    assert.match(parsed.developer_instructions, /## Agmo Agent Metadata/);
+    assert.match(parsed.developer_instructions, new RegExp(`- role: ${agentName}`));
+    assert.match(
+      parsed.developer_instructions,
+      new RegExp(`- posture: ${expected.posture}`),
+    );
+    assert.match(
+      parsed.developer_instructions,
+      new RegExp(`- model_class: ${expected.modelClass}`),
+    );
+    assert.match(
+      parsed.developer_instructions,
+      new RegExp(`- reasoning_effort: ${expected.model_reasoning_effort}`),
+    );
+  }
 });
 
 test("syncAgents mirrors shared managed prompt files into project .codex/prompts", async () => {

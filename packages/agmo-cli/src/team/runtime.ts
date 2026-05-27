@@ -10,11 +10,27 @@ import {
 } from "./role-router.js";
 import {
   createTeamSession,
+  createHudPane,
+  applyTeamLayout,
+  computeCurrentTeamLayoutPlan,
   describeTmuxSessionTopology,
   destroyWorkerPanes,
+  findHudPaneIds,
+  listTmuxPanes,
+  readAgmoHudPaneOwner,
+  reapOrphanHudPanes,
   notifyPane,
+  type TmuxPaneInfo,
+  type TmuxPaneDestructionSummary,
   type TmuxTopology
 } from "./tmux-session.js";
+import {
+  buildTeamHudRenderContext,
+  renderTeamHud,
+  type AgmoTeamHudPreset
+} from "./hud-renderer.js";
+import type { AgmoColorMode } from "./terminal-format.js";
+import type { TeamLayoutPreset } from "./layout-planner.js";
 import {
   buildInitialWorkerInbox,
   buildWorkerInstructions
@@ -41,13 +57,16 @@ import {
   resolveTeamIntegrationAssistPath,
   resolveTeamIntegrationsPath,
   resolveTeamLeaderHudPath,
+  resolveTeamHudRepairPath,
   resolveTeamLeaderMonitorViewPath,
   resolveTeamLeaderNudgesPath,
   resolveTeamMonitorPolicyPath,
   resolveTeamMailboxDir,
   resolveTeamManifestPath,
+  resolveTeamPaneCloseRetryPath,
   resolveTeamMonitorSnapshotPath,
   resolveTeamPhasePath,
+  resolveTeamShutdownPath,
   resolveTeamStateRoot,
   resolveTeamTaskPath,
   resolveTeamTasksDir,
@@ -63,6 +82,12 @@ import {
   type AgmoTeamManifest,
   type AgmoTeamPhaseState,
   type AgmoTeamStatusSnapshot,
+  type AgmoPaneCloseRetryEntry,
+  type AgmoPaneCloseRetryState,
+  type AgmoTeamHudRepairAttempt,
+  type AgmoTeamHudRepairState,
+  type AgmoTeamShutdownAck,
+  type AgmoTeamShutdownState,
   type AgmoWorkerIdentity
 } from "./state/index.js";
 import type {
@@ -90,6 +115,8 @@ import type {
 import type { AgmoMailboxMessage } from "./state/mailbox.js";
 import type {
   AgmoTeamMonitorSnapshot,
+  AgmoTmuxLayoutHealth,
+  AgmoTmuxPaneMonitorSnapshot,
   AgmoWorkerHeartbeat,
   AgmoWorkerHealth,
   AgmoWorkerMonitorSnapshot,
@@ -104,7 +131,10 @@ import type {
   AgmoTeamMonitorPolicyState
 } from "./state/policy.js";
 import type { AgmoTeamTaskRecord, AgmoTeamTaskStatus } from "./state/tasks.js";
-import { DEFAULT_TASK_CLAIM_LEASE_MS } from "./state/locks.js";
+import {
+  DEFAULT_TASK_CLAIM_LEASE_MS,
+  withTeamStateLock
+} from "./state/locks.js";
 import { ensureDir, readTextFileIfExists, writeJsonFile, writeTextFile } from "../utils/fs.js";
 
 export type TeamRuntimeMode = "interactive";
@@ -137,6 +167,35 @@ const LEADER_ALERT_DELIVERY_HISTORY_LIMIT = 200;
 const DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail";
 const DEFAULT_EMAIL_FROM = "agmo@localhost";
 const DEFAULT_EMAIL_SUBJECT_PREFIX = "[AGMO Leader Alert]";
+const DEFAULT_SHUTDOWN_GRACE_MS = 0;
+const PANE_CLOSE_RETRY_DELAY_MS = 30_000;
+const PANE_CLOSE_RETRY_MAX_ATTEMPTS = 3;
+const HUD_REPAIR_DEBOUNCE_MS = 30_000;
+const HUD_REPAIR_HISTORY_LIMIT = 20;
+
+function emptyTmuxPaneDestructionSummary(): TmuxPaneDestructionSummary {
+  return {
+    panes: [],
+    killed: 0,
+    failed: 0,
+    skipped: 0
+  };
+}
+
+type TeamAutoShutdownResult =
+  | {
+      triggered: true;
+      reason: "all_tasks_completed";
+      shutdown: Record<string, unknown>;
+    }
+  | {
+      triggered: false;
+      reason:
+        | "team_not_active"
+        | "no_tasks"
+        | "tasks_not_all_completed"
+        | "team_not_found";
+    };
 
 function assertValidWorkerCount(workerCount: number): void {
   if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > 20) {
@@ -704,6 +763,46 @@ async function refreshTeamDependencyStates(
   };
 }
 
+async function maybeShutdownCompletedTeamRuntime(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<TeamAutoShutdownResult> {
+  const status = await readTeamStatus(teamName, cwd);
+  if (!status) {
+    return {
+      triggered: false,
+      reason: "team_not_found"
+    };
+  }
+
+  if (!status.config.active || !status.phase.active) {
+    return {
+      triggered: false,
+      reason: "team_not_active"
+    };
+  }
+
+  if (status.tasks.length === 0) {
+    return {
+      triggered: false,
+      reason: "no_tasks"
+    };
+  }
+
+  if (!status.tasks.every((task) => task.status === "completed")) {
+    return {
+      triggered: false,
+      reason: "tasks_not_all_completed"
+    };
+  }
+
+  return {
+    triggered: true,
+    reason: "all_tasks_completed",
+    shutdown: await shutdownTeamRuntime(teamName, cwd)
+  };
+}
+
 function isPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
@@ -806,6 +905,561 @@ async function writeIntegrationState(
   cwd = process.cwd()
 ): Promise<void> {
   await writeJsonFile(resolveTeamIntegrationsPath(teamName, cwd), state);
+}
+
+async function readShutdownState(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoTeamShutdownState | null> {
+  return await readJsonFile<AgmoTeamShutdownState>(
+    resolveTeamShutdownPath(teamName, cwd)
+  );
+}
+
+async function writeShutdownState(
+  teamName: string,
+  state: AgmoTeamShutdownState,
+  cwd = process.cwd()
+): Promise<void> {
+  await writeJsonFile(resolveTeamShutdownPath(teamName, cwd), state);
+}
+
+async function readPaneCloseRetryState(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoPaneCloseRetryState | null> {
+  return await readJsonFile<AgmoPaneCloseRetryState>(
+    resolveTeamPaneCloseRetryPath(teamName, cwd)
+  );
+}
+
+async function writePaneCloseRetryState(
+  teamName: string,
+  state: AgmoPaneCloseRetryState,
+  cwd = process.cwd()
+): Promise<void> {
+  await writeJsonFile(resolveTeamPaneCloseRetryPath(teamName, cwd), state);
+}
+
+async function readHudRepairState(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoTeamHudRepairState | null> {
+  return await readJsonFile<AgmoTeamHudRepairState>(
+    resolveTeamHudRepairPath(teamName, cwd)
+  );
+}
+
+async function writeHudRepairAttempt(
+  teamName: string,
+  attempt: AgmoTeamHudRepairAttempt,
+  cwd = process.cwd()
+): Promise<AgmoTeamHudRepairState> {
+  const current =
+    (await readHudRepairState(teamName, cwd)) ?? {
+      updated_at: attempt.attempted_at,
+      debounce_ms: HUD_REPAIR_DEBOUNCE_MS,
+      recent: []
+    };
+  const next: AgmoTeamHudRepairState = {
+    updated_at: attempt.attempted_at,
+    debounce_ms: HUD_REPAIR_DEBOUNCE_MS,
+    recent: [...current.recent, attempt].slice(-HUD_REPAIR_HISTORY_LIMIT)
+  };
+  await writeJsonFile(resolveTeamHudRepairPath(teamName, cwd), next);
+  return next;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function paneRetryDelayFromAttempts(attempts: number): number {
+  return PANE_CLOSE_RETRY_DELAY_MS * Math.max(attempts, 1);
+}
+
+function collectTrackedTmuxPanes(status: AgmoTeamStatusSnapshot): AgmoPaneCloseRetryEntry[] {
+  const timestamp = nowIso();
+  const entries: AgmoPaneCloseRetryEntry[] = [];
+  for (const worker of status.workers) {
+    const paneId = status.config.tmux.worker_pane_ids[worker.identity.name] ?? worker.identity.pane_id;
+    if (!paneId) {
+      continue;
+    }
+    entries.push({
+      pane_id: paneId,
+      team_name: status.config.name,
+      role: "worker",
+      worker_name: worker.identity.name,
+      session_id: status.config.tmux.session_id ?? null,
+      leader_pane_id: status.config.tmux.leader_pane_id,
+      status: "pending",
+      max_attempts: PANE_CLOSE_RETRY_MAX_ATTEMPTS,
+      attempts: 0,
+      first_seen_at: timestamp,
+      next_attempt_at: timestamp
+    });
+  }
+  if (status.config.tmux.hud_pane_id) {
+    entries.push({
+      pane_id: status.config.tmux.hud_pane_id,
+      team_name: status.config.name,
+      role: "hud",
+      session_id: status.config.tmux.session_id ?? null,
+      leader_pane_id: status.config.tmux.leader_pane_id,
+      status: "pending",
+      max_attempts: PANE_CLOSE_RETRY_MAX_ATTEMPTS,
+      attempts: 0,
+      first_seen_at: timestamp,
+      next_attempt_at: timestamp
+    });
+  }
+  return entries;
+}
+
+async function enqueuePaneCloseRetries(
+  teamName: string,
+  candidates: AgmoPaneCloseRetryEntry[],
+  summary: TmuxPaneDestructionSummary,
+  cwd = process.cwd()
+): Promise<AgmoPaneCloseRetryState> {
+  const timestamp = nowIso();
+  const current =
+    (await readPaneCloseRetryState(teamName, cwd)) ?? {
+      updated_at: timestamp,
+      entries: []
+    };
+  const currentByPane = new Map(current.entries.map((entry) => [entry.pane_id, entry]));
+  const candidateByPane = new Map(candidates.map((entry) => [entry.pane_id, entry]));
+  for (const result of summary.panes) {
+    if (result.status === "killed") {
+      const previous = currentByPane.get(result.pane_id);
+      const candidate = candidateByPane.get(result.pane_id);
+      if (candidate || previous) {
+        currentByPane.set(result.pane_id, {
+          ...(candidate ?? previous),
+          ...(previous ?? {}),
+          pane_id: result.pane_id,
+          status: "cleared",
+          max_attempts:
+            previous?.max_attempts ?? candidate?.max_attempts ?? PANE_CLOSE_RETRY_MAX_ATTEMPTS,
+          cleared_at: timestamp,
+          last_error: undefined,
+          next_attempt_at: timestamp
+        } as AgmoPaneCloseRetryEntry);
+      }
+      continue;
+    }
+    if (result.status !== "failed" && result.reason !== "topology_guard") {
+      continue;
+    }
+    const previous = currentByPane.get(result.pane_id);
+    const candidate = candidateByPane.get(result.pane_id);
+    if (!candidate) {
+      continue;
+    }
+    const missingPane = /not found|no such pane/i.test(result.error ?? "");
+    const attempts = (previous?.attempts ?? candidate.attempts) + 1;
+    const maxAttempts =
+      previous?.max_attempts ?? candidate.max_attempts ?? PANE_CLOSE_RETRY_MAX_ATTEMPTS;
+    const nextStatus = missingPane
+      ? "cleared"
+      : attempts >= maxAttempts
+        ? "manual_required"
+        : "pending";
+    currentByPane.set(result.pane_id, {
+      ...candidate,
+      ...previous,
+      status: nextStatus,
+      max_attempts: maxAttempts,
+      attempts,
+      last_attempt_at: timestamp,
+      next_attempt_at:
+        nextStatus === "pending"
+          ? new Date(Date.parse(timestamp) + paneRetryDelayFromAttempts(attempts)).toISOString()
+          : timestamp,
+      ...(nextStatus === "cleared" ? { cleared_at: timestamp } : {}),
+      ...(!missingPane ? { last_seen_live: timestamp } : {}),
+      last_error: result.error
+    });
+  }
+  const next = {
+    updated_at: timestamp,
+    entries: Array.from(currentByPane.values())
+  };
+  await writePaneCloseRetryState(teamName, next, cwd);
+  return next;
+}
+
+async function processPaneCloseRetryQueue(
+  teamName: string,
+  options: {
+    dryRun?: boolean;
+    force?: boolean;
+  } = {},
+  cwd = process.cwd()
+): Promise<{
+  pending: number;
+  due: AgmoPaneCloseRetryEntry[];
+  dry_run: boolean;
+  tmux_pane_destruction: TmuxPaneDestructionSummary;
+}> {
+  const retryState = await readPaneCloseRetryState(teamName, cwd);
+  const entries = retryState?.entries ?? [];
+  const timestamp = nowIso();
+  const timestampMs = Date.parse(timestamp);
+  const due = entries.filter(
+    (entry) =>
+      (entry.status ?? "pending") === "pending" &&
+      (options.force || Date.parse(entry.next_attempt_at) <= timestampMs)
+  );
+  const pending = entries.filter((entry) => (entry.status ?? "pending") === "pending").length;
+  if (due.length === 0 || options.dryRun) {
+    return {
+      pending,
+      due,
+      dry_run: options.dryRun ?? false,
+      tmux_pane_destruction: emptyTmuxPaneDestructionSummary()
+    };
+  }
+
+  const bySession = new Map<string | null | undefined, AgmoPaneCloseRetryEntry[]>();
+  for (const entry of due) {
+    const key = entry.session_id ?? null;
+    bySession.set(key, [...(bySession.get(key) ?? []), entry]);
+  }
+  const summaries: TmuxPaneDestructionSummary[] = [];
+  for (const [sessionId, group] of bySession) {
+    summaries.push(
+      destroyWorkerPanes(
+        group.map((entry) => entry.pane_id),
+        undefined,
+        {
+          expectedSessionId: sessionId ?? null,
+          leaderPaneId: group[0]?.leader_pane_id,
+          currentPaneId: process.env.TMUX_PANE ?? null
+        }
+      )
+    );
+  }
+  const tmuxPaneDestruction = mergeTmuxPaneDestructionSummaries(summaries);
+  await enqueuePaneCloseRetries(teamName, due, tmuxPaneDestruction, cwd);
+  return {
+    pending:
+      (await readPaneCloseRetryState(teamName, cwd))?.entries.filter(
+        (entry) => (entry.status ?? "pending") === "pending"
+      ).length ?? 0,
+    due,
+    dry_run: false,
+    tmux_pane_destruction: tmuxPaneDestruction
+  };
+}
+
+function mergeTmuxPaneDestructionSummaries(
+  summaries: TmuxPaneDestructionSummary[]
+): TmuxPaneDestructionSummary {
+  const panes = summaries.flatMap((summary) => summary.panes);
+  return {
+    panes,
+    killed: panes.filter((pane) => pane.status === "killed").length,
+    failed: panes.filter((pane) => pane.status === "failed").length,
+    skipped: panes.filter((pane) => pane.status === "skipped").length
+  };
+}
+
+function buildTmuxPaneMonitor(
+  role: "leader" | "hud" | "worker",
+  paneId: string | null | undefined,
+  expectedSessionId: string | null | undefined,
+  panes: TmuxPaneInfo[],
+  workerName?: string
+): AgmoTmuxPaneMonitorSnapshot {
+  if (!paneId) {
+    return {
+      role,
+      ...(workerName ? { worker_name: workerName } : {}),
+      pane_id: paneId ?? null,
+      session_id: expectedSessionId ?? null,
+      health: "unknown",
+      reasons: ["pane_not_configured"]
+    };
+  }
+
+  const pane = panes.find((entry) => entry.pane_id === paneId);
+  if (!pane) {
+    return {
+      role,
+      ...(workerName ? { worker_name: workerName } : {}),
+      pane_id: paneId,
+      session_id: expectedSessionId ?? null,
+      health: "missing",
+      reasons: ["pane_not_found"]
+    };
+  }
+
+  const reasons: string[] = [];
+  if (expectedSessionId && pane.session_id !== expectedSessionId) {
+    reasons.push("session_mismatch");
+  }
+  if (pane.dead) {
+    reasons.push("pane_dead");
+  }
+
+  return {
+    role,
+    ...(workerName ? { worker_name: workerName } : {}),
+    pane_id: paneId,
+    session_id: pane.session_id,
+    health: reasons.length > 0 ? "orphaned" : "live",
+    reasons
+  };
+}
+
+function isUnavailableTmuxPane(pane: AgmoTmuxPaneMonitorSnapshot | undefined): boolean {
+  return Boolean(pane && pane.health !== "live" && pane.health !== "unknown");
+}
+
+function buildTmuxLayoutHealth(
+  transport: AgmoTeamConfig["transport"],
+  leader: AgmoTmuxPaneMonitorSnapshot | undefined,
+  hud: AgmoTmuxPaneMonitorSnapshot | undefined,
+  workers: AgmoTmuxPaneMonitorSnapshot[]
+): AgmoTmuxLayoutHealth {
+  if (transport !== "tmux") {
+    return "skipped";
+  }
+  if (!leader) {
+    return "unknown";
+  }
+  if (hud && isUnavailableTmuxPane(hud)) {
+    return "repairable";
+  }
+  if (isUnavailableTmuxPane(leader) || workers.some((worker) => isUnavailableTmuxPane(worker))) {
+    return "degraded";
+  }
+  return "ok";
+}
+
+function buildTmuxHealthSummary(
+  status: AgmoTeamStatusSnapshot,
+  leader: AgmoTmuxPaneMonitorSnapshot | undefined,
+  hud: AgmoTmuxPaneMonitorSnapshot | undefined,
+  workerPanes: AgmoTmuxPaneMonitorSnapshot[] = [],
+  layoutHealth: AgmoTmuxLayoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes)
+): NonNullable<AgmoTeamMonitorSnapshot["tmux_health"]> {
+  const retryEntries = status.pane_close_retry?.entries ?? [];
+  const orphanWarnings: string[] = [];
+  if (isUnavailableTmuxPane(leader)) {
+    orphanWarnings.push(`leader:${leader?.health}`);
+  }
+  if (isUnavailableTmuxPane(hud)) {
+    orphanWarnings.push(`hud:${hud?.health}`);
+  }
+  for (const worker of workerPanes) {
+    if (isUnavailableTmuxPane(worker)) {
+      orphanWarnings.push(`worker:${worker.worker_name ?? worker.pane_id}:${worker.health}`);
+    }
+  }
+  for (const entry of retryEntries) {
+    if ((entry.status ?? "pending") === "manual_required") {
+      orphanWarnings.push(`${entry.role}:${entry.pane_id}:manual_required`);
+    }
+  }
+
+  return {
+    transport: status.config.transport,
+    leader: leader?.health ?? "not_configured",
+    hud: hud?.health ?? "not_configured",
+    workers: Object.fromEntries(
+      workerPanes.map((pane) => [
+        pane.worker_name ?? pane.pane_id ?? "unknown",
+        pane.health ?? "not_configured"
+      ])
+    ),
+    layout: layoutHealth,
+    retry_pending: retryEntries.filter((entry) => (entry.status ?? "pending") === "pending").length,
+    retry_manual_required: retryEntries.filter((entry) => entry.status === "manual_required").length,
+    orphan_warnings: orphanWarnings
+  };
+}
+
+function buildShutdownAckAggregate(
+  acknowledgements: AgmoTeamShutdownAck[]
+): NonNullable<AgmoTeamShutdownState["aggregate"]> {
+  return {
+    accepted: acknowledgements.filter((ack) => (ack.status ?? "accepted") === "accepted").length,
+    busy: acknowledgements.filter((ack) => ack.status === "busy").length,
+    rejected: acknowledgements.filter((ack) => ack.status === "rejected").length,
+    total: acknowledgements.length
+  };
+}
+
+function shouldPreserveShutdownAckForAutomaticUpdate(
+  existing: AgmoTeamShutdownAck | undefined
+): existing is AgmoTeamShutdownAck {
+  if (!existing) {
+    return false;
+  }
+  if (existing.source === "explicit") {
+    return true;
+  }
+
+  // Legacy acks did not record their source. Treat non-accepted legacy
+  // decisions as intentional so automatic heartbeats cannot downgrade them.
+  return !existing.source && (existing.status === "busy" || existing.status === "rejected");
+}
+
+export async function readTeamTmuxHealthSummary(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<NonNullable<AgmoTeamMonitorSnapshot["tmux_health"]> | null> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    return null;
+  }
+
+  const tmuxPanes = status.config.transport === "tmux" ? listTmuxPanes() : [];
+  const leader =
+    status.config.transport === "tmux"
+      ? buildTmuxPaneMonitor(
+          "leader",
+          status.config.tmux.leader_pane_id,
+          status.config.tmux.session_id ?? null,
+          tmuxPanes
+        )
+      : undefined;
+  const hud =
+    status.config.transport === "tmux" && status.config.tmux.hud_pane_id
+      ? buildTmuxPaneMonitor(
+          "hud",
+          status.config.tmux.hud_pane_id,
+          status.config.tmux.session_id ?? null,
+          tmuxPanes
+        )
+      : undefined;
+  const workerPanes =
+    status.config.transport === "tmux"
+      ? status.workers.map((worker) =>
+          buildTmuxPaneMonitor(
+            "worker",
+            worker.identity.pane_id ?? status.config.tmux.worker_pane_ids[worker.identity.name],
+            status.config.tmux.session_id ?? null,
+            tmuxPanes,
+            worker.identity.name
+          )
+        )
+      : [];
+  const layoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes);
+
+  return buildTmuxHealthSummary(status, leader, hud, workerPanes, layoutHealth);
+}
+
+async function recordShutdownAckIfRequested(
+  teamName: string,
+  workerName: string,
+  options: {
+    status?: AgmoTeamShutdownAck["status"];
+    source?: AgmoTeamShutdownAck["source"];
+    reason?: string;
+    taskId?: string;
+  } = {},
+  cwd = process.cwd()
+): Promise<AgmoTeamShutdownAck | null> {
+  return await withTeamStateLock(
+    teamName,
+    "team-state",
+    `acknowledge shutdown for ${workerName}`,
+    async () => {
+      const shutdown = await readShutdownState(teamName, cwd);
+      if (!shutdown?.requested) {
+        return null;
+      }
+      const identity = await readWorkerIdentity(teamName, workerName, cwd);
+      const source = options.source ?? "auto";
+      const existing = shutdown.acknowledgements.find(
+        (entry) => entry.worker_name === workerName
+      );
+      if (source === "auto" && shouldPreserveShutdownAckForAutomaticUpdate(existing)) {
+        return existing;
+      }
+
+      const ack: AgmoTeamShutdownAck = {
+        worker_name: workerName,
+        pane_id: identity.pane_id ?? null,
+        status: options.status ?? "accepted",
+        source,
+        ...(options.reason ? { reason: options.reason } : {}),
+        ...(options.taskId ? { task_id: options.taskId } : {}),
+        acked_at: nowIso()
+      };
+      const acknowledgements = [
+        ...shutdown.acknowledgements.filter((entry) => entry.worker_name !== workerName),
+        ack
+      ];
+      await writeShutdownState(
+        teamName,
+        {
+          ...shutdown,
+          acknowledgements,
+          aggregate: buildShutdownAckAggregate(acknowledgements)
+        },
+        cwd
+      );
+      return ack;
+    },
+    cwd
+  );
+}
+
+export async function acknowledgeShutdownRequest(
+  teamName: string,
+  workerName: string,
+  status: "accepted" | "busy" | "rejected",
+  options: {
+    reason?: string;
+    taskId?: string;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  if (!["accepted", "busy", "rejected"].includes(status)) {
+    throw new Error("shutdown ack status must be one of: accepted, busy, rejected");
+  }
+  const ack = await recordShutdownAckIfRequested(
+    normalizedTeamName,
+    workerName,
+    {
+      status,
+      source: "explicit",
+      reason: options.reason,
+      taskId: options.taskId
+    },
+    cwd
+  );
+  if (!ack) {
+    throw new Error(`shutdown not requested for team: ${normalizedTeamName}`);
+  }
+  const shutdown = await readShutdownState(normalizedTeamName, cwd);
+  await writeEvent(
+    normalizedTeamName,
+    {
+      timestamp: ack.acked_at,
+      type: "shutdown_acknowledged",
+      team_name: normalizedTeamName,
+      worker_name: workerName,
+      status: ack.status,
+      reason: ack.reason,
+      task_id: ack.task_id
+    },
+    cwd
+  );
+  return {
+    team_name: normalizedTeamName,
+    worker_name: workerName,
+    acknowledgement: ack,
+    aggregate: shutdown?.aggregate ?? buildShutdownAckAggregate([ack])
+  };
 }
 
 function runGit(
@@ -1985,6 +2639,12 @@ export async function buildLeaderMonitorView(
   const monitorByWorker = new Map(snapshot.workers.map((worker) => [worker.worker_name, worker]));
   const actions: string[] = [];
 
+  if (isUnavailableTmuxPane(snapshot.leader)) {
+    actions.push(`Leader tmux pane is ${snapshot.leader?.health}; run \`agmo team cleanup-stale --sweep-tmux\` or \`agmo team shutdown ${normalizedTeamName} --grace-ms 0\` after confirming durable state.`);
+  }
+  if (isUnavailableTmuxPane(snapshot.hud)) {
+    actions.push(`Run \`agmo team hud ${normalizedTeamName} --repair\` to recreate the HUD pane.`);
+  }
   if (snapshot.dead_workers > 0 || snapshot.stale_workers > 0) {
     actions.push(`Run \`agmo team monitor ${normalizedTeamName} --auto-nudge\` to nudge non-reporting workers.`);
   }
@@ -2066,6 +2726,12 @@ export async function buildLeaderMonitorView(
           .map((entry) => `${entry.channel}:${entry.status}`)
           .join(", ")}`
       : "- leader_alert_delivery: none";
+  const leaderPaneSummary = snapshot.leader
+    ? `- leader_pane: ${snapshot.leader.pane_id ?? "none"} ${snapshot.leader.health}${snapshot.leader.reasons.length > 0 ? ` (${snapshot.leader.reasons.join(",")})` : ""}`
+    : "- leader_pane: n/a";
+  const hudPaneSummary = snapshot.hud
+    ? `- hud_pane: ${snapshot.hud.pane_id ?? "none"} ${snapshot.hud.health}${snapshot.hud.reasons.length > 0 ? ` (${snapshot.hud.reasons.join(",")})` : ""}`
+    : "- hud_pane: n/a";
 
   const markdown = [
     `# Leader Monitor View`,
@@ -2078,6 +2744,8 @@ export async function buildLeaderMonitorView(
     `- tasks: pending=${taskCounts.pending}, in_progress=${taskCounts.in_progress}, blocked=${taskCounts.blocked}, completed=${taskCounts.completed}, failed=${taskCounts.failed}`,
     `- pending_dispatch_requests: ${pendingDispatch}`,
     `- open_load_delta: ${openLoadDelta}`,
+    leaderPaneSummary,
+    hudPaneSummary,
     nudgeSummary,
     recoverySummary,
     alertSummary,
@@ -2109,6 +2777,10 @@ export async function buildLeaderHudView(
   options: {
     staleAfterMs?: number;
     deadAfterMs?: number;
+    preset?: AgmoTeamHudPreset;
+    width?: number;
+    maxLines?: number;
+    color?: AgmoColorMode;
   } = {},
   cwd = process.cwd()
 ): Promise<{
@@ -2162,24 +2834,29 @@ export async function buildLeaderHudView(
   if (activeLeaderAlerts > 0) {
     topActions.push("alert");
   }
+  if (isUnavailableTmuxPane(snapshot.leader)) {
+    topActions.push("leader-orphan");
+  }
+  if (isUnavailableTmuxPane(snapshot.hud)) {
+    topActions.push("repair-hud");
+  }
 
-  const workerLines = snapshot.workers
-    .map((worker) => {
-      const load = openLoads.get(worker.worker_name) ?? 0;
-      const currentTask = worker.current_task_id ? ` t=${worker.current_task_id}` : "";
-      const dispatch = worker.pending_dispatch_count > 0 ? ` d=${worker.pending_dispatch_count}` : "";
-      const risk = worker.claim_at_risk ? " !" : "";
-      return `${worker.worker_name.padEnd(8)} ${worker.health.padEnd(7)} ${worker.status_state.padEnd(7)} open=${String(load).padEnd(2)} hb=${formatDurationMs(worker.ms_since_heartbeat).padEnd(6)}${currentTask}${dispatch}${risk}`;
-    })
-    .join("\n");
-
-  const text = [
-    `AGMO HUD | team=${normalizedTeamName} | checked=${snapshot.checked_at}`,
-    `workers h=${snapshot.healthy_workers} s=${snapshot.stale_workers} d=${snapshot.dead_workers} active=${snapshot.active_workers} | tasks p=${taskCounts.pending} w=${taskCounts.in_progress} b=${taskCounts.blocked} c=${taskCounts.completed} f=${taskCounts.failed} | alerts=${activeLeaderAlerts}`,
-    `dispatch_pending=${pendingDispatch} | open_load_delta=${openLoadDelta} | actions=${topActions.length > 0 ? topActions.join(",") : "none"}`,
-    "",
-    workerLines || "no workers"
-  ].join("\n");
+  const text = renderTeamHud(
+    buildTeamHudRenderContext(normalizedTeamName, snapshot, status, {
+      taskCounts,
+      pendingDispatch,
+      activeLeaderAlerts,
+      openLoads,
+      openLoadDelta,
+      topActions
+    }),
+    {
+      preset: options.preset,
+      maxWidth: options.width,
+      maxLines: options.maxLines,
+      color: options.color
+    }
+  ).replace(/\n$/, "");
 
   const path = resolveTeamLeaderHudPath(normalizedTeamName, cwd);
   await writeTextFile(path, `${text}\n`);
@@ -2188,6 +2865,465 @@ export async function buildLeaderHudView(
     team_name: normalizedTeamName,
     path,
     text
+  };
+}
+
+export async function repairTeamHudPane(
+  teamName: string,
+  optionsOrCwd:
+    | {
+        debounceMs?: number;
+        force?: boolean;
+      }
+    | string = {},
+  cwdArg = process.cwd()
+): Promise<{
+  team_name: string;
+  status: "repaired" | "unchanged" | "skipped" | "failed" | "debounced";
+  reason?: string;
+  previous_hud_pane_id?: string | null;
+  hud_pane_id?: string | null;
+  repair_state?: AgmoTeamHudRepairState;
+}> {
+  const options = typeof optionsOrCwd === "string" ? {} : optionsOrCwd;
+  const cwd = typeof optionsOrCwd === "string" ? optionsOrCwd : cwdArg;
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+
+  const timestamp = nowIso();
+  const debounceMs = Math.max(options.debounceMs ?? HUD_REPAIR_DEBOUNCE_MS, 0);
+  const recordAttempt = async (
+    attempt: Omit<AgmoTeamHudRepairAttempt, "attempted_at">
+  ): Promise<{
+    team_name: string;
+    status: "repaired" | "unchanged" | "skipped" | "failed" | "debounced";
+    reason?: string;
+    previous_hud_pane_id?: string | null;
+    hud_pane_id?: string | null;
+    repair_state?: AgmoTeamHudRepairState;
+  }> => {
+    const repairState = await writeHudRepairAttempt(
+      normalizedTeamName,
+      {
+        attempted_at: timestamp,
+        ...attempt
+      },
+      cwd
+    );
+    return {
+      team_name: normalizedTeamName,
+      ...attempt,
+      repair_state: repairState
+    };
+  };
+
+  if (status.config.transport !== "tmux") {
+    return await recordAttempt({
+      status: "skipped",
+      reason: "team_not_using_tmux"
+    });
+  }
+
+  if (!status.config.tmux.hud_refresh_ms) {
+    return await recordAttempt({
+      status: "skipped",
+      reason: "hud_not_configured"
+    });
+  }
+
+  const currentRepairState = await readHudRepairState(normalizedTeamName, cwd);
+  const lastAttempt = currentRepairState?.recent.at(-1);
+  const lastAttemptAtMs = Date.parse(lastAttempt?.attempted_at ?? "");
+  if (
+    !options.force &&
+    lastAttempt &&
+    Number.isFinite(lastAttemptAtMs) &&
+    Date.parse(timestamp) - lastAttemptAtMs >= 0 &&
+    Date.parse(timestamp) - lastAttemptAtMs < debounceMs
+  ) {
+    return await recordAttempt({
+      status: "debounced",
+      reason: "repair_debounce",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+      hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    });
+  }
+
+  const snapshot = await monitorTeamRuntime(normalizedTeamName, {}, cwd);
+  if (snapshot.hud?.health === "live") {
+    return await recordAttempt({
+      status: "unchanged",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+      hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    });
+  }
+
+  if (isUnavailableTmuxPane(snapshot.leader)) {
+    return await recordAttempt({
+      status: "failed",
+      reason: "leader_pane_unavailable",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    });
+  }
+
+  const nextHudPaneId = createHudPane(
+    {
+      teamName: normalizedTeamName,
+      projectRoot: cwd,
+      cliEntryPath: agmoCliDistEntryPath(),
+      refreshMs: Math.max(status.config.tmux.hud_refresh_ms, 250),
+      clearScreen: status.config.tmux.hud_clear_screen ?? true,
+      leaderPaneId: status.config.tmux.leader_pane_id,
+      sessionId: status.config.tmux.session_id ?? null,
+      ownerTags: true
+    },
+    {
+      targetPaneId: status.config.tmux.leader_pane_id
+    }
+  );
+  if (!nextHudPaneId) {
+    return await recordAttempt({
+      status: "failed",
+      reason: "hud_pane_create_failed",
+      previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null
+    });
+  }
+
+  const nextConfig: AgmoTeamConfig = {
+    ...status.config,
+    updated_at: timestamp,
+    tmux: {
+      ...status.config.tmux,
+      hud_pane_id: nextHudPaneId
+    }
+  };
+  await Promise.all([
+    writeJsonFile(resolveTeamConfigPath(normalizedTeamName, cwd), nextConfig),
+    writeEvent(
+      normalizedTeamName,
+      {
+        timestamp,
+        type: "team_hud_repaired",
+        team_name: normalizedTeamName,
+        previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+        hud_pane_id: nextHudPaneId
+      },
+      cwd
+    )
+  ]);
+
+  return await recordAttempt({
+    status: "repaired",
+    previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
+    hud_pane_id: nextHudPaneId
+  });
+}
+
+type LayoutPaneHealth = {
+  pane_id?: string | null;
+  health: "live" | "missing" | "dead" | "foreign_session" | "not_configured" | "legacy_configured" | "unknown";
+  owned?: boolean;
+  reasons: string[];
+};
+
+type LayoutAction = {
+  kind: string;
+  target: string;
+  reason: string;
+};
+
+type LayoutOperation = {
+  command: "team layout repair" | "team layout rebalance";
+  team_name: string;
+  dry_run: boolean;
+  status: "completed" | "partial" | "skipped" | "failed" | "refused";
+  planned: LayoutAction[];
+  performed: LayoutAction[];
+  skipped: LayoutAction[];
+  failed: Array<LayoutAction & { error: string }>;
+  refused: Array<LayoutAction & { reason: string }>;
+};
+
+function mapHudReapAction(entry: { pane_id: string; reason: string }): LayoutAction {
+  return {
+    kind: "reap-orphan-hud",
+    target: entry.pane_id,
+    reason: entry.reason
+  };
+}
+
+function appendHudReapToLayoutOperation(
+  operation: LayoutOperation,
+  reap: ReturnType<typeof reapOrphanHudPanes>,
+  options: { dryRun?: boolean } = {}
+): void {
+  operation.planned.push(...reap.planned.map(mapHudReapAction));
+  operation.performed.push(...reap.performed.map(mapHudReapAction));
+  operation.skipped.push(
+    ...reap.skipped.map(mapHudReapAction),
+    ...(options.dryRun ? reap.planned.map(mapHudReapAction) : [])
+  );
+  operation.failed.push(
+    ...reap.failed.map((entry) => ({
+      ...mapHudReapAction(entry),
+      error: entry.error ?? "orphan HUD reap failed"
+    }))
+  );
+  operation.refused.push(
+    ...reap.refused.map((entry) => ({
+      ...mapHudReapAction(entry),
+      reason: entry.reason
+    }))
+  );
+}
+
+function buildPaneHealth(
+  paneId: string | null | undefined,
+  expectedSessionId: string | null | undefined,
+  panes: TmuxPaneInfo[],
+  role: "leader" | "hud" | "worker",
+  teamName: string
+): LayoutPaneHealth {
+  if (!paneId) {
+    return { pane_id: paneId ?? null, health: "not_configured", reasons: ["pane_not_configured"] };
+  }
+  const pane = panes.find((entry) => entry.pane_id === paneId);
+  if (!pane) {
+    return { pane_id: paneId, health: "missing", reasons: ["pane_not_found"] };
+  }
+  if (expectedSessionId && pane.session_id !== expectedSessionId) {
+    return { pane_id: paneId, health: "foreign_session", reasons: ["pane_session_mismatch"] };
+  }
+  if (pane.dead) {
+    return { pane_id: paneId, health: "dead", reasons: ["pane_dead"] };
+  }
+  const owner = role === "hud" ? readAgmoHudPaneOwner(pane) : null;
+  if (role === "hud" && !owner?.owned) {
+    return { pane_id: paneId, health: "legacy_configured", owned: false, reasons: ["legacy_untagged_configured_hud"] };
+  }
+  return {
+    pane_id: paneId,
+    health: "live",
+    ...(role === "hud" ? { owned: owner?.teamName === teamName } : {}),
+    reasons: []
+  };
+}
+
+export async function readTeamLayoutStatus(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<{
+  command: "team layout status";
+  team_name: string;
+  transport: "tmux" | "none";
+  dry_run: false;
+  layout_health: "ok" | "degraded" | "repairable" | "unknown" | "skipped";
+  panes: {
+    leader: LayoutPaneHealth;
+    hud?: LayoutPaneHealth;
+    workers: Record<string, LayoutPaneHealth>;
+  };
+  warnings: string[];
+  recommended_actions: string[];
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (status.config.transport !== "tmux") {
+    return {
+      command: "team layout status",
+      team_name: normalizedTeamName,
+      transport: "none",
+      dry_run: false,
+      layout_health: "skipped",
+      panes: {
+        leader: { pane_id: null, health: "not_configured", reasons: ["team_not_using_tmux"] },
+        workers: {}
+      },
+      warnings: ["team_not_using_tmux"],
+      recommended_actions: []
+    };
+  }
+  const panes = listTmuxPanes();
+  const expectedSessionId = status.config.tmux.session_id ?? null;
+  const leader = buildPaneHealth(
+    status.config.tmux.leader_pane_id,
+    expectedSessionId,
+    panes,
+    "leader",
+    normalizedTeamName
+  );
+  const hud = buildPaneHealth(
+    status.config.tmux.hud_pane_id ?? null,
+    expectedSessionId,
+    panes,
+    "hud",
+    normalizedTeamName
+  );
+  const workers = Object.fromEntries(
+    Object.entries(status.config.tmux.worker_pane_ids).map(([workerName, paneId]) => [
+      workerName,
+      buildPaneHealth(paneId, expectedSessionId, panes, "worker", normalizedTeamName)
+    ])
+  );
+  const ownedHudPaneIds = findHudPaneIds(panes, {
+    teamName: normalizedTeamName,
+    leaderPaneId: status.config.tmux.leader_pane_id,
+    sessionId: expectedSessionId
+  });
+  const orphanHudReap = reapOrphanHudPanes(
+    {
+      teamName: normalizedTeamName,
+      sessionId: expectedSessionId,
+      leaderPaneId: status.config.tmux.leader_pane_id,
+      dryRun: true
+    }
+  );
+  const plan = computeCurrentTeamLayoutPlan(
+    status.config.tmux.leader_pane_id,
+    Object.keys(status.config.tmux.worker_pane_ids).length,
+    { hud: Boolean(status.config.tmux.hud_pane_id) }
+  );
+  const warnings = [
+    ...plan.warnings,
+    ...(hud.health === "missing" || hud.health === "dead" ? ["hud_unavailable"] : []),
+    ...(hud.health === "legacy_configured" ? ["legacy_configured_hud_untagged"] : []),
+    ...(ownedHudPaneIds.length > 1 ? ["duplicate_owned_hud_panes"] : []),
+    ...(orphanHudReap.planned.length > 0 ? ["orphaned_owned_hud_panes"] : [])
+  ];
+  const recommended_actions = [
+    ...(hud.health === "missing" || hud.health === "dead" ? ["team layout repair"] : []),
+    ...(orphanHudReap.planned.length > 0 ? ["team layout repair --dry-run"] : []),
+    ...(plan.health === "degraded" ? ["team layout rebalance --dry-run"] : [])
+  ];
+  const repairable = hud.health === "missing" || hud.health === "dead";
+  return {
+    command: "team layout status",
+    team_name: normalizedTeamName,
+    transport: "tmux",
+    dry_run: false,
+    layout_health: repairable ? "repairable" : warnings.length > 0 ? "degraded" : "ok",
+    panes: {
+      leader,
+      hud,
+      workers
+    },
+    warnings,
+    recommended_actions
+  };
+}
+
+export async function repairTeamLayout(
+  teamName: string,
+  options: { dryRun?: boolean; force?: boolean } = {},
+  cwd = process.cwd()
+): Promise<LayoutOperation> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  const result: LayoutOperation = {
+    command: "team layout repair",
+    team_name: normalizedTeamName,
+    dry_run: Boolean(options.dryRun),
+    status: "skipped",
+    planned: [],
+    performed: [],
+    skipped: [],
+    failed: [],
+    refused: []
+  };
+  if (status.config.transport !== "tmux" || !status.config.tmux.hud_refresh_ms) {
+    result.skipped.push({ kind: "repair-hud", target: normalizedTeamName, reason: "team_not_using_tmux_or_hud_disabled" });
+    return result;
+  }
+  const layoutStatus = await readTeamLayoutStatus(normalizedTeamName, cwd);
+  const orphanHudReap = reapOrphanHudPanes({
+    teamName: normalizedTeamName,
+    sessionId: status.config.tmux.session_id ?? null,
+    leaderPaneId: status.config.tmux.leader_pane_id,
+    dryRun: options.dryRun
+  });
+  appendHudReapToLayoutOperation(result, orphanHudReap, { dryRun: options.dryRun });
+  const hudHealth = layoutStatus.panes.hud?.health ?? "not_configured";
+  const action = { kind: "repair-hud", target: status.config.tmux.leader_pane_id ?? "leader", reason: `hud_${hudHealth}` };
+  result.planned.push(action);
+  if (options.dryRun) {
+    result.skipped.push(action);
+    return result;
+  }
+  if (hudHealth === "live" || (hudHealth === "legacy_configured" && !options.force)) {
+    result.status = "completed";
+    result.skipped.push({ ...action, reason: hudHealth === "legacy_configured" ? "legacy_configured_hud_left_in_place" : "hud_already_live" });
+    if (orphanHudReap.failed.length > 0) {
+      result.status = result.performed.length > 0 ? "partial" : "failed";
+    } else if (orphanHudReap.refused.length > 0) {
+      result.status = result.performed.length > 0 ? "partial" : "refused";
+    }
+    return result;
+  }
+  const repair = await repairTeamHudPane(normalizedTeamName, { force: true, debounceMs: 0 }, cwd);
+  if (repair.status === "repaired" || repair.status === "unchanged") {
+    result.status = "completed";
+    result.performed.push({ ...action, target: repair.hud_pane_id ?? action.target });
+  } else if (repair.status === "skipped" || repair.status === "debounced") {
+    result.status = "skipped";
+    result.skipped.push({ ...action, reason: repair.reason ?? repair.status });
+  } else {
+    result.status = "failed";
+    result.failed.push({ ...action, error: repair.reason ?? "hud_repair_failed" });
+  }
+  if (orphanHudReap.failed.length > 0) {
+    result.status = result.performed.length > 0 ? "partial" : "failed";
+  } else if (orphanHudReap.refused.length > 0 && result.status === "completed") {
+    result.status = "partial";
+  }
+  return result;
+}
+
+export async function rebalanceTeamLayout(
+  teamName: string,
+  options: { dryRun?: boolean; layout?: TeamLayoutPreset } = {},
+  cwd = process.cwd()
+): Promise<LayoutOperation> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (status.config.transport !== "tmux") {
+    return {
+      command: "team layout rebalance",
+      team_name: normalizedTeamName,
+      dry_run: Boolean(options.dryRun),
+      status: "skipped",
+      planned: [],
+      performed: [],
+      skipped: [{ kind: "rebalance-layout", target: normalizedTeamName, reason: "team_not_using_tmux" }],
+      failed: [],
+      refused: []
+    };
+  }
+  const operation = applyTeamLayout({
+    teamName: normalizedTeamName,
+    leaderPaneId: status.config.tmux.leader_pane_id,
+    sessionId: status.config.tmux.session_id ?? null,
+    workerPaneIds: status.config.tmux.worker_pane_ids,
+    hudPaneId: status.config.tmux.hud_pane_id ?? null,
+    layout: options.layout ?? "auto",
+    dryRun: options.dryRun
+  });
+  return {
+    command: "team layout rebalance",
+    team_name: normalizedTeamName,
+    dry_run: Boolean(options.dryRun),
+    ...operation
   };
 }
 
@@ -2321,6 +3457,7 @@ export async function startTeamRuntime(
     tmux: {
       available: tmux.available,
       in_tmux_client: tmux.in_tmux_client,
+      session_id: tmux.session_id,
       leader_pane_id: tmux.leader_pane_id,
       hud_pane_id: null,
       hud_refresh_ms: request.hud ? Math.max(request.hudRefreshMs ?? 2000, 250) : null,
@@ -2489,6 +3626,7 @@ export async function startTeamRuntime(
     );
 
     config.transport = "tmux";
+    config.tmux.session_id = createdSession.sessionId;
     config.tmux.leader_pane_id = createdSession.leaderPaneId;
     config.tmux.hud_pane_id = createdSession.hudPaneId ?? null;
     config.tmux.worker_pane_ids = createdSession.workerPaneIds;
@@ -2585,6 +3723,9 @@ export async function readTeamStatus(
   const leaderEscalations = await readLeaderEscalationState(normalizedTeamName, cwd);
   const leaderAlertDelivery = await readLeaderAlertDeliveryConfig(normalizedTeamName, cwd);
   const integrations = await readIntegrationState(normalizedTeamName, cwd);
+  const shutdown = await readShutdownState(normalizedTeamName, cwd);
+  const paneCloseRetry = await readPaneCloseRetryState(normalizedTeamName, cwd);
+  const hudRepair = await readHudRepairState(normalizedTeamName, cwd);
 
   const tasks = await Promise.all(
     config.worker_names.map(async (_, index) => {
@@ -2650,93 +3791,316 @@ export async function readTeamStatus(
     leader_alert_delivery: leaderAlertDelivery,
     leader_escalations: leaderEscalations,
     leader_nudges: leaderNudges,
-    integrations
+    integrations,
+    shutdown,
+    pane_close_retry: paneCloseRetry,
+    hud_repair: hudRepair
   };
 }
 
 export async function shutdownTeamRuntime(
   teamName: string,
-  cwd = process.cwd()
+  optionsOrCwd:
+    | {
+        graceMs?: number;
+      }
+    | string = {},
+  cwdArg = process.cwd()
 ): Promise<Record<string, unknown>> {
-  const status = await readTeamStatus(teamName, cwd);
+  const options = typeof optionsOrCwd === "string" ? {} : optionsOrCwd;
+  const cwd = typeof optionsOrCwd === "string" ? optionsOrCwd : cwdArg;
+  const requested = await withTeamStateLock(
+    teamName,
+    "team-state",
+    "request team shutdown",
+    async () => {
+      const status = await readTeamStatus(teamName, cwd);
 
-  if (!status) {
-    throw new Error(`team not found: ${teamName}`);
-  }
+      if (!status) {
+        throw new Error(`team not found: ${teamName}`);
+      }
 
-  const timestamp = nowIso();
-  const nextConfig: AgmoTeamConfig = {
-    ...status.config,
-    active: false,
-    phase: "shutdown",
-    updated_at: timestamp
-  };
-  const nextPhase: AgmoTeamPhaseState = {
-    current_phase: "shutdown",
-    updated_at: timestamp,
-    active: false
-  };
-  const nextTasks = status.tasks.map((task) => buildShutdownTaskRecord(task, timestamp));
-  const nextDispatchRequests = status.dispatch_requests.map((request) =>
-    request.status === "delivered" || request.status === "failed"
-      ? request
-      : {
-          ...request,
-          status: "failed" as const,
-          failed_at: timestamp
+      const timestamp = nowIso();
+      const graceMs = Math.max(options.graceMs ?? DEFAULT_SHUTDOWN_GRACE_MS, 0);
+      const shutdownState: AgmoTeamShutdownState = {
+        requested: true,
+        request_id: `shutdown-${randomUUID()}`,
+        requested_at: timestamp,
+        grace_ms: graceMs,
+        hard_kill_after_at: new Date(Date.parse(timestamp) + graceMs).toISOString(),
+        message: "Team runtime shutdown requested. Finish current note, report idle, and exit this worker pane.",
+        acknowledgements: [],
+        aggregate: {
+          accepted: 0,
+          busy: 0,
+          rejected: 0,
+          total: 0
         }
+      };
+      await writeShutdownState(status.config.name, shutdownState, cwd);
+      return {
+        status,
+        timestamp,
+        graceMs,
+        shutdownState
+      };
+    },
+    cwd
+  );
+  const { status, timestamp, graceMs, shutdownState } = requested;
+
+  const shutdownNotifications = await Promise.all(
+    status.workers.map(async (worker) => {
+      const message: AgmoMailboxMessage = {
+        message_id: createMessageId(),
+        from_worker: "leader-fixed",
+        to_worker: worker.identity.name,
+        body: shutdownState.message,
+        created_at: timestamp
+      };
+      await appendMailboxMessage(status.config.name, worker.identity.name, message, cwd);
+      const paneId =
+        status.config.tmux.worker_pane_ids[worker.identity.name] ?? worker.identity.pane_id;
+      return {
+        worker_name: worker.identity.name,
+        pane_id: paneId ?? null,
+        notified: paneId ? notifyPane(paneId, shutdownState.message) : false
+      };
+    })
   );
 
-  await Promise.all([
-    writeJsonFile(resolveTeamConfigPath(status.config.name, cwd), nextConfig),
-    writeJsonFile(resolveTeamPhasePath(status.config.name, cwd), nextPhase),
-    writeDispatchRequests(status.config.name, nextDispatchRequests, cwd),
-    ...nextTasks.map((task) => writeTaskRecord(status.config.name, task, cwd)),
-    ...status.workers.flatMap((worker) => [
-      writeWorkerStatus(
-        status.config.name,
-        worker.identity.name,
-        buildShutdownWorkerStatus(timestamp),
-        cwd
-      ),
-      writeWorkerHeartbeat(
-        status.config.name,
-        worker.identity.name,
-        buildShutdownWorkerHeartbeat(worker.heartbeat, timestamp),
-        cwd
-      )
-    ])
-  ]);
-
-  if (status.config.transport === "tmux") {
-    destroyWorkerPanes(
-      [
-        ...Object.values(status.config.tmux.worker_pane_ids),
-        ...(status.config.tmux.hud_pane_id ? [status.config.tmux.hud_pane_id] : [])
-      ]
-    );
+  if (graceMs > 0) {
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline) {
+      const latest = await readShutdownState(status.config.name, cwd);
+      if ((latest?.acknowledgements.length ?? 0) >= status.workers.length) {
+        break;
+      }
+      await sleepMs(Math.min(100, Math.max(0, deadline - Date.now())));
+    }
   }
 
-  await writeEvent(
+  const finalized = await withTeamStateLock(
     status.config.name,
+    "team-state",
+    "finalize team shutdown",
+    async () => {
+      const latestStatus = await readTeamStatus(status.config.name, cwd);
+      if (!latestStatus) {
+        throw new Error(`team not found: ${status.config.name}`);
+      }
+      const latestShutdownState =
+        (await readShutdownState(status.config.name, cwd)) ?? shutdownState;
+      const nextConfig: AgmoTeamConfig = {
+        ...latestStatus.config,
+        active: false,
+        phase: "shutdown",
+        updated_at: timestamp
+      };
+      const nextPhase: AgmoTeamPhaseState = {
+        current_phase: "shutdown",
+        updated_at: timestamp,
+        active: false
+      };
+      const nextTasks = latestStatus.tasks.map((task) =>
+        buildShutdownTaskRecord(task, timestamp)
+      );
+      const nextDispatchRequests = latestStatus.dispatch_requests.map((request) =>
+        request.status === "delivered" || request.status === "failed"
+          ? request
+          : {
+              ...request,
+              status: "failed" as const,
+              failed_at: timestamp
+            }
+      );
+
+      await Promise.all([
+        writeJsonFile(resolveTeamConfigPath(latestStatus.config.name, cwd), nextConfig),
+        writeJsonFile(resolveTeamPhasePath(latestStatus.config.name, cwd), nextPhase),
+        writeDispatchRequests(latestStatus.config.name, nextDispatchRequests, cwd),
+        ...nextTasks.map((task) => writeTaskRecord(latestStatus.config.name, task, cwd)),
+        ...latestStatus.workers.flatMap((worker) => [
+          writeWorkerStatus(
+            latestStatus.config.name,
+            worker.identity.name,
+            buildShutdownWorkerStatus(timestamp),
+            cwd
+          ),
+          writeWorkerHeartbeat(
+            latestStatus.config.name,
+            worker.identity.name,
+            buildShutdownWorkerHeartbeat(worker.heartbeat, timestamp),
+            cwd
+          )
+        ])
+      ]);
+
+      return {
+        latestStatus,
+        latestShutdownState,
+        nextPhase,
+        nextTasks,
+        nextDispatchRequests
+      };
+    },
+    cwd
+  );
+  const {
+    latestStatus,
+    latestShutdownState,
+    nextPhase,
+    nextTasks,
+    nextDispatchRequests
+  } = finalized;
+
+  const tmuxPaneDestruction =
+    latestStatus.config.transport === "tmux"
+      ? destroyWorkerPanes(
+          [
+            ...Object.values(latestStatus.config.tmux.worker_pane_ids),
+            ...(latestStatus.config.tmux.hud_pane_id
+              ? [latestStatus.config.tmux.hud_pane_id]
+              : [])
+          ],
+          undefined,
+          {
+            expectedSessionId: latestStatus.config.tmux.session_id ?? null,
+            leaderPaneId: latestStatus.config.tmux.leader_pane_id,
+            currentPaneId: process.env.TMUX_PANE ?? null
+          }
+        )
+      : emptyTmuxPaneDestructionSummary();
+  const paneCloseRetry =
+    latestStatus.config.transport === "tmux"
+      ? await enqueuePaneCloseRetries(
+          latestStatus.config.name,
+          collectTrackedTmuxPanes(latestStatus),
+          tmuxPaneDestruction,
+          cwd
+        )
+      : null;
+
+  await writeEvent(
+    latestStatus.config.name,
     {
       timestamp,
       type: "team_shutdown",
-      team_name: status.config.name
+      team_name: latestStatus.config.name,
+      shutdown_request_id: latestShutdownState.request_id,
+      shutdown_ack_count: latestShutdownState.acknowledgements.length,
+      shutdown_ack_aggregate:
+        latestShutdownState.aggregate ??
+        buildShutdownAckAggregate(latestShutdownState.acknowledgements),
+      shutdown_notifications: shutdownNotifications,
+      tmux_pane_destruction: tmuxPaneDestruction
     },
     cwd
   );
 
   return {
-    team_name: status.config.name,
-    previous_phase: status.phase.current_phase,
+    team_name: latestStatus.config.name,
+    previous_phase: latestStatus.phase.current_phase,
     current_phase: nextPhase.current_phase,
     tasks_failed: nextTasks.filter((task) => task.status === "failed").length,
     dispatch_requests_failed: nextDispatchRequests.filter((request) => request.status === "failed")
       .length,
-    preserved_state_root: resolveTeamDir(status.config.name, cwd)
+    shutdown_request: latestShutdownState,
+    shutdown_ack_aggregate:
+      latestShutdownState.aggregate ??
+      buildShutdownAckAggregate(latestShutdownState.acknowledgements),
+    shutdown_notifications: shutdownNotifications,
+    tmux_pane_destruction: tmuxPaneDestruction,
+    pane_close_retry: paneCloseRetry,
+    preserved_state_root: resolveTeamDir(latestStatus.config.name, cwd)
   };
 }
+
+export async function runCodexFreeTeamLifecycleSmoke(
+  options: {
+    teamName?: string;
+    task?: string;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const teamName = sanitizeTeamName(
+    options.teamName ?? `codex-free-smoke-${Date.now().toString(36)}`
+  );
+  const task = options.task ?? "Codex-free team lifecycle smoke";
+
+  const started = await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task,
+      mode: "interactive"
+    },
+    cwd
+  );
+  const claimed = await claimTaskForWorker(teamName, "1", "worker-1", {}, cwd);
+  const reported = await reportWorkerStatus(
+    teamName,
+    "worker-1",
+    "working",
+    {
+      taskId: "1",
+      note: "codex-free smoke worker started"
+    },
+    cwd
+  );
+  const heartbeat = await heartbeatWorker(teamName, "worker-1", cwd);
+  const completed = await completeTaskForWorker(
+    teamName,
+    "1",
+    "worker-1",
+    "codex-free smoke completed one worker lane",
+    cwd
+  );
+  const acknowledgeAfterRequest = async (): Promise<Record<string, unknown>> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleepMs(5);
+      try {
+        return await acknowledgeShutdownRequest(
+          teamName,
+          "worker-1",
+          "accepted",
+          {
+            reason: "codex_free_smoke",
+            taskId: "1"
+          },
+          cwd
+        );
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("shutdown acknowledgement failed");
+  };
+  const [shutdown, acknowledgement] = await Promise.all([
+    shutdownTeamRuntime(teamName, { graceMs: 50 }, cwd),
+    acknowledgeAfterRequest()
+  ]);
+  const finalStatus = await readTeamStatus(teamName, cwd);
+
+  return {
+    team_name: teamName,
+    started,
+    claimed,
+    reported,
+    heartbeat,
+    completed,
+    shutdown,
+    acknowledgement,
+    final_phase: finalStatus?.phase.current_phase,
+    final_active: finalStatus?.config.active ?? null,
+    shutdown_ack_aggregate: finalStatus?.shutdown?.aggregate
+  };
+}
+
+type CleanupStaleReason = "all_workers_dead" | "no_healthy_workers" | "leader_orphaned";
+
+type PaneCloseRetryResult = Awaited<ReturnType<typeof processPaneCloseRetryQueue>>;
 
 export async function cleanupStaleTeamRuntimes(
   options: {
@@ -2744,6 +4108,8 @@ export async function cleanupStaleTeamRuntimes(
     deadAfterMs?: number;
     includeStale?: boolean;
     dryRun?: boolean;
+    retryPaneCloses?: boolean;
+    sweepTmux?: boolean;
   } = {},
   cwd = process.cwd()
 ): Promise<{
@@ -2752,29 +4118,103 @@ export async function cleanupStaleTeamRuntimes(
   active_team_count: number;
   cleaned: Array<{
     team_name: string;
-    reason: "all_workers_dead" | "no_healthy_workers";
+    reason: CleanupStaleReason;
     healthy_workers: number;
     stale_workers: number;
     dead_workers: number;
+    leader_health?: string;
     dry_run: boolean;
     shutdown?: Record<string, unknown>;
   }>;
+  tmux_sweep: {
+    retry_queues: Array<PaneCloseRetryResult & { team_name: string }>;
+    stale_panes: Array<{
+      team_name: string;
+      pane_count: number;
+      dry_run: boolean;
+      tmux_pane_destruction: TmuxPaneDestructionSummary;
+      pane_close_retry?: AgmoPaneCloseRetryState;
+    }>;
+  };
 }> {
   const checkedAt = nowIso();
   const teamNames = await listTeamNames(cwd);
   const cleaned: Array<{
     team_name: string;
-    reason: "all_workers_dead" | "no_healthy_workers";
+    reason: CleanupStaleReason;
     healthy_workers: number;
     stale_workers: number;
     dead_workers: number;
+    leader_health?: string;
     dry_run: boolean;
     shutdown?: Record<string, unknown>;
+  }> = [];
+  const retryQueueResults: Array<PaneCloseRetryResult & { team_name: string }> = [];
+  const stalePaneSweeps: Array<{
+    team_name: string;
+    pane_count: number;
+    dry_run: boolean;
+    tmux_pane_destruction: TmuxPaneDestructionSummary;
+    pane_close_retry?: AgmoPaneCloseRetryState;
   }> = [];
   let activeTeamCount = 0;
 
   for (const teamName of teamNames) {
     const status = await readTeamStatus(teamName, cwd);
+    if (!status) {
+      continue;
+    }
+
+    if (options.retryPaneCloses !== false) {
+      const retryResult = await processPaneCloseRetryQueue(
+        teamName,
+        { dryRun: options.dryRun },
+        cwd
+      );
+      if (retryResult.pending > 0 || retryResult.due.length > 0) {
+        retryQueueResults.push({
+          team_name: teamName,
+          ...retryResult
+        });
+      }
+    }
+
+    if (
+      options.sweepTmux &&
+      (!status.config.active || !status.phase.active) &&
+      status.config.transport === "tmux"
+    ) {
+      const candidates = collectTrackedTmuxPanes(status);
+      if (candidates.length > 0) {
+        const tmuxPaneDestruction = options.dryRun
+          ? emptyTmuxPaneDestructionSummary()
+          : destroyWorkerPanes(
+              candidates.map((entry) => entry.pane_id),
+              undefined,
+              {
+                expectedSessionId: status.config.tmux.session_id ?? null,
+                leaderPaneId: status.config.tmux.leader_pane_id,
+                currentPaneId: process.env.TMUX_PANE ?? null
+              }
+            );
+        const paneCloseRetry = options.dryRun
+          ? undefined
+          : await enqueuePaneCloseRetries(
+              teamName,
+              candidates,
+              tmuxPaneDestruction,
+              cwd
+            );
+        stalePaneSweeps.push({
+          team_name: teamName,
+          pane_count: candidates.length,
+          dry_run: options.dryRun ?? false,
+          tmux_pane_destruction: tmuxPaneDestruction,
+          ...(paneCloseRetry ? { pane_close_retry: paneCloseRetry } : {})
+        });
+      }
+    }
+
     if (!status || !status.config.active || !status.phase.active) {
       continue;
     }
@@ -2795,19 +4235,26 @@ export async function cleanupStaleTeamRuntimes(
 
     const deadOnly = snapshot.dead_workers === workerCount;
     const staleOnly = options.includeStale && snapshot.healthy_workers === 0;
-    if (!deadOnly && !staleOnly) {
+    const leaderOrphaned = isUnavailableTmuxPane(snapshot.leader);
+    if (!deadOnly && !staleOnly && !leaderOrphaned) {
       continue;
     }
 
+    const reason: CleanupStaleReason = leaderOrphaned
+      ? "leader_orphaned"
+      : deadOnly
+        ? "all_workers_dead"
+        : "no_healthy_workers";
     cleaned.push({
       team_name: teamName,
-      reason: deadOnly ? "all_workers_dead" : "no_healthy_workers",
+      reason,
       healthy_workers: snapshot.healthy_workers,
       stale_workers: snapshot.stale_workers,
       dead_workers: snapshot.dead_workers,
+      ...(snapshot.leader ? { leader_health: snapshot.leader.health } : {}),
       dry_run: options.dryRun ?? false,
       ...(!(options.dryRun ?? false)
-        ? { shutdown: await shutdownTeamRuntime(teamName, cwd) }
+        ? { shutdown: await shutdownTeamRuntime(teamName, { graceMs: 0 }, cwd) }
         : {})
     });
   }
@@ -2816,7 +4263,11 @@ export async function cleanupStaleTeamRuntimes(
     checked_at: checkedAt,
     team_count: teamNames.length,
     active_team_count: activeTeamCount,
-    cleaned
+    cleaned,
+    tmux_sweep: {
+      retry_queues: retryQueueResults,
+      stale_panes: stalePaneSweeps
+    }
   };
 }
 
@@ -3069,101 +4520,109 @@ export async function claimTaskForWorker(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
-  const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
-  assertWorkerOwnsTask(task, workerName);
-  const status = await readTeamStatus(normalizedTeamName, cwd);
-  if (!status) {
-    throw new Error(`team not found: ${normalizedTeamName}`);
-  }
-  const blockers = computeTaskDependencyBlockers(
-    task,
-    new Map(status.tasks.map((entry) => [entry.id, entry]))
-  );
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `claim task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      const blockers = computeTaskDependencyBlockers(
+        task,
+        new Map(status.tasks.map((entry) => [entry.id, entry]))
+      );
 
-  if (blockers.length > 0 && !options.ignoreDependencies) {
-    const blockedTask: AgmoTeamTaskRecord = {
-      ...task,
-      status: "blocked",
-      blocked_by_dependencies: blockers,
-      version: task.version + 1,
-      updated_at: nowIso()
-    };
-    await Promise.all([
-      writeTaskRecord(normalizedTeamName, blockedTask, cwd),
-      writeEvent(
-        normalizedTeamName,
-        {
-          timestamp: blockedTask.updated_at,
-          type: "task_claim_blocked",
-          team_name: normalizedTeamName,
-          worker_name: workerName,
-          task_id: taskId,
-          blocked_by_dependencies: blockers
+      if (blockers.length > 0 && !options.ignoreDependencies) {
+        const blockedTask: AgmoTeamTaskRecord = {
+          ...task,
+          status: "blocked",
+          blocked_by_dependencies: blockers,
+          version: task.version + 1,
+          updated_at: nowIso()
+        };
+        await Promise.all([
+          writeTaskRecord(normalizedTeamName, blockedTask, cwd),
+          writeEvent(
+            normalizedTeamName,
+            {
+              timestamp: blockedTask.updated_at,
+              type: "task_claim_blocked",
+              team_name: normalizedTeamName,
+              worker_name: workerName,
+              task_id: taskId,
+              blocked_by_dependencies: blockers
+            },
+            cwd
+          )
+        ]);
+        const blockerSummary = blockers
+          .map((entry) => `${entry.task_id}:${entry.status}`)
+          .join(", ");
+        throw new Error(
+          `task ${taskId} is blocked by unresolved dependencies: ${blockerSummary}`
+        );
+      }
+
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: workerName,
+        status: "in_progress",
+        blocked_by_dependencies: undefined,
+        claim: {
+          owner: workerName,
+          claimed_at: timestamp
         },
-        cwd
-      )
-    ]);
-    const blockerSummary = blockers
-      .map((entry) => `${entry.task_id}:${entry.status}`)
-      .join(", ");
-    throw new Error(
-      `task ${taskId} is blocked by unresolved dependencies: ${blockerSummary}`
-    );
-  }
-
-  const timestamp = nowIso();
-  const nextTask: AgmoTeamTaskRecord = {
-    ...task,
-    owner: workerName,
-    status: "in_progress",
-    blocked_by_dependencies: undefined,
-    claim: {
-      owner: workerName,
-      claimed_at: timestamp
-    },
-    error: undefined,
-    version: task.version + 1,
-    updated_at: timestamp
-  };
-
-  await Promise.all([
-    writeTaskRecord(normalizedTeamName, nextTask, cwd),
-    writeWorkerStatus(
-      normalizedTeamName,
-      workerName,
-      {
-        state: "working",
-        current_task_id: taskId,
+        error: undefined,
+        version: task.version + 1,
         updated_at: timestamp
-      },
-      cwd
-    ),
-    bumpWorkerHeartbeat(
-      normalizedTeamName,
-      workerName,
-      { pid: resolveReportedWorkerPid() },
-      cwd
-    ),
-    writeEvent(
-      normalizedTeamName,
-      {
-        timestamp,
-        type: "task_claimed",
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeWorkerStatus(
+          normalizedTeamName,
+          workerName,
+          {
+            state: "working",
+            current_task_id: taskId,
+            updated_at: timestamp
+          },
+          cwd
+        ),
+        bumpWorkerHeartbeat(
+          normalizedTeamName,
+          workerName,
+          { pid: resolveReportedWorkerPid() },
+          cwd
+        ),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_claimed",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId,
+            ignore_dependencies: options.ignoreDependencies ?? false
+          },
+          cwd
+        )
+      ]);
+
+      return {
         team_name: normalizedTeamName,
         worker_name: workerName,
-        task_id: taskId,
-        ignore_dependencies: options.ignoreDependencies ?? false
-      },
-      cwd
-    )
-  ]);
-
-  return {
-    team_name: normalizedTeamName,
-    worker_name: workerName,
-    ignored_dependencies: options.ignoreDependencies ?? false,
-    task: nextTask
-  };
+        ignored_dependencies: options.ignoreDependencies ?? false,
+        task: nextTask
+      };
+    },
+    cwd
+  );
 }
 
 export async function completeTaskForWorker(
@@ -3174,70 +4633,83 @@ export async function completeTaskForWorker(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
-  const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
-  assertWorkerOwnsTask(task, workerName);
+  const completed = await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `complete task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
 
-  const timestamp = nowIso();
-  const nextTask: AgmoTeamTaskRecord = {
-    ...task,
-    owner: workerName,
-    status: "completed",
-    claim_history: task.claim
-      ? [
-          ...(task.claim_history ?? []),
-          {
-            owner: task.claim.owner,
-            claimed_at: task.claim.claimed_at,
-            released_at: timestamp,
-            release_reason: "completed",
-            successor_owner: workerName
-          }
-        ]
-      : task.claim_history,
-    claim: undefined,
-    result,
-    error: undefined,
-    version: task.version + 1,
-    updated_at: timestamp
-  };
-
-  await Promise.all([
-    writeTaskRecord(normalizedTeamName, nextTask, cwd),
-    writeWorkerStatus(
-      normalizedTeamName,
-      workerName,
-      {
-        state: "done",
-        current_task_id: taskId,
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: workerName,
+        status: "completed",
+        claim_history: task.claim
+          ? [
+              ...(task.claim_history ?? []),
+              {
+                owner: task.claim.owner,
+                claimed_at: task.claim.claimed_at,
+                released_at: timestamp,
+                release_reason: "completed",
+                successor_owner: workerName
+              }
+            ]
+          : task.claim_history,
+        claim: undefined,
+        result,
+        error: undefined,
+        version: task.version + 1,
         updated_at: timestamp
-      },
-      cwd
-    ),
-    bumpWorkerHeartbeat(
-      normalizedTeamName,
-      workerName,
-      { pid: resolveReportedWorkerPid() },
-      cwd
-    ),
-    writeEvent(
-      normalizedTeamName,
-      {
-        timestamp,
-        type: "task_completed",
-        team_name: normalizedTeamName,
-        worker_name: workerName,
-        task_id: taskId
-      },
-      cwd
-    )
-  ]);
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeWorkerStatus(
+          normalizedTeamName,
+          workerName,
+          {
+            state: "done",
+            current_task_id: taskId,
+            updated_at: timestamp
+          },
+          cwd
+        ),
+        bumpWorkerHeartbeat(
+          normalizedTeamName,
+          workerName,
+          { pid: resolveReportedWorkerPid() },
+          cwd
+        ),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_completed",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId
+          },
+          cwd
+        )
+      ]);
+
+      return nextTask;
+    },
+    cwd
+  );
   const dependencyUpdates = await refreshTeamDependencyStates(normalizedTeamName, cwd);
+  const autoShutdown = await maybeShutdownCompletedTeamRuntime(normalizedTeamName, cwd);
 
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
-    task: nextTask,
-    dependency_updates: dependencyUpdates.updated
+    task: completed,
+    dependency_updates: dependencyUpdates.updated,
+    auto_shutdown: autoShutdown,
+    ...(autoShutdown.triggered ? { shutdown: autoShutdown.shutdown } : {})
   };
 }
 
@@ -3249,69 +4721,79 @@ export async function failTaskForWorker(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
-  const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
-  assertWorkerOwnsTask(task, workerName);
+  const failed = await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `fail task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
 
-  const timestamp = nowIso();
-  const nextTask: AgmoTeamTaskRecord = {
-    ...task,
-    owner: workerName,
-    status: "failed",
-    claim_history: task.claim
-      ? [
-          ...(task.claim_history ?? []),
-          {
-            owner: task.claim.owner,
-            claimed_at: task.claim.claimed_at,
-            released_at: timestamp,
-            release_reason: "failed",
-            successor_owner: workerName
-          }
-        ]
-      : task.claim_history,
-    claim: undefined,
-    error: error ?? "task failed",
-    version: task.version + 1,
-    updated_at: timestamp
-  };
-
-  await Promise.all([
-    writeTaskRecord(normalizedTeamName, nextTask, cwd),
-    writeWorkerStatus(
-      normalizedTeamName,
-      workerName,
-      {
-        state: "blocked",
-        current_task_id: taskId,
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: workerName,
+        status: "failed",
+        claim_history: task.claim
+          ? [
+              ...(task.claim_history ?? []),
+              {
+                owner: task.claim.owner,
+                claimed_at: task.claim.claimed_at,
+                released_at: timestamp,
+                release_reason: "failed",
+                successor_owner: workerName
+              }
+            ]
+          : task.claim_history,
+        claim: undefined,
+        error: error ?? "task failed",
+        version: task.version + 1,
         updated_at: timestamp
-      },
-      cwd
-    ),
-    bumpWorkerHeartbeat(
-      normalizedTeamName,
-      workerName,
-      { pid: resolveReportedWorkerPid() },
-      cwd
-    ),
-    writeEvent(
-      normalizedTeamName,
-      {
-        timestamp,
-        type: "task_failed",
-        team_name: normalizedTeamName,
-        worker_name: workerName,
-        task_id: taskId,
-        error: nextTask.error
-      },
-      cwd
-    )
-  ]);
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeWorkerStatus(
+          normalizedTeamName,
+          workerName,
+          {
+            state: "blocked",
+            current_task_id: taskId,
+            updated_at: timestamp
+          },
+          cwd
+        ),
+        bumpWorkerHeartbeat(
+          normalizedTeamName,
+          workerName,
+          { pid: resolveReportedWorkerPid() },
+          cwd
+        ),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_failed",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId,
+            error: nextTask.error
+          },
+          cwd
+        )
+      ]);
+
+      return nextTask;
+    },
+    cwd
+  );
   const dependencyUpdates = await refreshTeamDependencyStates(normalizedTeamName, cwd);
 
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
-    task: nextTask,
+    task: failed,
     dependency_updates: dependencyUpdates.updated
   };
 }
@@ -3330,6 +4812,7 @@ export async function heartbeatWorker(
       { pid: resolveReportedWorkerPid() },
       cwd
     ),
+    recordShutdownAckIfRequested(normalizedTeamName, workerName, {}, cwd),
     writeEvent(
       normalizedTeamName,
       {
@@ -3384,6 +4867,16 @@ export async function reportWorkerStatus(
       normalizedTeamName,
       workerName,
       { pid: resolveReportedWorkerPid() },
+      cwd
+    ),
+    recordShutdownAckIfRequested(
+      normalizedTeamName,
+      workerName,
+      {
+        status: state === "idle" || state === "done" ? "accepted" : "busy",
+        ...(options.note ? { reason: options.note } : {}),
+        ...(options.taskId ? { taskId: options.taskId } : {})
+      },
       cwd
     ),
     writeEvent(
@@ -3468,6 +4961,7 @@ export async function recordWorkerHookActivity(
     nextStatus
       ? writeWorkerStatus(normalizedTeamName, workerName, nextStatus, cwd)
       : Promise.resolve(),
+    recordShutdownAckIfRequested(normalizedTeamName, workerName, {}, cwd),
     writeEvent(
       normalizedTeamName,
       {
@@ -3587,6 +5081,39 @@ export async function monitorTeamRuntime(
     });
   }
 
+  const tmuxPanes = status.config.transport === "tmux" ? listTmuxPanes() : [];
+  const leader =
+    status.config.transport === "tmux"
+      ? buildTmuxPaneMonitor(
+          "leader",
+          status.config.tmux.leader_pane_id,
+          status.config.tmux.session_id ?? null,
+          tmuxPanes
+        )
+      : undefined;
+  const hud =
+    status.config.transport === "tmux" && status.config.tmux.hud_pane_id
+      ? buildTmuxPaneMonitor(
+          "hud",
+          status.config.tmux.hud_pane_id,
+          status.config.tmux.session_id ?? null,
+          tmuxPanes
+        )
+      : undefined;
+  const workerPanes =
+    status.config.transport === "tmux"
+      ? workers.map((worker) =>
+          buildTmuxPaneMonitor(
+            "worker",
+            worker.pane_id ?? status.config.tmux.worker_pane_ids[worker.worker_name],
+            status.config.tmux.session_id ?? null,
+            tmuxPanes,
+            worker.worker_name
+          )
+        )
+      : [];
+  const layoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes);
+
   const snapshot: AgmoTeamMonitorSnapshot = {
     team_name: normalizedTeamName,
     checked_at: checkedAt,
@@ -3596,7 +5123,12 @@ export async function monitorTeamRuntime(
     healthy_workers: workers.filter((worker) => worker.health === "healthy").length,
     stale_workers: workers.filter((worker) => worker.health === "stale").length,
     dead_workers: workers.filter((worker) => worker.health === "dead").length,
-    workers
+    workers,
+    ...(leader ? { leader } : {}),
+    ...(hud ? { hud } : {}),
+    ...(workerPanes.length > 0 ? { worker_panes: workerPanes } : {}),
+    layout_health: layoutHealth,
+    tmux_health: buildTmuxHealthSummary(status, leader, hud, workerPanes, layoutHealth)
   };
 
   await Promise.all([
@@ -3608,7 +5140,11 @@ export async function monitorTeamRuntime(
         type: "team_monitor_snapshot",
         team_name: normalizedTeamName,
         stale_workers: snapshot.stale_workers,
-        dead_workers: snapshot.dead_workers
+        dead_workers: snapshot.dead_workers,
+        leader_health: snapshot.leader?.health,
+        hud_health: snapshot.hud?.health,
+        layout_health: snapshot.layout_health,
+        tmux_health: snapshot.tmux_health
       },
       cwd
     )

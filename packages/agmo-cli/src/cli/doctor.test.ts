@@ -38,6 +38,24 @@ test("runDoctorCommand reports launch workspace cleanup guidance without legacy 
   }
 
   const output = JSON.parse(stdoutChunks.join(""));
+  assert.deepEqual(Object.keys(output).sort(), [
+    "agents_md",
+    "checks",
+    "command",
+    "launch_policy",
+    "launch_workspaces",
+    "paths",
+    "recommendations",
+    "scope",
+    "vault",
+  ]);
+  assert.equal(output.command, "doctor");
+  assert.equal(output.scope, "project");
+  assert.ok(output.checks && typeof output.checks === "object");
+  assert.ok(output.recommendations && typeof output.recommendations === "object");
+  assert.ok(output.paths && typeof output.paths === "object");
+  assert.ok(output.vault && typeof output.vault === "object");
+  assert.ok(output.launch_workspaces && typeof output.launch_workspaces === "object");
   assert.equal("legacy_runtime" in output, false);
   assert.equal("legacy_runtime" in output.recommendations, false);
   assert.ok(Array.isArray(output.recommendations.setup));

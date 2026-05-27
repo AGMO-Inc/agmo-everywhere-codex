@@ -13,6 +13,8 @@ export type AgmoWorkerStatus = {
 
 export type AgmoWorkerHealth = "healthy" | "stale" | "dead";
 
+export type AgmoTmuxPaneHealth = "live" | "missing" | "orphaned" | "unknown";
+
 export type AgmoWorkerMonitorSnapshot = {
   worker_name: string;
   role: string;
@@ -32,6 +34,17 @@ export type AgmoWorkerMonitorSnapshot = {
   reasons: string[];
 };
 
+export type AgmoTmuxPaneMonitorSnapshot = {
+  role: "leader" | "hud" | "worker";
+  worker_name?: string;
+  pane_id?: string | null;
+  session_id?: string | null;
+  health: AgmoTmuxPaneHealth;
+  reasons: string[];
+};
+
+export type AgmoTmuxLayoutHealth = "ok" | "degraded" | "repairable" | "unknown" | "skipped";
+
 export type AgmoTeamMonitorSnapshot = {
   team_name: string;
   checked_at: string;
@@ -42,4 +55,18 @@ export type AgmoTeamMonitorSnapshot = {
   stale_workers: number;
   dead_workers: number;
   workers: AgmoWorkerMonitorSnapshot[];
+  leader?: AgmoTmuxPaneMonitorSnapshot;
+  hud?: AgmoTmuxPaneMonitorSnapshot;
+  worker_panes?: AgmoTmuxPaneMonitorSnapshot[];
+  layout_health?: AgmoTmuxLayoutHealth;
+  tmux_health?: {
+    transport: "tmux" | "none";
+    leader: AgmoTmuxPaneHealth | "not_configured";
+    hud: AgmoTmuxPaneHealth | "not_configured";
+    workers: Record<string, AgmoTmuxPaneHealth | "not_configured">;
+    layout: AgmoTmuxLayoutHealth;
+    retry_pending: number;
+    retry_manual_required: number;
+    orphan_warnings: string[];
+  };
 };

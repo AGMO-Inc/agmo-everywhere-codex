@@ -31,6 +31,7 @@ export type AgmoTeamConfig = {
   tmux: {
     available: boolean;
     in_tmux_client: boolean;
+    session_id?: string | null;
     leader_pane_id: string | null;
     hud_pane_id?: string | null;
     hud_refresh_ms?: number | null;
@@ -97,6 +98,72 @@ export type AgmoTeamStatusSnapshot = {
   leader_escalations?: AgmoLeaderEscalationState | null;
   leader_nudges?: AgmoLeaderNudgeState | null;
   integrations?: AgmoTeamIntegrationState | null;
+  shutdown?: AgmoTeamShutdownState | null;
+  pane_close_retry?: AgmoPaneCloseRetryState | null;
+  hud_repair?: AgmoTeamHudRepairState | null;
+};
+
+export type AgmoTeamShutdownAck = {
+  worker_name: string;
+  pane_id?: string | null;
+  status?: "accepted" | "busy" | "rejected";
+  source?: "auto" | "explicit";
+  reason?: string;
+  task_id?: string;
+  acked_at: string;
+};
+
+export type AgmoTeamShutdownState = {
+  requested: boolean;
+  request_id: string;
+  requested_at: string;
+  grace_ms: number;
+  hard_kill_after_at: string;
+  message: string;
+  acknowledgements: AgmoTeamShutdownAck[];
+  aggregate?: {
+    accepted: number;
+    busy: number;
+    rejected: number;
+    total: number;
+  };
+};
+
+export type AgmoPaneCloseRetryEntry = {
+  pane_id: string;
+  team_name: string;
+  role: "worker" | "hud" | "unknown";
+  worker_name?: string;
+  session_id?: string | null;
+  leader_pane_id?: string | null;
+  status?: "pending" | "cleared" | "manual_required";
+  max_attempts?: number;
+  attempts: number;
+  first_seen_at: string;
+  last_attempt_at?: string;
+  next_attempt_at: string;
+  cleared_at?: string;
+  last_seen_live?: string;
+  last_error?: string;
+};
+
+export type AgmoPaneCloseRetryState = {
+  updated_at: string;
+  entries: AgmoPaneCloseRetryEntry[];
+};
+
+export type AgmoTeamHudRepairAttempt = {
+  attempted_at: string;
+  status: "repaired" | "unchanged" | "skipped" | "failed" | "debounced";
+  reason?: string;
+  previous_hud_pane_id?: string | null;
+  hud_pane_id?: string | null;
+};
+
+export type AgmoTeamHudRepairState = {
+  updated_at: string;
+  debounce_ms: number;
+  recent: AgmoTeamHudRepairAttempt[];
 };
 
 export function nowIso(): string {
@@ -317,6 +384,27 @@ export function resolveTeamIntegrationsPath(
   cwd = process.cwd()
 ): string {
   return join(resolveTeamDir(teamName, cwd), "integrations.json");
+}
+
+export function resolveTeamShutdownPath(
+  teamName: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "shutdown.json");
+}
+
+export function resolveTeamPaneCloseRetryPath(
+  teamName: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "pane-close-retry.json");
+}
+
+export function resolveTeamHudRepairPath(
+  teamName: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "hud-repair.json");
 }
 
 export function resolveTeamIntegrationAssistPath(
