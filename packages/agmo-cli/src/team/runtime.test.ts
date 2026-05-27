@@ -4,11 +4,18 @@ import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  acknowledgeShutdownRequest,
   claimTaskForWorker,
   cleanupStaleTeamRuntimes,
   completeTaskForWorker,
+  heartbeatWorker,
   monitorTeamRuntime,
   readTeamStatus,
+  readTeamTmuxHealthSummary,
+  recordWorkerHookActivity,
+  repairTeamHudPane,
+  reportWorkerStatus,
+  runCodexFreeTeamLifecycleSmoke,
   shutdownTeamRuntime,
   shouldSpawnTeamTmuxPanes,
   startTeamRuntime
@@ -16,6 +23,7 @@ import {
 import {
   resolveTeamConfigPath,
   resolveTeamDispatchPath,
+  resolveTeamHudRepairPath,
   resolveTeamPaneCloseRetryPath,
   resolveTeamTaskPath,
   resolveWorkerHeartbeatPath,
@@ -299,13 +307,80 @@ test("shutdownTeamRuntime records pane-close retries when guarded tmux panes rem
 
   const retryState = JSON.parse(
     await readFile(resolveTeamPaneCloseRetryPath(teamName, tempRoot), "utf8")
-  ) as { entries: Array<{ pane_id: string; attempts: number; last_error?: string }> };
+  ) as {
+    entries: Array<{
+      pane_id: string;
+      attempts: number;
+      status?: string;
+      cleared_at?: string;
+      last_error?: string;
+    }>;
+  };
   assert.deepEqual(
     retryState.entries.map((entry) => entry.pane_id).sort(),
     ["%998", "%999"]
   );
   assert.equal(retryState.entries[0]?.attempts, 1);
+  assert.equal(retryState.entries[0]?.status, "cleared");
+  assert.ok(retryState.entries[0]?.cleared_at);
   assert.match(retryState.entries[0]?.last_error ?? "", /not found/);
+});
+
+test("cleanupStaleTeamRuntimes moves exhausted protected pane retries to manual_required", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-pane-manual-"));
+  const teamName = "pane-manual-team";
+  const timestamp = "2026-04-23T12:00:00.000Z";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Mark protected retry manual",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  await writeFile(
+    resolveTeamPaneCloseRetryPath(teamName, tempRoot),
+    `${JSON.stringify(
+      {
+        updated_at: timestamp,
+        entries: [
+          {
+            pane_id: "%protected",
+            team_name: teamName,
+            role: "worker",
+            worker_name: "worker-1",
+            session_id: null,
+            leader_pane_id: "%protected",
+            status: "pending",
+            max_attempts: 3,
+            attempts: 2,
+            first_seen_at: timestamp,
+            next_attempt_at: timestamp
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const cleanup = await cleanupStaleTeamRuntimes(
+    {
+      retryPaneCloses: true
+    },
+    tempRoot
+  );
+  assert.equal(cleanup.tmux_sweep.retry_queues[0]?.pending, 0);
+
+  const retryState = JSON.parse(
+    await readFile(resolveTeamPaneCloseRetryPath(teamName, tempRoot), "utf8")
+  ) as { entries: Array<{ status?: string; attempts: number; last_error?: string }> };
+  assert.equal(retryState.entries[0]?.status, "manual_required");
+  assert.equal(retryState.entries[0]?.attempts, 3);
+  assert.match(retryState.entries[0]?.last_error ?? "", /protected/);
 });
 
 test("completeTaskForWorker keeps the team active while other tasks remain incomplete", async () => {
@@ -688,4 +763,291 @@ test("monitor and cleanup detect orphaned leader tmux panes", async () => {
   assert.equal(cleanup.cleaned[0]?.team_name, teamName);
   assert.equal(cleanup.cleaned[0]?.reason, "leader_orphaned");
   assert.equal(cleanup.cleaned[0]?.leader_health, "missing");
+});
+
+test("readTeamTmuxHealthSummary reports orphan and retry counts for status surfaces", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-tmux-health-"));
+  const teamName = "tmux-health-team";
+  const timestamp = "2026-04-23T12:00:00.000Z";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Summarize tmux health",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  const configPath = resolveTeamConfigPath(teamName, tempRoot);
+  const config = JSON.parse(await readFile(configPath, "utf8")) as {
+    transport: string;
+    tmux: {
+      session_id?: string | null;
+      leader_pane_id: string | null;
+      hud_pane_id?: string | null;
+      worker_pane_ids: Record<string, string>;
+    };
+  };
+  config.transport = "tmux";
+  config.tmux.session_id = "$missing-session";
+  config.tmux.leader_pane_id = "%997";
+  config.tmux.hud_pane_id = "%998";
+  config.tmux.worker_pane_ids = {};
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  await writeFile(
+    resolveTeamPaneCloseRetryPath(teamName, tempRoot),
+    `${JSON.stringify(
+      {
+        updated_at: timestamp,
+        entries: [
+          {
+            pane_id: "%998",
+            team_name: teamName,
+            role: "hud",
+            status: "pending",
+            attempts: 1,
+            first_seen_at: timestamp,
+            next_attempt_at: timestamp
+          },
+          {
+            pane_id: "%999",
+            team_name: teamName,
+            role: "worker",
+            status: "manual_required",
+            attempts: 3,
+            first_seen_at: timestamp,
+            next_attempt_at: timestamp
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const summary = await readTeamTmuxHealthSummary(teamName, tempRoot);
+  assert.ok(summary);
+  assert.equal(summary.transport, "tmux");
+  assert.equal(summary.leader, "missing");
+  assert.equal(summary.hud, "missing");
+  assert.equal(summary.retry_pending, 1);
+  assert.equal(summary.retry_manual_required, 1);
+  assert.deepEqual(summary.orphan_warnings.sort(), [
+    "hud:missing",
+    "leader:missing",
+    "worker:%999:manual_required"
+  ]);
+});
+
+test("repairTeamHudPane debounces repeated repair attempts", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-hud-debounce-"));
+  const teamName = "hud-debounce-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Debounce HUD repair",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  const configPath = resolveTeamConfigPath(teamName, tempRoot);
+  const config = JSON.parse(await readFile(configPath, "utf8")) as {
+    transport: string;
+    tmux: {
+      session_id?: string | null;
+      leader_pane_id: string | null;
+      hud_pane_id?: string | null;
+      hud_refresh_ms?: number | null;
+      worker_pane_ids: Record<string, string>;
+    };
+  };
+  config.transport = "tmux";
+  config.tmux.session_id = "$missing-session";
+  config.tmux.leader_pane_id = "%997";
+  config.tmux.hud_pane_id = "%998";
+  config.tmux.hud_refresh_ms = 1000;
+  config.tmux.worker_pane_ids = {};
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+  const first = await repairTeamHudPane(teamName, { debounceMs: 60_000 }, tempRoot);
+  assert.equal(first.status, "failed");
+  assert.equal(first.reason, "leader_pane_unavailable");
+
+  const second = await repairTeamHudPane(teamName, { debounceMs: 60_000 }, tempRoot);
+  assert.equal(second.status, "debounced");
+  assert.equal(second.reason, "repair_debounce");
+
+  const repairState = JSON.parse(
+    await readFile(resolveTeamHudRepairPath(teamName, tempRoot), "utf8")
+  ) as { recent: Array<{ status: string }> };
+  assert.deepEqual(
+    repairState.recent.map((entry) => entry.status),
+    ["failed", "debounced"]
+  );
+});
+
+test("shutdown acknowledgement protocol records accepted, busy, and rejected states", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-shutdown-acks-"));
+  const teamName = "shutdown-acks-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 3,
+      task: "Acknowledge shutdown states",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  const acknowledgeWhenReady = async (
+    workerName: string,
+    status: "accepted" | "busy" | "rejected",
+    options: { reason?: string; taskId?: string } = {}
+  ): Promise<Record<string, unknown>> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        return await acknowledgeShutdownRequest(
+          teamName,
+          workerName,
+          status,
+          options,
+          tempRoot
+        );
+      } catch (error) {
+        lastError = error;
+        if (
+          !(error instanceof Error) ||
+          !/shutdown not requested/i.test(error.message)
+        ) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("shutdown acknowledgement did not become ready");
+  };
+  const shutdownPromise = shutdownTeamRuntime(teamName, { graceMs: 100 }, tempRoot);
+  await acknowledgeWhenReady("worker-1", "accepted");
+  await acknowledgeWhenReady("worker-2", "busy", {
+    reason: "finishing task",
+    taskId: "2"
+  });
+  await acknowledgeWhenReady("worker-3", "rejected", {
+    reason: "manual hold"
+  });
+  const shutdown = await shutdownPromise;
+  assert.deepEqual(shutdown.shutdown_ack_aggregate, {
+    accepted: 1,
+    busy: 1,
+    rejected: 1,
+    total: 3
+  });
+
+  const status = await readTeamStatus(teamName, tempRoot);
+  assert.deepEqual(status?.shutdown?.aggregate, {
+    accepted: 1,
+    busy: 1,
+    rejected: 1,
+    total: 3
+  });
+  assert.deepEqual(
+    status?.shutdown?.acknowledgements.map((ack) => ack.source),
+    ["explicit", "explicit", "explicit"]
+  );
+});
+
+test("automatic shutdown acknowledgements preserve explicit worker decisions", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-shutdown-ack-preserve-"));
+  const acknowledgeWhenReady = async (
+    teamName: string,
+    status: "accepted" | "busy" | "rejected"
+  ): Promise<void> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        await acknowledgeShutdownRequest(
+          teamName,
+          "worker-1",
+          status,
+          { reason: `manual ${status}` },
+          tempRoot
+        );
+        return;
+      } catch (error) {
+        lastError = error;
+        if (
+          !(error instanceof Error) ||
+          !/shutdown not requested/i.test(error.message)
+        ) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("shutdown acknowledgement did not become ready");
+  };
+
+  for (const ackStatus of ["accepted", "busy", "rejected"] as const) {
+    const teamName = `shutdown-ack-preserve-${ackStatus}`;
+    await startTeamRuntime(
+      {
+        teamName,
+        workerCount: 1,
+        task: "Preserve explicit shutdown ack",
+        mode: "interactive"
+      },
+      tempRoot
+    );
+
+    const shutdownPromise = shutdownTeamRuntime(teamName, { graceMs: 100 }, tempRoot);
+    await acknowledgeWhenReady(teamName, ackStatus);
+    await heartbeatWorker(teamName, "worker-1", tempRoot);
+    await reportWorkerStatus(teamName, "worker-1", "working", { note: "still running" }, tempRoot);
+    await recordWorkerHookActivity(teamName, "worker-1", "PreToolUse", tempRoot);
+    await shutdownPromise;
+
+    const status = await readTeamStatus(teamName, tempRoot);
+    const acknowledgement = status?.shutdown?.acknowledgements.find(
+      (ack) => ack.worker_name === "worker-1"
+    );
+    assert.equal(acknowledgement?.status, ackStatus);
+    assert.equal(acknowledgement?.source, "explicit");
+    assert.equal(acknowledgement?.reason, `manual ${ackStatus}`);
+    assert.deepEqual(status?.shutdown?.aggregate, {
+      accepted: ackStatus === "accepted" ? 1 : 0,
+      busy: ackStatus === "busy" ? 1 : 0,
+      rejected: ackStatus === "rejected" ? 1 : 0,
+      total: 1
+    });
+  }
+});
+
+test("runCodexFreeTeamLifecycleSmoke exercises lifecycle without Codex worker process", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-codex-free-smoke-"));
+  const result = await runCodexFreeTeamLifecycleSmoke(
+    {
+      teamName: "codex-free-smoke-test",
+      task: "Run codex-free smoke"
+    },
+    tempRoot
+  );
+
+  assert.equal(result.team_name, "codex-free-smoke-test");
+  assert.equal(result.final_phase, "shutdown");
+  assert.equal(result.final_active, false);
+  assert.deepEqual(result.shutdown_ack_aggregate, {
+    accepted: 1,
+    busy: 0,
+    rejected: 0,
+    total: 1
+  });
 });

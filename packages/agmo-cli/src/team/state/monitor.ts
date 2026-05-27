@@ -54,4 +54,12 @@ export type AgmoTeamMonitorSnapshot = {
   workers: AgmoWorkerMonitorSnapshot[];
   leader?: AgmoTmuxPaneMonitorSnapshot;
   hud?: AgmoTmuxPaneMonitorSnapshot;
+  tmux_health?: {
+    transport: "tmux" | "none";
+    leader: AgmoTmuxPaneHealth | "not_configured";
+    hud: AgmoTmuxPaneHealth | "not_configured";
+    retry_pending: number;
+    retry_manual_required: number;
+    orphan_warnings: string[];
+  };
 };

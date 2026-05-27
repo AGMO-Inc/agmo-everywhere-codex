@@ -100,11 +100,16 @@ export type AgmoTeamStatusSnapshot = {
   integrations?: AgmoTeamIntegrationState | null;
   shutdown?: AgmoTeamShutdownState | null;
   pane_close_retry?: AgmoPaneCloseRetryState | null;
+  hud_repair?: AgmoTeamHudRepairState | null;
 };
 
 export type AgmoTeamShutdownAck = {
   worker_name: string;
   pane_id?: string | null;
+  status?: "accepted" | "busy" | "rejected";
+  source?: "auto" | "explicit";
+  reason?: string;
+  task_id?: string;
   acked_at: string;
 };
 
@@ -116,6 +121,12 @@ export type AgmoTeamShutdownState = {
   hard_kill_after_at: string;
   message: string;
   acknowledgements: AgmoTeamShutdownAck[];
+  aggregate?: {
+    accepted: number;
+    busy: number;
+    rejected: number;
+    total: number;
+  };
 };
 
 export type AgmoPaneCloseRetryEntry = {
@@ -125,16 +136,34 @@ export type AgmoPaneCloseRetryEntry = {
   worker_name?: string;
   session_id?: string | null;
   leader_pane_id?: string | null;
+  status?: "pending" | "cleared" | "manual_required";
+  max_attempts?: number;
   attempts: number;
   first_seen_at: string;
   last_attempt_at?: string;
   next_attempt_at: string;
+  cleared_at?: string;
+  last_seen_live?: string;
   last_error?: string;
 };
 
 export type AgmoPaneCloseRetryState = {
   updated_at: string;
   entries: AgmoPaneCloseRetryEntry[];
+};
+
+export type AgmoTeamHudRepairAttempt = {
+  attempted_at: string;
+  status: "repaired" | "unchanged" | "skipped" | "failed" | "debounced";
+  reason?: string;
+  previous_hud_pane_id?: string | null;
+  hud_pane_id?: string | null;
+};
+
+export type AgmoTeamHudRepairState = {
+  updated_at: string;
+  debounce_ms: number;
+  recent: AgmoTeamHudRepairAttempt[];
 };
 
 export function nowIso(): string {
@@ -369,6 +398,13 @@ export function resolveTeamPaneCloseRetryPath(
   cwd = process.cwd()
 ): string {
   return join(resolveTeamDir(teamName, cwd), "pane-close-retry.json");
+}
+
+export function resolveTeamHudRepairPath(
+  teamName: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "hud-repair.json");
 }
 
 export function resolveTeamIntegrationAssistPath(

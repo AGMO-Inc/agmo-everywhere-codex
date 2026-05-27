@@ -1,5 +1,6 @@
 import {
   buildLeaderHudView,
+  acknowledgeShutdownRequest,
   autoNudgeTeamRuntime,
   acknowledgeDispatchRequest,
   buildLeaderMonitorView,
@@ -18,6 +19,7 @@ import {
   resolveMonitorPolicy,
   reclaimTeamClaims,
   readTeamStatus,
+  readTeamTmuxHealthSummary,
   readTeamIntegrationAssist,
   reportWorkerStatus,
   retryDispatchRequests,
@@ -211,18 +213,43 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("team name is required");
       }
       const status = await readTeamStatus(teamName, cwd);
+      const tmuxHealth = status ? await readTeamTmuxHealthSummary(teamName, cwd) : null;
       console.log(
         JSON.stringify(
           {
             command: "team status",
             team_name: teamName,
             found: Boolean(status),
+            tmux_health: tmuxHealth,
             status
           },
           null,
           2
         )
       );
+      return;
+    }
+    case "shutdown-ack": {
+      const [teamName, workerName, ackStatus] = args.slice(1, 4);
+      if (!teamName || !workerName || !ackStatus) {
+        throw new Error(
+          "usage: agmo team shutdown-ack <team> <worker> <accepted|busy|rejected> [--reason <text>] [--task <id>]"
+        );
+      }
+      if (!["accepted", "busy", "rejected"].includes(ackStatus)) {
+        throw new Error("shutdown ack status must be one of: accepted, busy, rejected");
+      }
+      const result = await acknowledgeShutdownRequest(
+        teamName,
+        workerName,
+        ackStatus as "accepted" | "busy" | "rejected",
+        {
+          reason: parseOption(args.slice(4), "--reason"),
+          taskId: parseOption(args.slice(4), "--task")
+        },
+        cwd
+      );
+      console.log(JSON.stringify({ command: "team shutdown-ack", ...result }, null, 2));
       return;
     }
     case "shutdown": {
@@ -967,6 +994,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
+  agmo team shutdown-ack <team> <worker> <accepted|busy|rejected> [--reason <text>] [--task <id>]
   agmo team cleanup-stale [--stale-ms <ms>] [--dead-ms <ms>] [--include-stale|--no-include-stale] [--dry-run|--no-dry-run] [--retry-pane-closes|--no-retry-pane-closes] [--sweep-tmux|--no-sweep-tmux]
   agmo team send <team> <worker> "<message>"
   agmo team claim <team> <task-id> <worker> [--ignore-dependencies]
