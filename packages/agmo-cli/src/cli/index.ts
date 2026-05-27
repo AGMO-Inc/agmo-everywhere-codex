@@ -114,7 +114,10 @@ Usage:
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--auto-nudge] [--auto-reclaim] [--escalate-leader] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--email|--no-email] [--email-to <a,b>]
-  agmo team hud <team> [--watch] [--refresh-ms <ms>] [--repair]
+  agmo team hud <team> [--watch] [--refresh-ms <ms>] [--repair] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--color|--no-color]
+  agmo team layout status <team>
+  agmo team layout repair <team> [--dry-run] [--force]
+  agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]
   agmo team dispatch-ack <team> <request-id>
   agmo team dispatch-retry <team> [worker]
   agmo team reclaim <team> [--reassign]

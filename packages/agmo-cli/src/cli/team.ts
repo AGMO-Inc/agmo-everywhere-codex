@@ -14,8 +14,11 @@ import {
   failTaskForWorker,
   heartbeatWorker,
   integrateTeamChanges,
+  readTeamLayoutStatus,
   monitorTeamRuntime,
+  rebalanceTeamLayout,
   repairTeamHudPane,
+  repairTeamLayout,
   resolveMonitorPolicy,
   reclaimTeamClaims,
   readTeamStatus,
@@ -71,6 +74,31 @@ function parseBooleanFlag(
   }
   if (disabled) {
     return false;
+  }
+  return undefined;
+}
+
+function parseHudPreset(value: string | undefined): "minimal" | "focused" | "full" | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (value === "minimal" || value === "focused" || value === "full") {
+    return value;
+  }
+  throw new Error("--preset must be one of: minimal, focused, full");
+}
+
+function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined {
+  const color = args.includes("--color");
+  const noColor = args.includes("--no-color");
+  if (color && noColor) {
+    throw new Error("cannot use both --color and --no-color");
+  }
+  if (color) {
+    return "always";
+  }
+  if (noColor) {
+    return "never";
   }
   return undefined;
 }
@@ -745,13 +773,17 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear]"
+          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--color|--no-color]"
         );
       }
       const staleRaw = parseOption(args.slice(2), "--stale-ms");
       const deadRaw = parseOption(args.slice(2), "--dead-ms");
       const refreshMs = parseIntegerOption(args.slice(2), "--refresh-ms");
       const iterations = parseIntegerOption(args.slice(2), "--iterations");
+      const width = parseIntegerOption(args.slice(2), "--width");
+      const maxLines = parseIntegerOption(args.slice(2), "--max-lines");
+      const preset = parseHudPreset(parseOption(args.slice(2), "--preset"));
+      const color = parseColorMode(args.slice(2));
       const clearScreen = parseBooleanFlag(args.slice(2), "--clear", "--no-clear") ?? true;
       const watch = args.slice(2).includes("--watch");
       const repair = args.slice(2).includes("--repair");
@@ -769,18 +801,35 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       if (iterations !== undefined && iterations < 1) {
         throw new Error("--iterations must be at least 1");
       }
+      if (width !== undefined && width < 20) {
+        throw new Error("--width must be at least 20");
+      }
+      if (maxLines !== undefined && maxLines < 1) {
+        throw new Error("--max-lines must be at least 1");
+      }
+      let previousText: string | null = null;
+      let previousHeight = 0;
       const runHudOnce = async (): Promise<void> => {
         if (repair) {
           await repairTeamHudPane(teamName, cwd);
         }
         const hud = await buildLeaderHudView(
           teamName,
-          { staleAfterMs, deadAfterMs },
+          { staleAfterMs, deadAfterMs, preset, width, maxLines, color },
           cwd
         );
-        if (watch && clearScreen) {
-          process.stdout.write("\u001bc");
+        if (watch && clearScreen && hud.text === previousText) {
+          return;
         }
+        if (watch && clearScreen) {
+          const nextHeight = hud.text.split("\n").length;
+          process.stdout.write("\x1b[H\x1b[2J");
+          if (previousHeight > nextHeight) {
+            process.stdout.write("\x1b[J");
+          }
+          previousHeight = nextHeight;
+        }
+        previousText = hud.text;
         process.stdout.write(`${hud.text}\n`);
       };
       if (watch) {
@@ -796,6 +845,57 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         await runHudOnce();
       }
       return;
+    }
+    case "layout": {
+      const layoutCommand = args[1];
+      if (layoutCommand === "status") {
+        const teamName = args[2];
+        if (!teamName) {
+          throw new Error("usage: agmo team layout status <team>");
+        }
+        const result = await readTeamLayoutStatus(teamName, cwd);
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (layoutCommand === "repair") {
+        const teamName = args[2];
+        if (!teamName) {
+          throw new Error("usage: agmo team layout repair <team> [--dry-run] [--force]");
+        }
+        const result = await repairTeamLayout(
+          teamName,
+          {
+            dryRun: args.slice(3).includes("--dry-run"),
+            force: args.slice(3).includes("--force")
+          },
+          cwd
+        );
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (layoutCommand === "rebalance") {
+        const teamName = args[2];
+        if (!teamName) {
+          throw new Error("usage: agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]");
+        }
+        const layout = parseOption(args.slice(3), "--layout") ?? "auto";
+        if (layout !== "auto" && layout !== "main-vertical" && layout !== "tiled") {
+          throw new Error("--layout must be one of: auto, main-vertical, tiled");
+        }
+        const result = await rebalanceTeamLayout(
+          teamName,
+          {
+            dryRun: args.slice(3).includes("--dry-run"),
+            layout
+          },
+          cwd
+        );
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      throw new Error(
+        "usage: agmo team layout status <team> | agmo team layout repair <team> [--dry-run] [--force] | agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]"
+      );
     }
     case "dispatch-ack": {
       const [teamName, requestId] = args.slice(1);
@@ -1005,7 +1105,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--slack-username <name>] [--slack-icon-emoji <emoji>] [--email|--no-email] [--email-to <a,b>] [--email-from <addr>] [--email-sendmail-path <path>] [--email-subject-prefix <prefix>]
-  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear]
+  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--color|--no-color]
+  agmo team layout status <team>
+  agmo team layout repair <team> [--dry-run] [--force]
+  agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]
   agmo team dispatch-ack <team> <request-id>
   agmo team dispatch-retry <team> [worker]
   agmo team reclaim <team> [--worker <name>] [--task <id>] [--stale-ms <ms>] [--dead-ms <ms>] [--lease-ms <ms>] [--reassign] [--include-stale]

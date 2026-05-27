@@ -8,7 +8,6 @@ import {
   cleanupStaleTeamRuntimes,
   readTeamStatus,
   readTeamTmuxHealthSummary,
-  repairTeamHudPane,
   shutdownTeamRuntime,
   startTeamRuntime
 } from "./runtime.js";
@@ -16,12 +15,23 @@ import {
   resolveTeamConfigPath,
   resolveWorkerIdentityPath
 } from "./state/index.js";
+import { agmoCliDistEntryPath } from "../utils/paths.js";
 
 function tmux(args: string[]): string {
   return execFileSync("tmux", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   }).trim();
+}
+
+function agmoCliJson(args: string[], cwd: string): unknown {
+  return JSON.parse(
+    execFileSync(process.execPath, [agmoCliDistEntryPath(), ...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    })
+  ) as unknown;
 }
 
 function canUseTmux(): { ok: true } | { ok: false; reason: string } {
@@ -138,14 +148,70 @@ test("optional tmux lifecycle smoke preserves leader and repairs HUD", async (t)
     const beforeRepair = await readTeamTmuxHealthSummary(teamName, tempRoot);
     assert.equal(beforeRepair?.leader, "live");
     assert.equal(beforeRepair?.hud, "missing");
+    assert.equal(beforeRepair?.workers["worker-1"], "live");
 
-    const repair = await repairTeamHudPane(teamName, { force: true }, tempRoot);
-    assert.equal(repair.status, "repaired");
-    assert.ok(repair.hud_pane_id);
+    const layoutStatus = agmoCliJson(["team", "layout", "status", teamName], tempRoot) as {
+      layout_health: string;
+      panes: {
+        leader: { health: string };
+        hud: { health: string };
+        workers: Record<string, { health: string }>;
+      };
+    };
+    assert.equal(layoutStatus.layout_health, "repairable");
+    assert.equal(layoutStatus.panes.leader.health, "live");
+    assert.equal(layoutStatus.panes.hud.health, "missing");
+    assert.equal(layoutStatus.panes.workers["worker-1"]?.health, "live");
+
+    const repairDryRun = agmoCliJson(["team", "layout", "repair", teamName, "--dry-run"], tempRoot) as {
+      dry_run: boolean;
+      status: string;
+      planned: Array<{ kind: string }>;
+      performed: Array<{ kind: string }>;
+    };
+    assert.equal(repairDryRun.dry_run, true);
+    assert.equal(repairDryRun.status, "skipped");
+    assert.ok(repairDryRun.planned.some((entry) => entry.kind === "repair-hud"));
+    assert.equal(repairDryRun.performed.length, 0);
+
+    const layoutRepair = agmoCliJson(["team", "layout", "repair", teamName, "--force"], tempRoot) as {
+      status: string;
+      performed: Array<{ kind: string; target: string }>;
+    };
+    assert.equal(layoutRepair.status, "completed");
+    const repairedHud = layoutRepair.performed.find((entry) => entry.kind === "repair-hud");
+    assert.ok(repairedHud?.target);
 
     const afterRepair = await readTeamTmuxHealthSummary(teamName, tempRoot);
     assert.equal(afterRepair?.leader, "live");
     assert.equal(afterRepair?.hud, "live");
+    assert.equal(afterRepair?.layout, "ok");
+
+    const rebalanceDryRun = agmoCliJson(
+      ["team", "layout", "rebalance", teamName, "--layout", "auto", "--dry-run"],
+      tempRoot
+    ) as {
+      dry_run: boolean;
+      status: string;
+      planned: Array<{ kind: string }>;
+      performed: Array<{ kind: string }>;
+    };
+    assert.equal(rebalanceDryRun.dry_run, true);
+    assert.equal(rebalanceDryRun.status, "skipped");
+    assert.ok(rebalanceDryRun.planned.some((entry) => entry.kind === "select-layout"));
+    assert.equal(rebalanceDryRun.performed.length, 0);
+
+    const rebalance = agmoCliJson(
+      ["team", "layout", "rebalance", teamName, "--layout", "main-vertical"],
+      tempRoot
+    ) as {
+      status: string;
+      performed: Array<{ kind: string }>;
+      failed: Array<{ kind: string }>;
+    };
+    assert.equal(rebalance.status, "completed");
+    assert.ok(rebalance.performed.some((entry) => entry.kind === "select-layout"));
+    assert.equal(rebalance.failed.length, 0);
 
     const shutdown = await shutdownTeamRuntime(teamName, { graceMs: 0 }, tempRoot);
     assert.equal((shutdown.tmux_pane_destruction as { killed: number }).killed, 2);
@@ -156,7 +222,7 @@ test("optional tmux lifecycle smoke preserves leader and repairs HUD", async (t)
       .filter(Boolean);
     assert.ok(remainingPanes.includes(leaderPaneId));
     assert.ok(!remainingPanes.includes(workerPaneId));
-    assert.ok(!remainingPanes.includes(repair.hud_pane_id ?? ""));
+    assert.ok(!remainingPanes.includes(repairedHud.target));
 
     const cleanup = await cleanupStaleTeamRuntimes(
       {

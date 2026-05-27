@@ -10,6 +10,13 @@ async function captureTeamCommand(
   args: string[],
   cwd: string,
 ): Promise<Record<string, unknown>> {
+  return JSON.parse(await captureTeamCommandText(args, cwd)) as Record<string, unknown>;
+}
+
+async function captureTeamCommandText(
+  args: string[],
+  cwd: string,
+): Promise<string> {
   const originalCwd = process.cwd();
   const originalProjectRoot = process.env.AGMO_PROJECT_ROOT;
   const originalWrite = process.stdout.write.bind(process.stdout);
@@ -36,7 +43,7 @@ async function captureTeamCommand(
     }
   }
 
-  return JSON.parse(stdoutChunks.join("")) as Record<string, unknown>;
+  return stdoutChunks.join("");
 }
 
 test("runTeamCommand status prints current ad hoc JSON shape for an existing team", async () => {
@@ -135,4 +142,89 @@ test("runTeamCommand shutdown-ack prints current ad hoc JSON shape after shutdow
     rejected: 0,
     total: 1,
   });
+});
+
+test("runTeamCommand hud supports preset width max-lines and no-color flags", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-flags-"));
+  const teamName = "cli-hud-flags-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Render HUD with CLI flags",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommandText(
+    [
+      "hud",
+      teamName,
+      "--preset",
+      "minimal",
+      "--width",
+      "40",
+      "--max-lines",
+      "3",
+      "--no-color",
+    ],
+    tempRoot,
+  );
+
+  assert.match(output, /AGMO HUD/);
+  assert.doesNotMatch(output, /\x1b\[/);
+  assert.ok(!output.includes("Workers"));
+  for (const line of output.trimEnd().split("\n")) {
+    assert.ok(line.length <= 40, line);
+  }
+});
+
+test("runTeamCommand layout commands print stable JSON contracts for non-tmux teams", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-layout-"));
+  const teamName = "cli-layout-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Characterize team layout JSON",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const status = await captureTeamCommand(["layout", "status", teamName], tempRoot);
+  assert.equal(status.command, "team layout status");
+  assert.equal(status.team_name, teamName);
+  assert.equal(status.transport, "none");
+  assert.equal(status.dry_run, false);
+  assert.equal(status.layout_health, "skipped");
+  assert.ok(status.panes && typeof status.panes === "object");
+  assert.deepEqual(status.recommended_actions, []);
+
+  const repair = await captureTeamCommand(
+    ["layout", "repair", teamName, "--dry-run"],
+    tempRoot,
+  );
+  assert.equal(repair.command, "team layout repair");
+  assert.equal(repair.team_name, teamName);
+  assert.equal(repair.dry_run, true);
+  assert.equal(repair.status, "skipped");
+  assert.deepEqual(repair.performed, []);
+  assert.deepEqual(repair.failed, []);
+  assert.deepEqual(repair.refused, []);
+
+  const rebalance = await captureTeamCommand(
+    ["layout", "rebalance", teamName, "--layout", "auto", "--dry-run"],
+    tempRoot,
+  );
+  assert.equal(rebalance.command, "team layout rebalance");
+  assert.equal(rebalance.team_name, teamName);
+  assert.equal(rebalance.dry_run, true);
+  assert.equal(rebalance.status, "skipped");
+  assert.deepEqual(rebalance.performed, []);
+  assert.deepEqual(rebalance.failed, []);
+  assert.deepEqual(rebalance.refused, []);
 });

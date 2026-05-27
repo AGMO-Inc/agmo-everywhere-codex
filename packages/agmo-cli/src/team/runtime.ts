@@ -11,14 +11,26 @@ import {
 import {
   createTeamSession,
   createHudPane,
+  applyTeamLayout,
+  computeCurrentTeamLayoutPlan,
   describeTmuxSessionTopology,
   destroyWorkerPanes,
+  findHudPaneIds,
   listTmuxPanes,
+  readAgmoHudPaneOwner,
+  reapOrphanHudPanes,
   notifyPane,
   type TmuxPaneInfo,
   type TmuxPaneDestructionSummary,
   type TmuxTopology
 } from "./tmux-session.js";
+import {
+  buildTeamHudRenderContext,
+  renderTeamHud,
+  type AgmoTeamHudPreset
+} from "./hud-renderer.js";
+import type { AgmoColorMode } from "./terminal-format.js";
+import type { TeamLayoutPreset } from "./layout-planner.js";
 import {
   buildInitialWorkerInbox,
   buildWorkerInstructions
@@ -103,6 +115,7 @@ import type {
 import type { AgmoMailboxMessage } from "./state/mailbox.js";
 import type {
   AgmoTeamMonitorSnapshot,
+  AgmoTmuxLayoutHealth,
   AgmoTmuxPaneMonitorSnapshot,
   AgmoWorkerHeartbeat,
   AgmoWorkerHealth,
@@ -1155,14 +1168,16 @@ function mergeTmuxPaneDestructionSummaries(
 }
 
 function buildTmuxPaneMonitor(
-  role: "leader" | "hud",
+  role: "leader" | "hud" | "worker",
   paneId: string | null | undefined,
   expectedSessionId: string | null | undefined,
-  panes: TmuxPaneInfo[]
+  panes: TmuxPaneInfo[],
+  workerName?: string
 ): AgmoTmuxPaneMonitorSnapshot {
   if (!paneId) {
     return {
       role,
+      ...(workerName ? { worker_name: workerName } : {}),
       pane_id: paneId ?? null,
       session_id: expectedSessionId ?? null,
       health: "unknown",
@@ -1174,6 +1189,7 @@ function buildTmuxPaneMonitor(
   if (!pane) {
     return {
       role,
+      ...(workerName ? { worker_name: workerName } : {}),
       pane_id: paneId,
       session_id: expectedSessionId ?? null,
       health: "missing",
@@ -1191,6 +1207,7 @@ function buildTmuxPaneMonitor(
 
   return {
     role,
+    ...(workerName ? { worker_name: workerName } : {}),
     pane_id: paneId,
     session_id: pane.session_id,
     health: reasons.length > 0 ? "orphaned" : "live",
@@ -1202,10 +1219,33 @@ function isUnavailableTmuxPane(pane: AgmoTmuxPaneMonitorSnapshot | undefined): b
   return Boolean(pane && pane.health !== "live" && pane.health !== "unknown");
 }
 
+function buildTmuxLayoutHealth(
+  transport: AgmoTeamConfig["transport"],
+  leader: AgmoTmuxPaneMonitorSnapshot | undefined,
+  hud: AgmoTmuxPaneMonitorSnapshot | undefined,
+  workers: AgmoTmuxPaneMonitorSnapshot[]
+): AgmoTmuxLayoutHealth {
+  if (transport !== "tmux") {
+    return "skipped";
+  }
+  if (!leader) {
+    return "unknown";
+  }
+  if (hud && isUnavailableTmuxPane(hud)) {
+    return "repairable";
+  }
+  if (isUnavailableTmuxPane(leader) || workers.some((worker) => isUnavailableTmuxPane(worker))) {
+    return "degraded";
+  }
+  return "ok";
+}
+
 function buildTmuxHealthSummary(
   status: AgmoTeamStatusSnapshot,
   leader: AgmoTmuxPaneMonitorSnapshot | undefined,
-  hud: AgmoTmuxPaneMonitorSnapshot | undefined
+  hud: AgmoTmuxPaneMonitorSnapshot | undefined,
+  workerPanes: AgmoTmuxPaneMonitorSnapshot[] = [],
+  layoutHealth: AgmoTmuxLayoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes)
 ): NonNullable<AgmoTeamMonitorSnapshot["tmux_health"]> {
   const retryEntries = status.pane_close_retry?.entries ?? [];
   const orphanWarnings: string[] = [];
@@ -1214,6 +1254,11 @@ function buildTmuxHealthSummary(
   }
   if (isUnavailableTmuxPane(hud)) {
     orphanWarnings.push(`hud:${hud?.health}`);
+  }
+  for (const worker of workerPanes) {
+    if (isUnavailableTmuxPane(worker)) {
+      orphanWarnings.push(`worker:${worker.worker_name ?? worker.pane_id}:${worker.health}`);
+    }
   }
   for (const entry of retryEntries) {
     if ((entry.status ?? "pending") === "manual_required") {
@@ -1225,6 +1270,13 @@ function buildTmuxHealthSummary(
     transport: status.config.transport,
     leader: leader?.health ?? "not_configured",
     hud: hud?.health ?? "not_configured",
+    workers: Object.fromEntries(
+      workerPanes.map((pane) => [
+        pane.worker_name ?? pane.pane_id ?? "unknown",
+        pane.health ?? "not_configured"
+      ])
+    ),
+    layout: layoutHealth,
     retry_pending: retryEntries.filter((entry) => (entry.status ?? "pending") === "pending").length,
     retry_manual_required: retryEntries.filter((entry) => entry.status === "manual_required").length,
     orphan_warnings: orphanWarnings
@@ -1286,8 +1338,21 @@ export async function readTeamTmuxHealthSummary(
           tmuxPanes
         )
       : undefined;
+  const workerPanes =
+    status.config.transport === "tmux"
+      ? status.workers.map((worker) =>
+          buildTmuxPaneMonitor(
+            "worker",
+            worker.identity.pane_id ?? status.config.tmux.worker_pane_ids[worker.identity.name],
+            status.config.tmux.session_id ?? null,
+            tmuxPanes,
+            worker.identity.name
+          )
+        )
+      : [];
+  const layoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes);
 
-  return buildTmuxHealthSummary(status, leader, hud);
+  return buildTmuxHealthSummary(status, leader, hud, workerPanes, layoutHealth);
 }
 
 async function recordShutdownAckIfRequested(
@@ -2712,6 +2777,10 @@ export async function buildLeaderHudView(
   options: {
     staleAfterMs?: number;
     deadAfterMs?: number;
+    preset?: AgmoTeamHudPreset;
+    width?: number;
+    maxLines?: number;
+    color?: AgmoColorMode;
   } = {},
   cwd = process.cwd()
 ): Promise<{
@@ -2772,24 +2841,22 @@ export async function buildLeaderHudView(
     topActions.push("repair-hud");
   }
 
-  const workerLines = snapshot.workers
-    .map((worker) => {
-      const load = openLoads.get(worker.worker_name) ?? 0;
-      const currentTask = worker.current_task_id ? ` t=${worker.current_task_id}` : "";
-      const dispatch = worker.pending_dispatch_count > 0 ? ` d=${worker.pending_dispatch_count}` : "";
-      const risk = worker.claim_at_risk ? " !" : "";
-      return `${worker.worker_name.padEnd(8)} ${worker.health.padEnd(7)} ${worker.status_state.padEnd(7)} open=${String(load).padEnd(2)} hb=${formatDurationMs(worker.ms_since_heartbeat).padEnd(6)}${currentTask}${dispatch}${risk}`;
-    })
-    .join("\n");
-
-  const text = [
-    `AGMO HUD | team=${normalizedTeamName} | checked=${snapshot.checked_at}`,
-    `workers h=${snapshot.healthy_workers} s=${snapshot.stale_workers} d=${snapshot.dead_workers} active=${snapshot.active_workers} | tasks p=${taskCounts.pending} w=${taskCounts.in_progress} b=${taskCounts.blocked} c=${taskCounts.completed} f=${taskCounts.failed} | alerts=${activeLeaderAlerts}`,
-    `tmux leader=${snapshot.leader?.health ?? "n/a"} hud=${snapshot.hud?.health ?? "n/a"}`,
-    `dispatch_pending=${pendingDispatch} | open_load_delta=${openLoadDelta} | actions=${topActions.length > 0 ? topActions.join(",") : "none"}`,
-    "",
-    workerLines || "no workers"
-  ].join("\n");
+  const text = renderTeamHud(
+    buildTeamHudRenderContext(normalizedTeamName, snapshot, status, {
+      taskCounts,
+      pendingDispatch,
+      activeLeaderAlerts,
+      openLoads,
+      openLoadDelta,
+      topActions
+    }),
+    {
+      preset: options.preset,
+      maxWidth: options.width,
+      maxLines: options.maxLines,
+      color: options.color
+    }
+  ).replace(/\n$/, "");
 
   const path = resolveTeamLeaderHudPath(normalizedTeamName, cwd);
   await writeTextFile(path, `${text}\n`);
@@ -2908,7 +2975,10 @@ export async function repairTeamHudPane(
       projectRoot: cwd,
       cliEntryPath: agmoCliDistEntryPath(),
       refreshMs: Math.max(status.config.tmux.hud_refresh_ms, 250),
-      clearScreen: status.config.tmux.hud_clear_screen ?? true
+      clearScreen: status.config.tmux.hud_clear_screen ?? true,
+      leaderPaneId: status.config.tmux.leader_pane_id,
+      sessionId: status.config.tmux.session_id ?? null,
+      ownerTags: true
     },
     {
       targetPaneId: status.config.tmux.leader_pane_id
@@ -2950,6 +3020,311 @@ export async function repairTeamHudPane(
     previous_hud_pane_id: status.config.tmux.hud_pane_id ?? null,
     hud_pane_id: nextHudPaneId
   });
+}
+
+type LayoutPaneHealth = {
+  pane_id?: string | null;
+  health: "live" | "missing" | "dead" | "foreign_session" | "not_configured" | "legacy_configured" | "unknown";
+  owned?: boolean;
+  reasons: string[];
+};
+
+type LayoutAction = {
+  kind: string;
+  target: string;
+  reason: string;
+};
+
+type LayoutOperation = {
+  command: "team layout repair" | "team layout rebalance";
+  team_name: string;
+  dry_run: boolean;
+  status: "completed" | "partial" | "skipped" | "failed" | "refused";
+  planned: LayoutAction[];
+  performed: LayoutAction[];
+  skipped: LayoutAction[];
+  failed: Array<LayoutAction & { error: string }>;
+  refused: Array<LayoutAction & { reason: string }>;
+};
+
+function mapHudReapAction(entry: { pane_id: string; reason: string }): LayoutAction {
+  return {
+    kind: "reap-orphan-hud",
+    target: entry.pane_id,
+    reason: entry.reason
+  };
+}
+
+function appendHudReapToLayoutOperation(
+  operation: LayoutOperation,
+  reap: ReturnType<typeof reapOrphanHudPanes>,
+  options: { dryRun?: boolean } = {}
+): void {
+  operation.planned.push(...reap.planned.map(mapHudReapAction));
+  operation.performed.push(...reap.performed.map(mapHudReapAction));
+  operation.skipped.push(
+    ...reap.skipped.map(mapHudReapAction),
+    ...(options.dryRun ? reap.planned.map(mapHudReapAction) : [])
+  );
+  operation.failed.push(
+    ...reap.failed.map((entry) => ({
+      ...mapHudReapAction(entry),
+      error: entry.error ?? "orphan HUD reap failed"
+    }))
+  );
+  operation.refused.push(
+    ...reap.refused.map((entry) => ({
+      ...mapHudReapAction(entry),
+      reason: entry.reason
+    }))
+  );
+}
+
+function buildPaneHealth(
+  paneId: string | null | undefined,
+  expectedSessionId: string | null | undefined,
+  panes: TmuxPaneInfo[],
+  role: "leader" | "hud" | "worker",
+  teamName: string
+): LayoutPaneHealth {
+  if (!paneId) {
+    return { pane_id: paneId ?? null, health: "not_configured", reasons: ["pane_not_configured"] };
+  }
+  const pane = panes.find((entry) => entry.pane_id === paneId);
+  if (!pane) {
+    return { pane_id: paneId, health: "missing", reasons: ["pane_not_found"] };
+  }
+  if (expectedSessionId && pane.session_id !== expectedSessionId) {
+    return { pane_id: paneId, health: "foreign_session", reasons: ["pane_session_mismatch"] };
+  }
+  if (pane.dead) {
+    return { pane_id: paneId, health: "dead", reasons: ["pane_dead"] };
+  }
+  const owner = role === "hud" ? readAgmoHudPaneOwner(pane) : null;
+  if (role === "hud" && !owner?.owned) {
+    return { pane_id: paneId, health: "legacy_configured", owned: false, reasons: ["legacy_untagged_configured_hud"] };
+  }
+  return {
+    pane_id: paneId,
+    health: "live",
+    ...(role === "hud" ? { owned: owner?.teamName === teamName } : {}),
+    reasons: []
+  };
+}
+
+export async function readTeamLayoutStatus(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<{
+  command: "team layout status";
+  team_name: string;
+  transport: "tmux" | "none";
+  dry_run: false;
+  layout_health: "ok" | "degraded" | "repairable" | "unknown" | "skipped";
+  panes: {
+    leader: LayoutPaneHealth;
+    hud?: LayoutPaneHealth;
+    workers: Record<string, LayoutPaneHealth>;
+  };
+  warnings: string[];
+  recommended_actions: string[];
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (status.config.transport !== "tmux") {
+    return {
+      command: "team layout status",
+      team_name: normalizedTeamName,
+      transport: "none",
+      dry_run: false,
+      layout_health: "skipped",
+      panes: {
+        leader: { pane_id: null, health: "not_configured", reasons: ["team_not_using_tmux"] },
+        workers: {}
+      },
+      warnings: ["team_not_using_tmux"],
+      recommended_actions: []
+    };
+  }
+  const panes = listTmuxPanes();
+  const expectedSessionId = status.config.tmux.session_id ?? null;
+  const leader = buildPaneHealth(
+    status.config.tmux.leader_pane_id,
+    expectedSessionId,
+    panes,
+    "leader",
+    normalizedTeamName
+  );
+  const hud = buildPaneHealth(
+    status.config.tmux.hud_pane_id ?? null,
+    expectedSessionId,
+    panes,
+    "hud",
+    normalizedTeamName
+  );
+  const workers = Object.fromEntries(
+    Object.entries(status.config.tmux.worker_pane_ids).map(([workerName, paneId]) => [
+      workerName,
+      buildPaneHealth(paneId, expectedSessionId, panes, "worker", normalizedTeamName)
+    ])
+  );
+  const ownedHudPaneIds = findHudPaneIds(panes, {
+    teamName: normalizedTeamName,
+    leaderPaneId: status.config.tmux.leader_pane_id,
+    sessionId: expectedSessionId
+  });
+  const orphanHudReap = reapOrphanHudPanes(
+    {
+      teamName: normalizedTeamName,
+      sessionId: expectedSessionId,
+      leaderPaneId: status.config.tmux.leader_pane_id,
+      dryRun: true
+    }
+  );
+  const plan = computeCurrentTeamLayoutPlan(
+    status.config.tmux.leader_pane_id,
+    Object.keys(status.config.tmux.worker_pane_ids).length,
+    { hud: Boolean(status.config.tmux.hud_pane_id) }
+  );
+  const warnings = [
+    ...plan.warnings,
+    ...(hud.health === "missing" || hud.health === "dead" ? ["hud_unavailable"] : []),
+    ...(hud.health === "legacy_configured" ? ["legacy_configured_hud_untagged"] : []),
+    ...(ownedHudPaneIds.length > 1 ? ["duplicate_owned_hud_panes"] : []),
+    ...(orphanHudReap.planned.length > 0 ? ["orphaned_owned_hud_panes"] : [])
+  ];
+  const recommended_actions = [
+    ...(hud.health === "missing" || hud.health === "dead" ? ["team layout repair"] : []),
+    ...(orphanHudReap.planned.length > 0 ? ["team layout repair --dry-run"] : []),
+    ...(plan.health === "degraded" ? ["team layout rebalance --dry-run"] : [])
+  ];
+  const repairable = hud.health === "missing" || hud.health === "dead";
+  return {
+    command: "team layout status",
+    team_name: normalizedTeamName,
+    transport: "tmux",
+    dry_run: false,
+    layout_health: repairable ? "repairable" : warnings.length > 0 ? "degraded" : "ok",
+    panes: {
+      leader,
+      hud,
+      workers
+    },
+    warnings,
+    recommended_actions
+  };
+}
+
+export async function repairTeamLayout(
+  teamName: string,
+  options: { dryRun?: boolean; force?: boolean } = {},
+  cwd = process.cwd()
+): Promise<LayoutOperation> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  const result: LayoutOperation = {
+    command: "team layout repair",
+    team_name: normalizedTeamName,
+    dry_run: Boolean(options.dryRun),
+    status: "skipped",
+    planned: [],
+    performed: [],
+    skipped: [],
+    failed: [],
+    refused: []
+  };
+  if (status.config.transport !== "tmux" || !status.config.tmux.hud_refresh_ms) {
+    result.skipped.push({ kind: "repair-hud", target: normalizedTeamName, reason: "team_not_using_tmux_or_hud_disabled" });
+    return result;
+  }
+  const layoutStatus = await readTeamLayoutStatus(normalizedTeamName, cwd);
+  const orphanHudReap = reapOrphanHudPanes({
+    teamName: normalizedTeamName,
+    sessionId: status.config.tmux.session_id ?? null,
+    leaderPaneId: status.config.tmux.leader_pane_id,
+    dryRun: options.dryRun
+  });
+  appendHudReapToLayoutOperation(result, orphanHudReap, { dryRun: options.dryRun });
+  const hudHealth = layoutStatus.panes.hud?.health ?? "not_configured";
+  const action = { kind: "repair-hud", target: status.config.tmux.leader_pane_id ?? "leader", reason: `hud_${hudHealth}` };
+  result.planned.push(action);
+  if (options.dryRun) {
+    result.skipped.push(action);
+    return result;
+  }
+  if (hudHealth === "live" || (hudHealth === "legacy_configured" && !options.force)) {
+    result.status = "completed";
+    result.skipped.push({ ...action, reason: hudHealth === "legacy_configured" ? "legacy_configured_hud_left_in_place" : "hud_already_live" });
+    if (orphanHudReap.failed.length > 0) {
+      result.status = result.performed.length > 0 ? "partial" : "failed";
+    } else if (orphanHudReap.refused.length > 0) {
+      result.status = result.performed.length > 0 ? "partial" : "refused";
+    }
+    return result;
+  }
+  const repair = await repairTeamHudPane(normalizedTeamName, { force: true, debounceMs: 0 }, cwd);
+  if (repair.status === "repaired" || repair.status === "unchanged") {
+    result.status = "completed";
+    result.performed.push({ ...action, target: repair.hud_pane_id ?? action.target });
+  } else if (repair.status === "skipped" || repair.status === "debounced") {
+    result.status = "skipped";
+    result.skipped.push({ ...action, reason: repair.reason ?? repair.status });
+  } else {
+    result.status = "failed";
+    result.failed.push({ ...action, error: repair.reason ?? "hud_repair_failed" });
+  }
+  if (orphanHudReap.failed.length > 0) {
+    result.status = result.performed.length > 0 ? "partial" : "failed";
+  } else if (orphanHudReap.refused.length > 0 && result.status === "completed") {
+    result.status = "partial";
+  }
+  return result;
+}
+
+export async function rebalanceTeamLayout(
+  teamName: string,
+  options: { dryRun?: boolean; layout?: TeamLayoutPreset } = {},
+  cwd = process.cwd()
+): Promise<LayoutOperation> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (status.config.transport !== "tmux") {
+    return {
+      command: "team layout rebalance",
+      team_name: normalizedTeamName,
+      dry_run: Boolean(options.dryRun),
+      status: "skipped",
+      planned: [],
+      performed: [],
+      skipped: [{ kind: "rebalance-layout", target: normalizedTeamName, reason: "team_not_using_tmux" }],
+      failed: [],
+      refused: []
+    };
+  }
+  const operation = applyTeamLayout({
+    teamName: normalizedTeamName,
+    leaderPaneId: status.config.tmux.leader_pane_id,
+    sessionId: status.config.tmux.session_id ?? null,
+    workerPaneIds: status.config.tmux.worker_pane_ids,
+    hudPaneId: status.config.tmux.hud_pane_id ?? null,
+    layout: options.layout ?? "auto",
+    dryRun: options.dryRun
+  });
+  return {
+    command: "team layout rebalance",
+    team_name: normalizedTeamName,
+    dry_run: Boolean(options.dryRun),
+    ...operation
+  };
 }
 
 function buildTaskRecords(
@@ -4725,6 +5100,19 @@ export async function monitorTeamRuntime(
           tmuxPanes
         )
       : undefined;
+  const workerPanes =
+    status.config.transport === "tmux"
+      ? workers.map((worker) =>
+          buildTmuxPaneMonitor(
+            "worker",
+            worker.pane_id ?? status.config.tmux.worker_pane_ids[worker.worker_name],
+            status.config.tmux.session_id ?? null,
+            tmuxPanes,
+            worker.worker_name
+          )
+        )
+      : [];
+  const layoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes);
 
   const snapshot: AgmoTeamMonitorSnapshot = {
     team_name: normalizedTeamName,
@@ -4738,7 +5126,9 @@ export async function monitorTeamRuntime(
     workers,
     ...(leader ? { leader } : {}),
     ...(hud ? { hud } : {}),
-    tmux_health: buildTmuxHealthSummary(status, leader, hud)
+    ...(workerPanes.length > 0 ? { worker_panes: workerPanes } : {}),
+    layout_health: layoutHealth,
+    tmux_health: buildTmuxHealthSummary(status, leader, hud, workerPanes, layoutHealth)
   };
 
   await Promise.all([
@@ -4753,6 +5143,7 @@ export async function monitorTeamRuntime(
         dead_workers: snapshot.dead_workers,
         leader_health: snapshot.leader?.health,
         hud_health: snapshot.hud?.health,
+        layout_health: snapshot.layout_health,
         tmux_health: snapshot.tmux_health
       },
       cwd

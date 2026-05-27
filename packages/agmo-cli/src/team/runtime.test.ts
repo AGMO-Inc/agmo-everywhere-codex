@@ -962,6 +962,8 @@ test("monitor and cleanup detect orphaned leader tmux panes", async () => {
   );
   assert.equal(snapshot.leader?.health, "missing");
   assert.deepEqual(snapshot.leader?.reasons, ["pane_not_found"]);
+  assert.equal(snapshot.layout_health, "degraded");
+  assert.equal(snapshot.tmux_health?.layout, "degraded");
 
   const cleanup = await cleanupStaleTeamRuntimes(
     {
@@ -1005,7 +1007,9 @@ test("readTeamTmuxHealthSummary reports orphan and retry counts for status surfa
   config.tmux.session_id = "$missing-session";
   config.tmux.leader_pane_id = "%997";
   config.tmux.hud_pane_id = "%998";
-  config.tmux.worker_pane_ids = {};
+  config.tmux.worker_pane_ids = {
+    "worker-1": "%996"
+  };
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
   await writeFile(
     resolveTeamPaneCloseRetryPath(teamName, tempRoot),
@@ -1044,12 +1048,15 @@ test("readTeamTmuxHealthSummary reports orphan and retry counts for status surfa
   assert.equal(summary.transport, "tmux");
   assert.equal(summary.leader, "missing");
   assert.equal(summary.hud, "missing");
+  assert.equal(summary.workers["worker-1"], "missing");
+  assert.equal(summary.layout, "repairable");
   assert.equal(summary.retry_pending, 1);
   assert.equal(summary.retry_manual_required, 1);
   assert.deepEqual(summary.orphan_warnings.sort(), [
     "hud:missing",
     "leader:missing",
-    "worker:%999:manual_required"
+    "worker:%999:manual_required",
+    "worker:worker-1:missing"
   ]);
 });
 
