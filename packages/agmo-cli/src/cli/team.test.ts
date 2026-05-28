@@ -178,6 +178,55 @@ test("runTeamCommand shutdown-ack prints current ad hoc JSON shape after shutdow
   });
 });
 
+test("runTeamCommand start rejects invalid spec inputs before writing team state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-start-validation-"));
+
+  await assert.rejects(
+    () => captureTeamCommandOutput(["start", "2x", "Bad worker count"], tempRoot),
+    /worker count must be an integer between 1 and 20/,
+  );
+  await assert.rejects(
+    () => captureTeamCommandOutput(["start", "21", "Too many workers"], tempRoot),
+    /worker count must be an integer between 1 and 20/,
+  );
+  await assert.rejects(
+    () => captureTeamCommandOutput(["start", "1", "Bad name", "--name", "Bad Name"], tempRoot),
+    /--name must match/,
+  );
+  await assert.rejects(
+    () =>
+      captureTeamCommandOutput(
+        ["start", "1", "Bad role worker", "--name", "bad-role-worker", "--role-map", "worker-2=agmo-executor"],
+        tempRoot,
+      ),
+    /unknown worker: worker-2/,
+  );
+  await assert.rejects(
+    () =>
+      captureTeamCommandOutput(
+        ["start", "1", "Bad role name", "--name", "bad-role-name", "--role-map", "worker-1=executor"],
+        tempRoot,
+      ),
+    /must be one of: agmo-planner/,
+  );
+  await assert.rejects(
+    () =>
+      captureTeamCommandOutput(
+        ["start", "1", "Bad HUD refresh", "--name", "bad-hud-refresh", "--hud-refresh-ms", "100"],
+        tempRoot,
+      ),
+    /--hud-refresh-ms must be at least 250/,
+  );
+  await assert.rejects(
+    () => captureTeamCommandOutput(["start", "1", "Missing name value", "--name"], tempRoot),
+    /--name requires a value/,
+  );
+
+  assert.equal(existsSync(resolveTeamDir("bad-role-worker", tempRoot)), false);
+  assert.equal(existsSync(resolveTeamDir("bad-role-name", tempRoot)), false);
+  assert.equal(existsSync(resolveTeamDir("bad-hud-refresh", tempRoot)), false);
+});
+
 test("runTeamCommand delete refuses active teams without force", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-delete-active-"));
   const teamName = "cli-delete-active-team";

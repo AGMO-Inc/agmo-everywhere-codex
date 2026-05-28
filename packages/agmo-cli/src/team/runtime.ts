@@ -56,6 +56,7 @@ import {
   createMessageId,
   generateTeamName,
   nowIso,
+  assertCanonicalTeamName,
   resolveTeamConfigPath,
   resolveTeamDir,
   resolveTeamDispatchPath,
@@ -183,6 +184,16 @@ const PANE_CLOSE_RETRY_DELAY_MS = 30_000;
 const PANE_CLOSE_RETRY_MAX_ATTEMPTS = 3;
 const HUD_REPAIR_DEBOUNCE_MS = 30_000;
 const HUD_REPAIR_HISTORY_LIMIT = 20;
+const TEAM_ROLE_NAMES = [
+  "agmo-planner",
+  "agmo-executor",
+  "agmo-verifier",
+  "agmo-wisdom",
+  "agmo-architect",
+  "agmo-critic",
+  "agmo-explore"
+] as const;
+const TEAM_ROLE_NAME_SET = new Set<string>(TEAM_ROLE_NAMES);
 
 function emptyTmuxPaneDestructionSummary(): TmuxPaneDestructionSummary {
   return {
@@ -211,6 +222,34 @@ type TeamAutoShutdownResult =
 function assertValidWorkerCount(workerCount: number): void {
   if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > 20) {
     throw new Error("workerCount must be an integer between 1 and 20");
+  }
+}
+
+function assertValidTeamTask(task: string): void {
+  if (task.trim().length === 0) {
+    throw new Error("task is required");
+  }
+  if (task.length > 32_000) {
+    throw new Error("task must be at most 32000 characters");
+  }
+}
+
+function assertValidRoleOverrides(
+  roleOverrides: Record<string, string> | undefined,
+  workerNames: string[]
+): void {
+  if (!roleOverrides) {
+    return;
+  }
+
+  const workerNameSet = new Set(workerNames);
+  for (const [workerName, role] of Object.entries(roleOverrides)) {
+    if (!workerNameSet.has(workerName)) {
+      throw new Error(`roleOverrides references unknown worker: ${workerName}`);
+    }
+    if (!TEAM_ROLE_NAME_SET.has(role)) {
+      throw new Error(`roleOverrides for ${workerName} must be one of: ${TEAM_ROLE_NAMES.join(", ")}`);
+    }
   }
 }
 
@@ -3584,8 +3623,14 @@ export async function startTeamRuntime(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   assertValidWorkerCount(request.workerCount);
+  assertValidTeamTask(request.task);
 
-  const teamName = sanitizeTeamName(request.teamName ?? generateTeamName(request.task));
+  const teamName =
+    request.teamName === undefined
+      ? sanitizeTeamName(generateTeamName(request.task))
+      : assertCanonicalTeamName(request.teamName);
+  const workerNames = buildWorkerNames(request.workerCount);
+  assertValidRoleOverrides(request.roleOverrides, workerNames);
   const existingConfig = await readJsonFile<AgmoTeamConfig>(
     resolveTeamConfigPath(teamName, cwd)
   );
@@ -3594,7 +3639,6 @@ export async function startTeamRuntime(
     throw new Error(`team already active: ${teamName}`);
   }
 
-  const workerNames = buildWorkerNames(request.workerCount);
   const tmux = describeTmuxSessionTopology(request.workerCount);
   const timestamp = nowIso();
   const stateRoot = resolveTeamStateRoot(cwd);

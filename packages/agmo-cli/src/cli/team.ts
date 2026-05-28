@@ -32,16 +32,22 @@ import {
   shutdownTeamRuntime,
   startTeamRuntime
 } from "../team/runtime.js";
-import { resolveTeamMonitorPolicyPath } from "../team/state/index.js";
+import {
+  assertCanonicalTeamName,
+  resolveTeamMonitorPolicyPath
+} from "../team/state/index.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
 import { ellipsize, fitLines } from "../team/terminal-format.js";
 
 function parseWorkerCount(value: string | undefined): number {
+  if (!value || !/^\d+$/.test(value)) {
+    throw new Error("worker count must be an integer between 1 and 20");
+  }
   const parsed = Number.parseInt(value ?? "", 10);
-  if (!Number.isInteger(parsed)) {
-    throw new Error("worker count must be an integer");
+  if (parsed < 1 || parsed > 20) {
+    throw new Error("worker count must be an integer between 1 and 20");
   }
   return parsed;
 }
@@ -50,6 +56,9 @@ function parseIntegerOption(args: string[], optionName: string): number | undefi
   const raw = parseOption(args, optionName);
   if (!raw) {
     return undefined;
+  }
+  if (!/^-?\d+$/.test(raw)) {
+    throw new Error(`${optionName} must be an integer`);
   }
 
   const parsed = Number.parseInt(raw, 10);
@@ -60,15 +69,14 @@ function parseIntegerOption(args: string[], optionName: string): number | undefi
   return parsed;
 }
 
-function parseStrictIntegerOption(args: string[], optionName: string): number | undefined {
-  const raw = parseOption(args, optionName);
-  if (!raw) {
-    return undefined;
+function assertMinimumOption(
+  value: number | undefined,
+  optionName: string,
+  minimum: number
+): void {
+  if (value !== undefined && value < minimum) {
+    throw new Error(`${optionName} must be at least ${minimum}`);
   }
-  if (!/^-?\d+$/.test(raw)) {
-    throw new Error(`${optionName} must be an integer`);
-  }
-  return Number.parseInt(raw, 10);
 }
 
 function parseBooleanFlag(
@@ -130,6 +138,9 @@ function parseRoleMapOption(value: string | undefined): Record<string, string> |
     const [workerName, role] = entry.split("=").map((part) => part?.trim());
     if (!workerName || !role) {
       throw new Error("--role-map must look like worker-1=agmo-planner,worker-2=agmo-executor");
+    }
+    if (Object.hasOwn(output, workerName)) {
+      throw new Error(`--role-map repeats ${workerName}`);
     }
     output[workerName] = role;
   }
@@ -253,11 +264,22 @@ export async function runTeamHudWatchLoop({
 function parseOption(args: string[], optionName: string): string | undefined {
   const exactIndex = args.findIndex((arg) => arg === optionName);
   if (exactIndex >= 0) {
-    return args[exactIndex + 1];
+    const value = args[exactIndex + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error(`${optionName} requires a value`);
+    }
+    return value;
   }
 
   const inline = args.find((arg) => arg.startsWith(`${optionName}=`));
-  return inline ? inline.slice(optionName.length + 1) : undefined;
+  if (!inline) {
+    return undefined;
+  }
+  const value = inline.slice(optionName.length + 1);
+  if (!value) {
+    throw new Error(`${optionName} requires a value`);
+  }
+  return value;
 }
 
 function removeOption(args: string[], optionName: string): string[] {
@@ -299,6 +321,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       parseScopeFlag(args.slice(1));
       const workers = parseWorkerCount(args[1]);
       const hudRefreshMs = parseIntegerOption(args.slice(2), "--hud-refresh-ms");
+      assertMinimumOption(hudRefreshMs, "--hud-refresh-ms", 250);
       const hudClearScreen = parseBooleanFlag(args.slice(2), "--hud-clear", "--hud-no-clear");
       const allocationIntent = parseOption(args.slice(2), "--allocation-intent");
       const roleOverrides = parseRoleMapOption(parseOption(args.slice(2), "--role-map"));
@@ -329,6 +352,9 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
       }
       const teamName = parseOption(args.slice(2), "--name");
+      if (teamName !== undefined) {
+        assertCanonicalTeamName(teamName, "--name");
+      }
       const result = await startTeamRuntime({
         teamName,
         workerCount: workers,
@@ -455,6 +481,8 @@ export async function runTeamCommand(args: string[]): Promise<void> {
     case "cleanup-stale": {
       const staleAfterMs = parseIntegerOption(args.slice(1), "--stale-ms");
       const deadAfterMs = parseIntegerOption(args.slice(1), "--dead-ms");
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
       const includeStale = parseBooleanFlag(
         args.slice(1),
         "--include-stale",
@@ -518,6 +546,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const autoIntegrate = args.slice(1).includes("--auto-integrate");
       const integrateStrategy = parseOption(args.slice(1), "--integrate-strategy");
       const integrateMaxCommits = parseIntegerOption(args.slice(1), "--integrate-max-commits");
+      assertMinimumOption(integrateMaxCommits, "--integrate-max-commits", 1);
       const integrateOnConflict = parseOption(args.slice(1), "--integrate-on-conflict");
       const integrateOnEmpty = parseOption(args.slice(1), "--integrate-on-empty");
       const integrateTargetRef = parseOption(args.slice(1), "--integrate-target-ref");
@@ -647,8 +676,8 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
       }
       const preset = parseOption(args.slice(2), "--preset");
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
       const autoNudgeOverride = parseBooleanFlag(
         args.slice(2),
         "--auto-nudge",
@@ -691,51 +720,24 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       );
       const leaderView = args.slice(2).includes("--leader-view");
       const repairHud = args.slice(2).includes("--repair-hud");
-      const cooldownRaw = parseOption(args.slice(2), "--nudge-cooldown-ms");
-      const reclaimLeaseRaw = parseOption(args.slice(2), "--reclaim-lease-ms");
-      const leaderAlertCooldownRaw = parseOption(args.slice(2), "--leader-alert-cooldown-ms");
-      const escalationRepeatThresholdRaw = parseOption(
+      const cooldownMs = parseIntegerOption(args.slice(2), "--nudge-cooldown-ms");
+      const reclaimLeaseMs = parseIntegerOption(args.slice(2), "--reclaim-lease-ms");
+      const leaderAlertCooldownMs = parseIntegerOption(args.slice(2), "--leader-alert-cooldown-ms");
+      const escalationRepeatThreshold = parseIntegerOption(
         args.slice(2),
         "--escalation-repeat-threshold"
       );
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      const cooldownMs = cooldownRaw ? Number.parseInt(cooldownRaw, 10) : undefined;
-      const reclaimLeaseMs = reclaimLeaseRaw
-        ? Number.parseInt(reclaimLeaseRaw, 10)
-        : undefined;
-      const leaderAlertCooldownMs = leaderAlertCooldownRaw
-        ? Number.parseInt(leaderAlertCooldownRaw, 10)
-        : undefined;
-      const escalationRepeatThreshold = escalationRepeatThresholdRaw
-        ? Number.parseInt(escalationRepeatThresholdRaw, 10)
-        : undefined;
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(cooldownMs, "--nudge-cooldown-ms", 0);
+      assertMinimumOption(reclaimLeaseMs, "--reclaim-lease-ms", 0);
+      assertMinimumOption(leaderAlertCooldownMs, "--leader-alert-cooldown-ms", 0);
+      assertMinimumOption(escalationRepeatThreshold, "--escalation-repeat-threshold", 1);
       if (
         preset &&
         !["observe", "conservative", "balanced", "aggressive"].includes(preset)
       ) {
         throw new Error("--preset must be: observe, conservative, balanced, aggressive");
-      }
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (cooldownRaw && !Number.isFinite(cooldownMs)) {
-        throw new Error("--nudge-cooldown-ms must be an integer");
-      }
-      if (reclaimLeaseRaw && !Number.isFinite(reclaimLeaseMs)) {
-        throw new Error("--reclaim-lease-ms must be an integer");
-      }
-      if (leaderAlertCooldownRaw && !Number.isFinite(leaderAlertCooldownMs)) {
-        throw new Error("--leader-alert-cooldown-ms must be an integer");
-      }
-      if (
-        escalationRepeatThresholdRaw &&
-        !Number.isFinite(escalationRepeatThreshold)
-      ) {
-        throw new Error("--escalation-repeat-threshold must be an integer");
       }
       const policy = resolveMonitorPolicy({
         preset:
@@ -929,11 +931,11 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
         );
       }
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
       const refreshMs = parseIntegerOption(args.slice(2), "--refresh-ms");
       const iterations = parseIntegerOption(args.slice(2), "--iterations");
-      const width = parseStrictIntegerOption(args.slice(2), "--width");
+      const width = parseIntegerOption(args.slice(2), "--width");
       const maxLines = parseIntegerOption(args.slice(2), "--max-lines");
       const preset = parseHudPreset(parseOption(args.slice(2), "--preset"));
       const color = parseColorMode(args.slice(2));
@@ -941,26 +943,12 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const watch = args.slice(2).includes("--watch");
       const repair = args.slice(2).includes("--repair");
       const showLegend = args.slice(2).includes("--legend");
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (refreshMs !== undefined && refreshMs < 250) {
-        throw new Error("--refresh-ms must be at least 250");
-      }
-      if (iterations !== undefined && iterations < 1) {
-        throw new Error("--iterations must be at least 1");
-      }
-      if (width !== undefined && width < 20) {
-        throw new Error("--width must be at least 20");
-      }
-      if (maxLines !== undefined && maxLines < 1) {
-        throw new Error("--max-lines must be at least 1");
-      }
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(refreshMs, "--refresh-ms", 250);
+      assertMinimumOption(iterations, "--iterations", 1);
+      assertMinimumOption(width, "--width", 20);
+      assertMinimumOption(maxLines, "--max-lines", 1);
       const intervalMs = refreshMs ?? 2000;
       const renderHudFrame = async (): Promise<string> => {
         if (repair) {
@@ -1079,21 +1067,12 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       }
       const workerName = parseOption(args.slice(2), "--worker");
       const taskId = parseOption(args.slice(2), "--task");
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
-      const leaseRaw = parseOption(args.slice(2), "--lease-ms");
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      const leaseMs = leaseRaw ? Number.parseInt(leaseRaw, 10) : undefined;
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (leaseRaw && !Number.isFinite(leaseMs)) {
-        throw new Error("--lease-ms must be an integer");
-      }
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
+      const leaseMs = parseIntegerOption(args.slice(2), "--lease-ms");
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(leaseMs, "--lease-ms", 0);
       const result = await reclaimTeamClaims(
         teamName,
         {
@@ -1118,42 +1097,18 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
       }
       const workerName = parseOption(args.slice(2), "--worker");
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
-      const maxOpenDeltaRaw = parseOption(args.slice(2), "--max-open-delta");
-      const maxOpenPerWorkerRaw = parseOption(args.slice(2), "--max-open-per-worker");
-      const maxPendingDispatchRaw = parseOption(args.slice(2), "--max-pending-dispatch");
-      const limitRaw = parseOption(args.slice(2), "--limit");
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      const maxOpenDelta = maxOpenDeltaRaw
-        ? Number.parseInt(maxOpenDeltaRaw, 10)
-        : undefined;
-      const maxOpenPerWorker = maxOpenPerWorkerRaw
-        ? Number.parseInt(maxOpenPerWorkerRaw, 10)
-        : undefined;
-      const maxPendingDispatch = maxPendingDispatchRaw
-        ? Number.parseInt(maxPendingDispatchRaw, 10)
-        : undefined;
-      const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (maxOpenDeltaRaw && !Number.isFinite(maxOpenDelta)) {
-        throw new Error("--max-open-delta must be an integer");
-      }
-      if (maxOpenPerWorkerRaw && !Number.isFinite(maxOpenPerWorker)) {
-        throw new Error("--max-open-per-worker must be an integer");
-      }
-      if (maxPendingDispatchRaw && !Number.isFinite(maxPendingDispatch)) {
-        throw new Error("--max-pending-dispatch must be an integer");
-      }
-      if (limitRaw && !Number.isFinite(limit)) {
-        throw new Error("--limit must be an integer");
-      }
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
+      const maxOpenDelta = parseIntegerOption(args.slice(2), "--max-open-delta");
+      const maxOpenPerWorker = parseIntegerOption(args.slice(2), "--max-open-per-worker");
+      const maxPendingDispatch = parseIntegerOption(args.slice(2), "--max-pending-dispatch");
+      const limit = parseIntegerOption(args.slice(2), "--limit");
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(maxOpenDelta, "--max-open-delta", 0);
+      assertMinimumOption(maxOpenPerWorker, "--max-open-per-worker", 0);
+      assertMinimumOption(maxPendingDispatch, "--max-pending-dispatch", 0);
+      assertMinimumOption(limit, "--limit", 1);
       const result = await rebalanceTeamAssignments(
         teamName,
         {
@@ -1184,15 +1139,14 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const strategy = parseOption(args.slice(2), "--strategy");
       const maxCommits = parseIntegerOption(args.slice(2), "--max-commits");
       const batchSize = parseIntegerOption(args.slice(2), "--batch-size");
+      assertMinimumOption(maxCommits, "--max-commits", 1);
+      assertMinimumOption(batchSize, "--batch-size", 1);
       const batchOrder = parseOption(args.slice(2), "--batch-order");
       const targetRef = parseOption(args.slice(2), "--target-ref");
       const onConflict = parseOption(args.slice(2), "--on-conflict");
       const onEmpty = parseOption(args.slice(2), "--on-empty");
       if (strategy && !["cherry-pick", "squash"].includes(strategy)) {
         throw new Error("--strategy must be: cherry-pick, squash");
-      }
-      if (batchSize !== undefined && batchSize < 1) {
-        throw new Error("--batch-size must be at least 1");
       }
       if (batchOrder && !["oldest", "newest", "task-id"].includes(batchOrder)) {
         throw new Error("--batch-order must be: oldest, newest, task-id");

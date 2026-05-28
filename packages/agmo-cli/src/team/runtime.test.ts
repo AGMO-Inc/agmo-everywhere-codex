@@ -76,6 +76,78 @@ test("startTeamRuntime writes a worktree ownership manifest after provisioning",
   );
 });
 
+test("startTeamRuntime rejects non-canonical explicit team names before writing state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-invalid-name-"));
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "Invalid Team",
+        workerCount: 1,
+        task: "Reject non-canonical team name",
+        mode: "interactive"
+      },
+      tempRoot
+    ),
+    /teamName must match/
+  );
+
+  assert.equal(existsSync(resolveTeamDir("invalid-team", tempRoot)), false);
+});
+
+test("startTeamRuntime validates task text and role overrides before writing state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-start-validation-"));
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "blank-task",
+        workerCount: 1,
+        task: "   ",
+        mode: "interactive"
+      },
+      tempRoot
+    ),
+    /task is required/
+  );
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "unknown-worker-role",
+        workerCount: 1,
+        task: "Reject unknown worker role override",
+        mode: "interactive",
+        roleOverrides: {
+          "worker-2": "agmo-executor"
+        }
+      },
+      tempRoot
+    ),
+    /unknown worker: worker-2/
+  );
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "unknown-role",
+        workerCount: 1,
+        task: "Reject unsupported role override",
+        mode: "interactive",
+        roleOverrides: {
+          "worker-1": "executor"
+        }
+      },
+      tempRoot
+    ),
+    /must be one of: agmo-planner/
+  );
+
+  assert.equal(existsSync(resolveTeamDir("blank-task", tempRoot)), false);
+  assert.equal(existsSync(resolveTeamDir("unknown-worker-role", tempRoot)), false);
+  assert.equal(existsSync(resolveTeamDir("unknown-role", tempRoot)), false);
+});
+
 test("deleteTeamRuntime preserves state when worktree manifest points outside the team root", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-delete-unsafe-worktree-"));
   const teamName = "delete-unsafe-worktree";

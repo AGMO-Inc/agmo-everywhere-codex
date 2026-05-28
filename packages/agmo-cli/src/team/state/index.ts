@@ -170,6 +170,16 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+const CANONICAL_TEAM_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+
+export function assertCanonicalTeamName(value: string, fieldName = "teamName"): string {
+  const trimmed = value.trim();
+  if (!CANONICAL_TEAM_NAME_PATTERN.test(trimmed)) {
+    throw new Error(`${fieldName} must match /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/`);
+  }
+  return trimmed;
+}
+
 export function sanitizeTeamName(value: string): string {
   const normalized = value
     .trim()
