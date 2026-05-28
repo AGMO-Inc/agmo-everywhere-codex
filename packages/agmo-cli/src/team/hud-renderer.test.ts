@@ -143,6 +143,62 @@ test("renderTeamHud supports presets, clipping, and no-color output", () => {
   }
 });
 
+test("renderTeamHud focused and full views surface worker and task diagnostics", () => {
+  const testContext = context();
+  testContext.snapshot.healthy_workers = 0;
+  testContext.snapshot.stale_workers = 1;
+  testContext.snapshot.workers[0] = {
+    ...testContext.snapshot.workers[0],
+    role: "agmo-verifier",
+    status_state: "blocked",
+    health: "stale",
+    ms_since_heartbeat: 180000,
+    mailbox_message_count: 2,
+    pending_dispatch_count: 3,
+    claim_at_risk: true,
+    reasons: ["waiting\u0007on reviewer"]
+  };
+  testContext.snapshot.worker_panes = [
+    {
+      role: "worker",
+      worker_name: "worker-1",
+      pane_id: "%2",
+      session_id: "$1",
+      health: "missing",
+      reasons: ["pane_not_found"]
+    }
+  ];
+  testContext.status.tasks[0] = {
+    ...testContext.status.tasks[0],
+    claim: {
+      owner: "worker-1",
+      claimed_at: "2026-05-26T23:00:00.000Z"
+    }
+  };
+
+  const focused = renderTeamHud(testContext, {
+    preset: "focused",
+    maxWidth: 180,
+    color: "never"
+  });
+  const full = renderTeamHud(testContext, {
+    preset: "full",
+    maxWidth: 180,
+    color: "never"
+  });
+
+  assert.match(focused, /worker-1\s+stale\s+blocked\s+role=verifier/);
+  assert.match(focused, /mail=2/);
+  assert.match(focused, /d=3/);
+  assert.match(focused, /pane=missing/);
+  assert.match(focused, /reason=waiting\?on reviewer/);
+  assert.match(focused, /!/);
+  assert.match(full, /task task-1 \| in_progress \| owner=worker-1\/stale \| claim_age=1h \| finish renderer/);
+  for (const line of `${focused}${full}`.trimEnd().split("\n")) {
+    assert.ok(visibleLength(line) <= 180, line);
+  }
+});
+
 test("renderTeamHud sidecar is compact, sanitized, and action-oriented", () => {
   const rendered = renderTeamHud(context(), {
     preset: "sidecar",

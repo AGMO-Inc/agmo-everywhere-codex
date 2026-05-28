@@ -80,6 +80,11 @@ export type TeamHudRenderOptions = {
   showLegend?: boolean;
 };
 
+type TeamHudWorkerSnapshot = TeamHudRenderContext["snapshot"]["workers"][number];
+type TeamHudTaskSnapshot = TeamHudRenderContext["status"]["tasks"][number];
+type TeamHudColorTone = "bold" | "dim" | "green" | "yellow" | "red" | "cyan";
+type TeamHudColorize = (value: string, tone: TeamHudColorTone) => string;
+
 const ACTION_KEY_PRIORITY: TeamHudActionKey[] = [
   "leader-orphan",
   "repair-hud",
@@ -606,6 +611,62 @@ function resolveWorkerPaneHealth(
   return workerPane?.health ?? context.snapshot.tmux_health?.workers[workerName];
 }
 
+function findWorkerSnapshot(
+  context: TeamHudRenderContext,
+  workerName: string
+): TeamHudWorkerSnapshot | undefined {
+  return context.snapshot.workers.find((worker) => worker.worker_name === workerName);
+}
+
+function shouldShowPaneHealth(paneHealth: string | undefined, preset: AgmoTeamHudPreset): boolean {
+  if (!paneHealth || paneHealth === "not_configured") {
+    return false;
+  }
+  return preset === "full" || paneHealth !== "live";
+}
+
+function formatWorkerDiagnosticLine(
+  context: TeamHudRenderContext,
+  worker: TeamHudWorkerSnapshot,
+  preset: AgmoTeamHudPreset,
+  c: TeamHudColorize
+): string {
+  const load = context.openLoads[worker.worker_name] ?? 0;
+  const healthTone =
+    worker.health === "healthy" ? "green" : worker.health === "stale" ? "yellow" : "red";
+  const currentTask = worker.current_task_id ? ` t=${clean(worker.current_task_id)}` : "";
+  const dispatch = worker.pending_dispatch_count > 0 ? ` d=${worker.pending_dispatch_count}` : "";
+  const risk = worker.claim_at_risk ? " !" : "";
+  const paneHealth = resolveWorkerPaneHealth(context, worker.worker_name);
+  const pane = shouldShowPaneHealth(paneHealth, preset) ? ` pane=${clean(paneHealth)}` : "";
+  const reason =
+    (preset === "full" || worker.health !== "healthy" || worker.status_state === "blocked") &&
+    worker.reasons[0]
+      ? ` reason=${clean(worker.reasons[0])}`
+      : "";
+  return `${clean(worker.worker_name).padEnd(8)} ${c(worker.health.padEnd(7), healthTone)} ${clean(worker.status_state).padEnd(7)} role=${compactWorkerRole(worker.role)} open=${String(load).padEnd(2)} mail=${worker.mailbox_message_count} hb=${formatDurationMs(worker.ms_since_heartbeat).padEnd(6)}${currentTask}${dispatch}${pane}${reason}${risk}`;
+}
+
+function formatTaskOwnerLabel(context: TeamHudRenderContext, owner: string | undefined): string {
+  if (!owner) {
+    return "unassigned";
+  }
+  const health = findWorkerSnapshot(context, owner)?.health;
+  return health ? `${clean(owner)}/${clean(health)}` : clean(owner);
+}
+
+function formatTaskClaimAge(context: TeamHudRenderContext, task: TeamHudTaskSnapshot): string | null {
+  if (!task.claim?.claimed_at) {
+    return null;
+  }
+  const claimedAtMs = Date.parse(task.claim.claimed_at);
+  const checkedAtMs = Date.parse(context.snapshot.checked_at);
+  if (!Number.isFinite(claimedAtMs) || !Number.isFinite(checkedAtMs) || checkedAtMs < claimedAtMs) {
+    return null;
+  }
+  return formatDurationMs(checkedAtMs - claimedAtMs);
+}
+
 function formatSidecarTopologyLine(context: TeamHudRenderContext): string | null {
   const workers = [...context.snapshot.workers].sort((left, right) =>
     left.worker_name.localeCompare(right.worker_name, undefined, { numeric: true })
@@ -813,15 +874,7 @@ export function renderTeamHud(
     lines.push("no workers");
   } else {
     for (const worker of workers) {
-      const load = context.openLoads[worker.worker_name] ?? 0;
-      const healthTone =
-        worker.health === "healthy" ? "green" : worker.health === "stale" ? "yellow" : "red";
-      const currentTask = worker.current_task_id ? ` t=${clean(worker.current_task_id)}` : "";
-      const dispatch = worker.pending_dispatch_count > 0 ? ` d=${worker.pending_dispatch_count}` : "";
-      const risk = worker.claim_at_risk ? " !" : "";
-      lines.push(
-        `${clean(worker.worker_name).padEnd(8)} ${c(worker.health.padEnd(7), healthTone)} ${clean(worker.status_state).padEnd(7)} open=${String(load).padEnd(2)} hb=${formatDurationMs(worker.ms_since_heartbeat).padEnd(6)}${currentTask}${dispatch}${risk}`
-      );
+      lines.push(formatWorkerDiagnosticLine(context, worker, preset, c));
     }
   }
 
@@ -835,8 +888,10 @@ export function renderTeamHud(
       lines.push("none");
     } else {
       for (const task of openTasks) {
+        const claimAge = formatTaskClaimAge(context, task);
+        const claimAgeLabel = claimAge ? ` | claim_age=${claimAge}` : "";
         lines.push(
-          `task ${clean(task.id)} | ${clean(task.status)} | owner=${clean(task.owner ?? "unassigned")} | ${clean(task.subject)}`
+          `task ${clean(task.id)} | ${clean(task.status)} | owner=${formatTaskOwnerLabel(context, task.owner)}${claimAgeLabel} | ${clean(task.subject)}`
         );
       }
     }
