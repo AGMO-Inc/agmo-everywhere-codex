@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import os from "node:os";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
-import { resolveTeamDir, resolveTeamManifestPath } from "../team/state/index.js";
+import {
+  resolveTeamDir,
+  resolveTeamManifestPath,
+  resolveWorkerHeartbeatPath,
+  resolveWorkerIdentityPath,
+  resolveWorkerInboxPath,
+} from "../team/state/index.js";
 import { resolveTeamWorktreeRoot } from "../team/worktree.js";
 import { runTeamCommand, runTeamHudWatchLoop } from "./team.js";
 
@@ -411,6 +417,248 @@ test("runTeamCommand team api returns worker_not_found for missing read-only wor
     message: "worker not found: worker-404",
   });
   assert.equal("data" in heartbeatOutput, false);
+});
+
+test("runTeamCommand team api writes worker heartbeat, inbox, and identity state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-write-worker-"));
+  const teamName = "cli-api-write-worker-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Write worker API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const heartbeat = await captureTeamCommand(
+    [
+      "api",
+      "update-worker-heartbeat",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        turn_count: 7,
+        alive: true,
+        pid: 12345,
+        last_turn_at: "2026-05-28T00:00:00.000Z",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(heartbeat, "update-worker-heartbeat");
+  const heartbeatData = heartbeat.data as {
+    worker_name?: string;
+    heartbeat?: { alive?: boolean; pid?: number; turn_count?: number; last_turn_at?: string };
+  };
+  assert.equal(heartbeatData.worker_name, "worker-1");
+  assert.deepEqual(heartbeatData.heartbeat, {
+    alive: true,
+    pid: 12345,
+    turn_count: 7,
+    last_turn_at: "2026-05-28T00:00:00.000Z",
+  });
+  assert.deepEqual(
+    JSON.parse(await readFile(resolveWorkerHeartbeatPath(teamName, "worker-1", tempRoot), "utf-8")),
+    heartbeatData.heartbeat,
+  );
+
+  const inbox = await captureTeamCommand(
+    [
+      "api",
+      "write-worker-inbox",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        content: "Replacement inbox content\n",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(inbox, "write-worker-inbox");
+  const inboxData = inbox.data as { worker_name?: string; written?: boolean };
+  assert.equal(inboxData.worker_name, "worker-1");
+  assert.equal(inboxData.written, true);
+  assert.equal(
+    await readFile(resolveWorkerInboxPath(teamName, "worker-1", tempRoot), "utf-8"),
+    "Replacement inbox content\n",
+  );
+
+  const identity = await captureTeamCommand(
+    [
+      "api",
+      "write-worker-identity",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        index: 2,
+        role: "agmo-verifier",
+        working_dir: "/tmp/agmo-worker",
+        worktree_path: "/tmp/agmo-worker/worktree",
+        team_state_root: "/tmp/agmo-team-state",
+        pane_id: "%7",
+        git_branch: "api-worker-state",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(identity, "write-worker-identity");
+  const identityData = identity.data as {
+    worker_name?: string;
+    identity?: {
+      name?: string;
+      index?: number;
+      role?: string;
+      working_dir?: string;
+      worktree_path?: string;
+      team_state_root?: string;
+      pane_id?: string;
+      git_branch?: string;
+    };
+  };
+  assert.equal(identityData.worker_name, "worker-1");
+  assert.deepEqual(identityData.identity, {
+    name: "worker-1",
+    index: 2,
+    role: "agmo-verifier",
+    working_dir: "/tmp/agmo-worker",
+    worktree_path: "/tmp/agmo-worker/worktree",
+    team_state_root: "/tmp/agmo-team-state",
+    pane_id: "%7",
+    git_branch: "api-worker-state",
+  });
+  assert.deepEqual(
+    JSON.parse(await readFile(resolveWorkerIdentityPath(teamName, "worker-1", tempRoot), "utf-8")),
+    identityData.identity,
+  );
+});
+
+test("runTeamCommand team api rejects invalid worker state write input", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-write-worker-invalid-"));
+  const teamName = "cli-api-write-worker-invalid-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject invalid worker write API input",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const heartbeatResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "update-worker-heartbeat",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        turn_count: -1,
+        alive: true,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const heartbeatOutput = JSON.parse(heartbeatResult.stdout) as Record<string, unknown>;
+  assert.equal(heartbeatResult.exitCode, 1);
+  assertMachineEnvelope(heartbeatOutput, "update-worker-heartbeat", false);
+  assert.deepEqual(heartbeatOutput.error, {
+    code: "invalid_input",
+    message: "turn_count must be a non-negative integer",
+  });
+
+  const inboxResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-worker-inbox",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1", content: "" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const inboxOutput = JSON.parse(inboxResult.stdout) as Record<string, unknown>;
+  assert.equal(inboxResult.exitCode, 1);
+  assertMachineEnvelope(inboxOutput, "write-worker-inbox", false);
+  assert.deepEqual(inboxOutput.error, {
+    code: "invalid_input",
+    message: "content is required",
+  });
+
+  const identityResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-worker-identity",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1", index: 0, role: "agmo-verifier" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const identityOutput = JSON.parse(identityResult.stdout) as Record<string, unknown>;
+  assert.equal(identityResult.exitCode, 1);
+  assertMachineEnvelope(identityOutput, "write-worker-identity", false);
+  assert.deepEqual(identityOutput.error, {
+    code: "invalid_input",
+    message: "index must be a positive integer",
+  });
+});
+
+test("runTeamCommand team api returns worker_not_found for missing worker state writes", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-write-worker-missing-"));
+  const teamName = "cli-api-write-worker-missing-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject missing worker API state writes",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const cases = [
+    {
+      operation: "update-worker-heartbeat",
+      input: { team_name: teamName, worker: "worker-404", turn_count: 1, alive: true },
+    },
+    {
+      operation: "write-worker-inbox",
+      input: { team_name: teamName, worker: "worker-404", content: "Replacement inbox" },
+    },
+    {
+      operation: "write-worker-identity",
+      input: { team_name: teamName, worker: "worker-404", index: 1, role: "agmo-verifier" },
+    },
+  ];
+
+  for (const { operation, input } of cases) {
+    const result = await captureTeamCommandOutput(
+      ["api", operation, "--input", JSON.stringify(input), "--json"],
+      tempRoot,
+    );
+    const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+    assert.equal(result.exitCode, 1);
+    assertMachineEnvelope(output, operation, false);
+    assert.deepEqual(output.error, {
+      code: "worker_not_found",
+      message: "worker not found: worker-404",
+    });
+    assert.equal("data" in output, false);
+  }
 });
 
 test("runTeamCommand team api sends, lists, and marks mailbox messages delivered", async () => {

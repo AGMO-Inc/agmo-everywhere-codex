@@ -11,6 +11,9 @@ import {
   releaseTaskClaimForWorker,
   sendWorkerMessage,
   updateTeamTask,
+  updateWorkerHeartbeatState,
+  writeWorkerIdentityState,
+  writeWorkerInboxContent,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
@@ -28,6 +31,9 @@ export type TeamApiOperation =
   | "read-manifest"
   | "read-worker-status"
   | "read-worker-heartbeat"
+  | "update-worker-heartbeat"
+  | "write-worker-inbox"
+  | "write-worker-identity"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -207,6 +213,39 @@ function optionalPositiveInteger(input: TeamApiInput, fieldName: string): number
   return value;
 }
 
+function requiredPositiveInteger(input: TeamApiInput, fieldName: string): number | TeamApiError {
+  const value = input[fieldName];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be a positive integer`
+    };
+  }
+  return value;
+}
+
+function requiredNonNegativeInteger(input: TeamApiInput, fieldName: string): number | TeamApiError {
+  const value = input[fieldName];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be a non-negative integer`
+    };
+  }
+  return value;
+}
+
+function requiredBoolean(input: TeamApiInput, fieldName: string): boolean | TeamApiError {
+  const value = input[fieldName];
+  if (typeof value !== "boolean") {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be a boolean`
+    };
+  }
+  return value;
+}
+
 function requiredTaskStatus(input: TeamApiInput, fieldName: string): AgmoTeamTaskStatus | TeamApiError {
   const value = requiredString(input, fieldName);
   if (isTeamApiError(value)) {
@@ -237,6 +276,13 @@ function buildTaskCounts(tasks: Array<{ status: AgmoTeamTaskStatus }>): Record<A
       tasks.filter((task) => task.status === status).length
     ])
   ) as Record<AgmoTeamTaskStatus, number>;
+}
+
+function workerExists(
+  status: Awaited<ReturnType<typeof readTeamStatus>>,
+  worker: string
+): boolean {
+  return Boolean(status?.workers.some((candidate) => candidate.identity.name === worker));
 }
 
 function mapRuntimeError(error: unknown): TeamApiError {
@@ -328,6 +374,134 @@ export async function executeTeamApiOperation(
       return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
     }
     return dataEnvelope(operation, { worker, heartbeat: workerState.heartbeat });
+  }
+
+  if (operation === "update-worker-heartbeat") {
+    const worker = requiredString(input, "worker");
+    const turnCount = requiredNonNegativeInteger(input, "turn_count");
+    const alive = requiredBoolean(input, "alive");
+    const pid = optionalPositiveInteger(input, "pid");
+    const lastTurnAt = optionalString(input, "last_turn_at");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(turnCount)) {
+      return buildTeamApiErrorEnvelope(operation, turnCount.code, turnCount.message);
+    }
+    if (isTeamApiError(alive)) {
+      return buildTeamApiErrorEnvelope(operation, alive.code, alive.message);
+    }
+    if (isTeamApiError(pid)) {
+      return buildTeamApiErrorEnvelope(operation, pid.code, pid.message);
+    }
+    if (isTeamApiError(lastTurnAt)) {
+      return buildTeamApiErrorEnvelope(operation, lastTurnAt.code, lastTurnAt.message);
+    }
+    if (!workerExists(status, worker)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await updateWorkerHeartbeatState(
+          teamName,
+          worker,
+          {
+            turnCount,
+            alive,
+            ...(pid !== undefined ? { pid } : {}),
+            ...(lastTurnAt !== undefined ? { lastTurnAt } : {})
+          },
+          cwd
+        )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "write-worker-inbox") {
+    const worker = requiredString(input, "worker");
+    const content = requiredString(input, "content");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(content)) {
+      return buildTeamApiErrorEnvelope(operation, content.code, content.message);
+    }
+    if (!workerExists(status, worker)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await writeWorkerInboxContent(teamName, worker, content, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "write-worker-identity") {
+    const worker = requiredString(input, "worker");
+    const index = requiredPositiveInteger(input, "index");
+    const role = requiredString(input, "role");
+    const workingDir = optionalString(input, "working_dir");
+    const worktreePath = optionalString(input, "worktree_path");
+    const teamStateRoot = optionalString(input, "team_state_root");
+    const paneId = optionalString(input, "pane_id");
+    const gitBranch = optionalString(input, "git_branch");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(index)) {
+      return buildTeamApiErrorEnvelope(operation, index.code, index.message);
+    }
+    if (isTeamApiError(role)) {
+      return buildTeamApiErrorEnvelope(operation, role.code, role.message);
+    }
+    if (isTeamApiError(workingDir)) {
+      return buildTeamApiErrorEnvelope(operation, workingDir.code, workingDir.message);
+    }
+    if (isTeamApiError(worktreePath)) {
+      return buildTeamApiErrorEnvelope(operation, worktreePath.code, worktreePath.message);
+    }
+    if (isTeamApiError(teamStateRoot)) {
+      return buildTeamApiErrorEnvelope(operation, teamStateRoot.code, teamStateRoot.message);
+    }
+    if (isTeamApiError(paneId)) {
+      return buildTeamApiErrorEnvelope(operation, paneId.code, paneId.message);
+    }
+    if (isTeamApiError(gitBranch)) {
+      return buildTeamApiErrorEnvelope(operation, gitBranch.code, gitBranch.message);
+    }
+    if (!workerExists(status, worker)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await writeWorkerIdentityState(
+          teamName,
+          worker,
+          {
+            index,
+            role,
+            ...(workingDir !== undefined ? { workingDir } : {}),
+            ...(worktreePath !== undefined ? { worktreePath } : {}),
+            ...(teamStateRoot !== undefined ? { teamStateRoot } : {}),
+            ...(paneId !== undefined ? { paneId } : {}),
+            ...(gitBranch !== undefined ? { gitBranch } : {})
+          },
+          cwd
+        )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
   }
 
   if (operation === "send-message") {

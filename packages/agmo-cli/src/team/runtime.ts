@@ -5846,6 +5846,133 @@ export async function heartbeatWorker(
   };
 }
 
+export async function updateWorkerHeartbeatState(
+  teamName: string,
+  workerName: string,
+  heartbeat: {
+    turnCount: number;
+    alive: boolean;
+    pid?: number;
+    lastTurnAt?: string;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const heartbeatPath = resolveWorkerHeartbeatPath(normalizedTeamName, workerName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `update worker heartbeat for ${workerName}`,
+    async () => {
+      await readWorkerIdentity(normalizedTeamName, workerName, cwd);
+      const current =
+        (await readJsonFile<AgmoWorkerHeartbeat>(heartbeatPath)) ??
+        buildDefaultWorkerHeartbeat();
+      const next: AgmoWorkerHeartbeat = {
+        ...current,
+        ...(heartbeat.pid !== undefined ? { pid: heartbeat.pid } : {}),
+        alive: heartbeat.alive,
+        turn_count: heartbeat.turnCount,
+        last_turn_at: heartbeat.lastTurnAt ?? nowIso()
+      };
+      await writeWorkerHeartbeat(normalizedTeamName, workerName, next, cwd);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        path: heartbeatPath,
+        written: true,
+        heartbeat: next
+      };
+    },
+    cwd
+  );
+}
+
+export async function writeWorkerInboxContent(
+  teamName: string,
+  workerName: string,
+  content: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const inboxPath = resolveWorkerInboxPath(normalizedTeamName, workerName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write worker inbox for ${workerName}`,
+    async () => {
+      await readWorkerIdentity(normalizedTeamName, workerName, cwd);
+      await writeTextFile(inboxPath, content);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        path: inboxPath,
+        written: true
+      };
+    },
+    cwd
+  );
+}
+
+export async function writeWorkerIdentityState(
+  teamName: string,
+  workerName: string,
+  identityUpdate: {
+    index: number;
+    role: string;
+    workingDir?: string;
+    worktreePath?: string;
+    teamStateRoot?: string;
+    paneId?: string;
+    gitBranch?: string;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const identityPath = resolveWorkerIdentityPath(normalizedTeamName, workerName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write worker identity for ${workerName}`,
+    async () => {
+      const current = await readWorkerIdentity(normalizedTeamName, workerName, cwd);
+      const next: AgmoWorkerIdentity = {
+        ...current,
+        name: workerName,
+        index: identityUpdate.index,
+        role: identityUpdate.role,
+        ...(identityUpdate.workingDir !== undefined
+          ? { working_dir: identityUpdate.workingDir }
+          : {}),
+        ...(identityUpdate.worktreePath !== undefined
+          ? { worktree_path: identityUpdate.worktreePath }
+          : {}),
+        ...(identityUpdate.teamStateRoot !== undefined
+          ? { team_state_root: identityUpdate.teamStateRoot }
+          : {}),
+        ...(identityUpdate.paneId !== undefined
+          ? { pane_id: identityUpdate.paneId }
+          : {}),
+        ...(identityUpdate.gitBranch !== undefined
+          ? { git_branch: identityUpdate.gitBranch }
+          : {})
+      };
+      await writeJsonFile(identityPath, next);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        path: identityPath,
+        written: true,
+        identity: next
+      };
+    },
+    cwd
+  );
+}
+
 export async function reportWorkerStatus(
   teamName: string,
   workerName: string,
