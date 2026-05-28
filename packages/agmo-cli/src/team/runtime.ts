@@ -5973,6 +5973,70 @@ export async function writeWorkerIdentityState(
   );
 }
 
+export async function appendTeamApiEvent(
+  teamName: string,
+  input: {
+    type: string;
+    worker: string;
+    taskId?: string;
+    messageId?: string | null;
+    reason?: string;
+    state?: string;
+    prevState?: string;
+    toWorker?: string;
+    workerCount?: number;
+    sourceType?: string;
+    metadata?: Record<string, unknown>;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `append event ${input.type}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      const isLeaderEvent = input.worker === "leader" || input.worker === "leader-fixed";
+      if (!isLeaderEvent && !status.workers.some((worker) => worker.identity.name === input.worker)) {
+        throw new Error(`worker not found: ${input.worker}`);
+      }
+
+      const timestamp = nowIso();
+      const event = {
+        event_id: `evt-${randomUUID()}`,
+        team: normalizedTeamName,
+        team_name: normalizedTeamName,
+        type: input.type,
+        worker: input.worker,
+        worker_name: input.worker,
+        ...(input.taskId !== undefined ? { task_id: input.taskId } : {}),
+        ...(input.messageId !== undefined ? { message_id: input.messageId } : {}),
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        ...(input.state !== undefined ? { state: input.state } : {}),
+        ...(input.prevState !== undefined ? { prev_state: input.prevState } : {}),
+        ...(input.toWorker !== undefined ? { to_worker: input.toWorker } : {}),
+        ...(input.workerCount !== undefined ? { worker_count: input.workerCount } : {}),
+        ...(input.sourceType !== undefined ? { source_type: input.sourceType } : {}),
+        ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+        created_at: timestamp,
+        timestamp
+      };
+
+      await writeEvent(normalizedTeamName, event, cwd);
+
+      return {
+        team_name: normalizedTeamName,
+        event
+      };
+    },
+    cwd
+  );
+}
+
 export async function reportWorkerStatus(
   teamName: string,
   workerName: string,

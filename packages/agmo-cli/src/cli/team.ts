@@ -146,6 +146,7 @@ const TEAM_API_OPERATION_NAMES = [
   "update-worker-heartbeat",
   "write-worker-inbox",
   "write-worker-identity",
+  "append-event",
   "read-task",
   "list-tasks",
   "get-summary",

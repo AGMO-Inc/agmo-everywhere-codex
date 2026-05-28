@@ -14,6 +14,7 @@ import {
   updateWorkerHeartbeatState,
   writeWorkerIdentityState,
   writeWorkerInboxContent,
+  appendTeamApiEvent,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
@@ -34,6 +35,7 @@ export type TeamApiOperation =
   | "update-worker-heartbeat"
   | "write-worker-inbox"
   | "write-worker-identity"
+  | "append-event"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -96,6 +98,68 @@ const UPDATE_TASK_LIFECYCLE_FIELDS = [
   "created_at",
   "updated_at"
 ];
+const TEAM_API_EVENT_TYPES = [
+  "task_completed",
+  "task_failed",
+  "worker_state_changed",
+  "worker_idle",
+  "worker_stopped",
+  "message_received",
+  "leader_notification_deferred",
+  "all_workers_idle",
+  "shutdown_ack",
+  "shutdown_gate",
+  "shutdown_gate_forced",
+  "ralph_cleanup_policy",
+  "ralph_cleanup_summary",
+  "approval_decision",
+  "team_leader_nudge",
+  "worker_diff_activity",
+  "worker_diff_report",
+  "worker_merge_report",
+  "worker_merge_conflict",
+  "worker_integration_failed",
+  "worker_integration_attempt_requested",
+  "worker_cherry_pick_detected",
+  "worker_cherry_pick_applied",
+  "worker_cherry_pick_conflict",
+  "worker_rebase_applied",
+  "worker_rebase_conflict",
+  "worker_cross_rebase_applied",
+  "worker_cross_rebase_conflict",
+  "worker_cross_rebase_skipped",
+  "worker_stale_diff",
+  "worker_stale_heartbeat",
+  "worker_stale_stdout",
+  "team_started",
+  "team_shutdown",
+  "shutdown_acknowledged",
+  "leader_escalation_alert",
+  "leader_alert_delivery",
+  "leader_alert_delivery_configured",
+  "team_hud_repaired",
+  "worker_message_sent",
+  "mailbox_message_notified",
+  "mailbox_message_delivered",
+  "dispatch_acknowledged",
+  "dispatch_retry",
+  "task_claim_blocked",
+  "task_claimed",
+  "task_created",
+  "task_updated",
+  "task_claim_released",
+  "worker_heartbeat",
+  "worker_status_reported",
+  "worker_hook_activity",
+  "team_monitor_snapshot",
+  "leader_auto_nudge",
+  "task_claim_reclaimed",
+  "task_rebalanced",
+  "task_integrated",
+  "task_integration_conflict",
+  "task_integration_failed"
+] as const;
+type TeamApiEventType = (typeof TEAM_API_EVENT_TYPES)[number];
 
 export function buildTeamApiErrorEnvelope(
   operation: TeamApiOperation,
@@ -213,6 +277,20 @@ function optionalPositiveInteger(input: TeamApiInput, fieldName: string): number
   return value;
 }
 
+function optionalNonNegativeInteger(input: TeamApiInput, fieldName: string): number | TeamApiError | undefined {
+  const value = input[fieldName];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be a non-negative integer when provided`
+    };
+  }
+  return value;
+}
+
 function requiredPositiveInteger(input: TeamApiInput, fieldName: string): number | TeamApiError {
   const value = input[fieldName];
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
@@ -246,6 +324,37 @@ function requiredBoolean(input: TeamApiInput, fieldName: string): boolean | Team
   return value;
 }
 
+function optionalNullableString(input: TeamApiInput, fieldName: string): string | null | TeamApiError | undefined {
+  const value = input[fieldName];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be a string or null when provided`
+    };
+  }
+  return value;
+}
+
+function optionalRecord(input: TeamApiInput, fieldName: string): Record<string, unknown> | TeamApiError | undefined {
+  const value = input[fieldName];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be an object when provided`
+    };
+  }
+  return value as Record<string, unknown>;
+}
+
 function requiredTaskStatus(input: TeamApiInput, fieldName: string): AgmoTeamTaskStatus | TeamApiError {
   const value = requiredString(input, fieldName);
   if (isTeamApiError(value)) {
@@ -258,6 +367,20 @@ function requiredTaskStatus(input: TeamApiInput, fieldName: string): AgmoTeamTas
     };
   }
   return value as AgmoTeamTaskStatus;
+}
+
+function requiredEventType(input: TeamApiInput, fieldName: string): TeamApiEventType | TeamApiError {
+  const value = requiredString(input, fieldName);
+  if (isTeamApiError(value)) {
+    return value;
+  }
+  if (!TEAM_API_EVENT_TYPES.includes(value as TeamApiEventType)) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be one of: ${TEAM_API_EVENT_TYPES.join(", ")}`
+    };
+  }
+  return value as TeamApiEventType;
 }
 
 function isTeamApiError(value: unknown): value is TeamApiError {
@@ -494,6 +617,82 @@ export async function executeTeamApiOperation(
             ...(teamStateRoot !== undefined ? { teamStateRoot } : {}),
             ...(paneId !== undefined ? { paneId } : {}),
             ...(gitBranch !== undefined ? { gitBranch } : {})
+          },
+          cwd
+        )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "append-event") {
+    const type = requiredEventType(input, "type");
+    const worker = requiredString(input, "worker");
+    const taskId = optionalString(input, "task_id");
+    const messageId = optionalNullableString(input, "message_id");
+    const reason = optionalString(input, "reason");
+    const state = optionalString(input, "state");
+    const prevState = optionalString(input, "prev_state");
+    const toWorker = optionalString(input, "to_worker");
+    const workerCount = optionalNonNegativeInteger(input, "worker_count");
+    const sourceType = optionalString(input, "source_type");
+    const metadata = optionalRecord(input, "metadata");
+    if (isTeamApiError(type)) {
+      return buildTeamApiErrorEnvelope(operation, type.code, type.message);
+    }
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    if (isTeamApiError(messageId)) {
+      return buildTeamApiErrorEnvelope(operation, messageId.code, messageId.message);
+    }
+    if (isTeamApiError(reason)) {
+      return buildTeamApiErrorEnvelope(operation, reason.code, reason.message);
+    }
+    if (isTeamApiError(state)) {
+      return buildTeamApiErrorEnvelope(operation, state.code, state.message);
+    }
+    if (isTeamApiError(prevState)) {
+      return buildTeamApiErrorEnvelope(operation, prevState.code, prevState.message);
+    }
+    if (isTeamApiError(toWorker)) {
+      return buildTeamApiErrorEnvelope(operation, toWorker.code, toWorker.message);
+    }
+    if (isTeamApiError(workerCount)) {
+      return buildTeamApiErrorEnvelope(operation, workerCount.code, workerCount.message);
+    }
+    if (isTeamApiError(sourceType)) {
+      return buildTeamApiErrorEnvelope(operation, sourceType.code, sourceType.message);
+    }
+    if (isTeamApiError(metadata)) {
+      return buildTeamApiErrorEnvelope(operation, metadata.code, metadata.message);
+    }
+    const isLeaderEvent = worker === "leader" || worker === "leader-fixed";
+    if (!isLeaderEvent && !workerExists(status, worker)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await appendTeamApiEvent(
+          teamName,
+          {
+            type,
+            worker,
+            ...(taskId !== undefined ? { taskId } : {}),
+            ...(messageId !== undefined ? { messageId } : {}),
+            ...(reason !== undefined ? { reason } : {}),
+            ...(state !== undefined ? { state } : {}),
+            ...(prevState !== undefined ? { prevState } : {}),
+            ...(toWorker !== undefined ? { toWorker } : {}),
+            ...(workerCount !== undefined ? { workerCount } : {}),
+            ...(sourceType !== undefined ? { sourceType } : {}),
+            ...(metadata !== undefined ? { metadata } : {})
           },
           cwd
         )

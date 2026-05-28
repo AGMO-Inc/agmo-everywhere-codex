@@ -7,6 +7,7 @@ import test from "node:test";
 import { shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
 import {
   resolveTeamDir,
+  resolveTeamEventsPath,
   resolveTeamManifestPath,
   resolveWorkerHeartbeatPath,
   resolveWorkerIdentityPath,
@@ -659,6 +660,146 @@ test("runTeamCommand team api returns worker_not_found for missing worker state 
     });
     assert.equal("data" in output, false);
   }
+});
+
+test("runTeamCommand team api appends strict team events", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-append-event-"));
+  const teamName = "cli-api-append-event-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Append event API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const result = await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        type: "task_completed",
+        worker: "worker-1",
+        task_id: "1",
+        message_id: null,
+        reason: "verified",
+        metadata: { source: "cli-test" },
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+
+  assertMachineEnvelope(result, "append-event");
+  assert.equal(result.command, "team api append-event");
+  const data = result.data as {
+    team_name?: string;
+    event?: {
+      event_id?: string;
+      team?: string;
+      team_name?: string;
+      type?: string;
+      worker?: string;
+      worker_name?: string;
+      task_id?: string;
+      message_id?: string | null;
+      reason?: string;
+      metadata?: Record<string, unknown>;
+      created_at?: string;
+      timestamp?: string;
+    };
+  };
+  assert.equal(data.team_name, teamName);
+  assert.match(data.event?.event_id ?? "", /^evt-/);
+  assert.equal(data.event?.team, teamName);
+  assert.equal(data.event?.team_name, teamName);
+  assert.equal(data.event?.type, "task_completed");
+  assert.equal(data.event?.worker, "worker-1");
+  assert.equal(data.event?.worker_name, "worker-1");
+  assert.equal(data.event?.task_id, "1");
+  assert.equal(data.event?.message_id, null);
+  assert.equal(data.event?.reason, "verified");
+  assert.deepEqual(data.event?.metadata, { source: "cli-test" });
+  assert.match(data.event?.created_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(data.event?.timestamp, data.event?.created_at);
+
+  const eventLines = (await readFile(resolveTeamEventsPath(teamName, tempRoot), "utf-8"))
+    .trim()
+    .split("\n");
+  const persisted = JSON.parse(eventLines[eventLines.length - 1] ?? "{}") as Record<string, unknown>;
+  assert.deepEqual(persisted, data.event);
+});
+
+test("runTeamCommand team api rejects invalid append-event input", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-append-event-invalid-"));
+  const teamName = "cli-api-append-event-invalid-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject invalid append event input",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const invalidTypeResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, type: "not_an_event", worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const invalidType = JSON.parse(invalidTypeResult.stdout) as Record<string, unknown>;
+  assert.equal(invalidTypeResult.exitCode, 1);
+  assertMachineEnvelope(invalidType, "append-event", false);
+  assert.equal((invalidType.error as { code?: string }).code, "invalid_input");
+  assert.match((invalidType.error as { message?: string }).message ?? "", /type must be one of:/);
+
+  const missingWorkerResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, type: "task_completed", worker: "worker-404" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingWorker = JSON.parse(missingWorkerResult.stdout) as Record<string, unknown>;
+  assert.equal(missingWorkerResult.exitCode, 1);
+  assertMachineEnvelope(missingWorker, "append-event", false);
+  assert.deepEqual(missingWorker.error, {
+    code: "worker_not_found",
+    message: "worker not found: worker-404",
+  });
+
+  const invalidMetadataResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, type: "task_completed", worker: "worker-1", metadata: [] }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const invalidMetadata = JSON.parse(invalidMetadataResult.stdout) as Record<string, unknown>;
+  assert.equal(invalidMetadataResult.exitCode, 1);
+  assertMachineEnvelope(invalidMetadata, "append-event", false);
+  assert.deepEqual(invalidMetadata.error, {
+    code: "invalid_input",
+    message: "metadata must be an object when provided",
+  });
 });
 
 test("runTeamCommand team api sends, lists, and marks mailbox messages delivered", async () => {
