@@ -131,6 +131,17 @@ export type AgmoTeamShutdownState = {
   };
 };
 
+export type AgmoTeamTaskApprovalStatus = "pending" | "approved" | "rejected";
+
+export type AgmoTeamTaskApprovalRecord = {
+  task_id: string;
+  required: boolean;
+  status: AgmoTeamTaskApprovalStatus;
+  reviewer: string;
+  decision_reason: string;
+  decided_at: string;
+};
+
 export type AgmoPaneCloseRetryEntry = {
   pane_id: string;
   team_name: string;
@@ -239,6 +250,14 @@ export function resolveTeamPhasePath(teamName: string, cwd = process.cwd()): str
 
 export function resolveTeamTasksDir(teamName: string, cwd = process.cwd()): string {
   return join(resolveTeamDir(teamName, cwd), "tasks");
+}
+
+export function resolveTeamTaskApprovalPath(
+  teamName: string,
+  taskId: string,
+  cwd = process.cwd()
+): string {
+  return join(resolveTeamDir(teamName, cwd), "approvals", `task-${taskId}.json`);
 }
 
 export function resolveTeamTaskPath(

@@ -80,6 +80,7 @@ import {
   resolveTeamPhasePath,
   resolveTeamShutdownPath,
   resolveTeamStateRoot,
+  resolveTeamTaskApprovalPath,
   resolveTeamTaskPath,
   resolveTeamTasksDir,
   resolveWorkerDir,
@@ -100,6 +101,7 @@ import {
   type AgmoTeamHudRepairState,
   type AgmoTeamShutdownAck,
   type AgmoTeamShutdownState,
+  type AgmoTeamTaskApprovalRecord,
   type AgmoWorkerIdentity
 } from "./state/index.js";
 import type {
@@ -6483,6 +6485,138 @@ export async function readTeamApiShutdownAck(
         }
       : null
   };
+}
+
+function normalizeTeamTaskApprovalRecord(
+  taskId: string,
+  raw: unknown
+): AgmoTeamTaskApprovalRecord | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const value = raw as Record<string, unknown>;
+  if (value.task_id !== taskId) {
+    return null;
+  }
+  if (
+    value.status !== "pending" &&
+    value.status !== "approved" &&
+    value.status !== "rejected"
+  ) {
+    return null;
+  }
+  const reviewer = cleanString(value.reviewer);
+  const decisionReason = cleanString(value.decision_reason);
+  const decidedAt = cleanString(value.decided_at);
+  if (!reviewer || !decisionReason || !decidedAt) {
+    return null;
+  }
+
+  return {
+    task_id: taskId,
+    required: value.required !== false,
+    status: value.status,
+    reviewer,
+    decision_reason: decisionReason,
+    decided_at: decidedAt
+  };
+}
+
+export async function readTeamTaskApprovalState(
+  teamName: string,
+  taskId: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.tasks.some((task) => task.id === taskId)) {
+    throw new Error(`task not found: ${taskId}`);
+  }
+
+  const path = resolveTeamTaskApprovalPath(normalizedTeamName, taskId, cwd);
+  const raw = await readJsonFile<Record<string, unknown>>(path);
+  const approval = normalizeTeamTaskApprovalRecord(taskId, raw);
+  return {
+    team_name: normalizedTeamName,
+    task_id: taskId,
+    path,
+    approval
+  };
+}
+
+export async function writeTeamTaskApprovalState(
+  teamName: string,
+  input: {
+    taskId: string;
+    required: boolean;
+    status: AgmoTeamTaskApprovalRecord["status"];
+    reviewer: string;
+    decisionReason: string;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const path = resolveTeamTaskApprovalPath(normalizedTeamName, input.taskId, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write task approval for ${input.taskId}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      if (!status.tasks.some((task) => task.id === input.taskId)) {
+        throw new Error(`task not found: ${input.taskId}`);
+      }
+      const reviewerIsLeader = input.reviewer === "leader" || input.reviewer === "leader-fixed";
+      if (
+        !reviewerIsLeader &&
+        !status.workers.some((worker) => worker.identity.name === input.reviewer)
+      ) {
+        throw new Error(`worker not found: ${input.reviewer}`);
+      }
+
+      const approval: AgmoTeamTaskApprovalRecord = {
+        task_id: input.taskId,
+        required: input.required,
+        status: input.status,
+        reviewer: input.reviewer,
+        decision_reason: input.decisionReason,
+        decided_at: nowIso()
+      };
+
+      await Promise.all([
+        writeJsonFile(path, approval),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp: approval.decided_at,
+            type: "approval_decision",
+            team_name: normalizedTeamName,
+            worker_name: input.reviewer,
+            worker: input.reviewer,
+            task_id: input.taskId,
+            status: input.status,
+            required: input.required,
+            reason: `${input.status}:${input.decisionReason}`
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        task_id: input.taskId,
+        path,
+        approval
+      };
+    },
+    cwd
+  );
 }
 
 export async function reportWorkerStatus(

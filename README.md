@@ -312,7 +312,7 @@ Machine-oriented JSON commands keep existing `command` fields and add a stable e
 `schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
 Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo team` commands,
 and JSON-producing `agmo vault` commands.
-For machine interop, `agmo team api <send-message|broadcast|mailbox-list|mailbox-mark-delivered|mailbox-mark-notified|create-task|update-task|release-task-claim|read-config|read-manifest|read-worker-status|read-worker-heartbeat|update-worker-heartbeat|write-worker-inbox|write-worker-identity|append-event|read-events|await-event|read-monitor-snapshot|write-monitor-snapshot|write-shutdown-request|read-shutdown-ack|read-idle-state|read-stall-state|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json`
+For machine interop, `agmo team api <send-message|broadcast|mailbox-list|mailbox-mark-delivered|mailbox-mark-notified|create-task|update-task|release-task-claim|read-config|read-manifest|read-worker-status|read-worker-heartbeat|update-worker-heartbeat|write-worker-inbox|write-worker-identity|append-event|read-events|await-event|read-monitor-snapshot|write-monitor-snapshot|write-shutdown-request|read-shutdown-ack|read-idle-state|read-stall-state|read-task-approval|write-task-approval|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json`
 returns an OMC-style envelope with either `data` or `error`; lifecycle mutation is limited to claim-safe
 claim/release and `in_progress -> completed|failed` terminal transitions. Mailbox operations expose durable
 message send/list/mark state and worker inbox replacement. Worker heartbeat and identity writes use durable
@@ -320,8 +320,8 @@ team state files, while event APIs append, read, and await canonical durable tea
 snapshot APIs expose the durable `monitor-snapshot.json` file without requiring consumers to tail tmux panes.
 Shutdown handshake APIs write durable request state and read worker acknowledgements without finalizing the
 team or closing panes. Idle/stall APIs derive leader-facing state from durable worker status, heartbeats,
-tasks, dispatch, and events. Task creation uses durable numeric IDs and `list-tasks`/`read-task` include
-dynamically created task files.
+tasks, dispatch, and events. Task approval APIs persist reviewer decisions and append approval events.
+Task creation uses durable numeric IDs and `list-tasks`/`read-task` include dynamically created task files.
 
 ### Operational features
 

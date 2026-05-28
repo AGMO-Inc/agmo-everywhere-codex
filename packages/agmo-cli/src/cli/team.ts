@@ -155,6 +155,8 @@ const TEAM_API_OPERATION_NAMES = [
   "read-shutdown-ack",
   "read-idle-state",
   "read-stall-state",
+  "read-task-approval",
+  "write-task-approval",
   "read-task",
   "list-tasks",
   "get-summary",

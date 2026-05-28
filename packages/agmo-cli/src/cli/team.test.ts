@@ -12,6 +12,7 @@ import {
   resolveTeamManifestPath,
   resolveTeamMonitorSnapshotPath,
   resolveTeamShutdownPath,
+  resolveTeamTaskApprovalPath,
   resolveWorkerHeartbeatPath,
   resolveWorkerIdentityPath,
   resolveWorkerInboxPath,
@@ -1592,6 +1593,189 @@ test("runTeamCommand team api reads stall state from durable heartbeats and disp
   assert.equal(data.source?.summary_available, true);
   assert.equal(data.source?.phase_available, true);
   assert.ok((data.source?.recent_event_count ?? 0) >= 1);
+});
+
+test("runTeamCommand team api reads and writes task approvals", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-task-approval-"));
+  const teamName = "cli-api-task-approval-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose task approval API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const missing = await captureTeamCommand(
+    [
+      "api",
+      "read-task-approval",
+      "--input",
+      JSON.stringify({ team_name: teamName, task_id: "1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(missing, "read-task-approval");
+  assert.equal((missing.data as { approval?: unknown }).approval, null);
+
+  const write = await captureTeamCommand(
+    [
+      "api",
+      "write-task-approval",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        required: false,
+        status: "approved",
+        reviewer: "leader-fixed",
+        decision_reason: "plan is verified",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(write, "write-task-approval");
+  const writeData = write.data as {
+    approval?: {
+      task_id?: string;
+      required?: boolean;
+      status?: string;
+      reviewer?: string;
+      decision_reason?: string;
+      decided_at?: string;
+    };
+  };
+  assert.deepEqual(
+    {
+      task_id: writeData.approval?.task_id,
+      required: writeData.approval?.required,
+      status: writeData.approval?.status,
+      reviewer: writeData.approval?.reviewer,
+      decision_reason: writeData.approval?.decision_reason,
+    },
+    {
+      task_id: "1",
+      required: false,
+      status: "approved",
+      reviewer: "leader-fixed",
+      decision_reason: "plan is verified",
+    },
+  );
+  assert.match(writeData.approval?.decided_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(
+    JSON.parse(await readFile(resolveTeamTaskApprovalPath(teamName, "1", tempRoot), "utf-8")),
+    writeData.approval,
+  );
+
+  const read = await captureTeamCommand(
+    [
+      "api",
+      "read-task-approval",
+      "--input",
+      JSON.stringify({ team_name: teamName, task_id: "1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(read, "read-task-approval");
+  assert.deepEqual((read.data as { approval?: unknown }).approval, writeData.approval);
+
+  const eventLines = (await readFile(resolveTeamEventsPath(teamName, tempRoot), "utf-8"))
+    .trim()
+    .split("\n");
+  const approvalEvent = eventLines
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((event) => event.type === "approval_decision");
+  assert.equal(approvalEvent?.worker, "leader-fixed");
+  assert.equal(approvalEvent?.task_id, "1");
+  assert.equal(approvalEvent?.status, "approved");
+  assert.equal(approvalEvent?.reason, "approved:plan is verified");
+});
+
+test("runTeamCommand team api rejects invalid task approval input", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-task-approval-invalid-"));
+  const teamName = "cli-api-task-approval-invalid-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject invalid task approval API input",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const invalidStatusResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-task-approval",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        status: "maybe",
+        reviewer: "leader-fixed",
+        decision_reason: "invalid",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const invalidStatus = JSON.parse(invalidStatusResult.stdout) as Record<string, unknown>;
+  assert.equal(invalidStatusResult.exitCode, 1);
+  assertMachineEnvelope(invalidStatus, "write-task-approval", false);
+  assert.deepEqual(invalidStatus.error, {
+    code: "invalid_input",
+    message: "status must be one of: pending, approved, rejected",
+  });
+
+  const missingTaskResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "read-task-approval",
+      "--input",
+      JSON.stringify({ team_name: teamName, task_id: "404" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingTask = JSON.parse(missingTaskResult.stdout) as Record<string, unknown>;
+  assert.equal(missingTaskResult.exitCode, 1);
+  assertMachineEnvelope(missingTask, "read-task-approval", false);
+  assert.deepEqual(missingTask.error, {
+    code: "task_not_found",
+    message: "task not found: 404",
+  });
+
+  const missingReviewerResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-task-approval",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        status: "approved",
+        reviewer: "worker-404",
+        decision_reason: "unknown reviewer",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingReviewer = JSON.parse(missingReviewerResult.stdout) as Record<string, unknown>;
+  assert.equal(missingReviewerResult.exitCode, 1);
+  assertMachineEnvelope(missingReviewer, "write-task-approval", false);
+  assert.deepEqual(missingReviewer.error, {
+    code: "worker_not_found",
+    message: "worker not found: worker-404",
+  });
 });
 
 test("runTeamCommand team api sends, lists, and marks mailbox messages delivered", async () => {

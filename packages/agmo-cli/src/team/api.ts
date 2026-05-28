@@ -21,6 +21,8 @@ import {
   writeTeamApiMonitorSnapshot,
   readTeamApiShutdownAck,
   writeTeamApiShutdownRequest,
+  readTeamTaskApprovalState,
+  writeTeamTaskApprovalState,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
@@ -50,6 +52,8 @@ export type TeamApiOperation =
   | "read-shutdown-ack"
   | "read-idle-state"
   | "read-stall-state"
+  | "read-task-approval"
+  | "write-task-approval"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -90,6 +94,8 @@ const TASK_STATUSES: AgmoTeamTaskStatus[] = [
   "completed",
   "failed"
 ];
+const TASK_APPROVAL_STATUSES = ["pending", "approved", "rejected"] as const;
+type TeamTaskApprovalStatus = (typeof TASK_APPROVAL_STATUSES)[number];
 const UPDATE_TASK_MUTABLE_FIELDS = new Set([
   "team_name",
   "task_id",
@@ -415,6 +421,20 @@ function requiredTaskStatus(input: TeamApiInput, fieldName: string): AgmoTeamTas
     };
   }
   return value as AgmoTeamTaskStatus;
+}
+
+function requiredTaskApprovalStatus(input: TeamApiInput, fieldName: string): TeamTaskApprovalStatus | TeamApiError {
+  const value = requiredString(input, fieldName);
+  if (isTeamApiError(value)) {
+    return value;
+  }
+  if (!TASK_APPROVAL_STATUSES.includes(value as TeamTaskApprovalStatus)) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be one of: ${TASK_APPROVAL_STATUSES.join(", ")}`
+    };
+  }
+  return value as TeamTaskApprovalStatus;
 }
 
 function requiredEventType(input: TeamApiInput, fieldName: string): TeamApiEventType | TeamApiError {
@@ -1154,6 +1174,74 @@ export async function executeTeamApiOperation(
         operation === "read-idle-state"
           ? idleState
           : buildStallStateData(teamName, status, idleState, events, snapshotAvailable)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "read-task-approval") {
+    const taskId = requiredString(input, "task_id");
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    if (!status.tasks.some((task) => task.id === taskId)) {
+      return buildTeamApiErrorEnvelope(operation, "task_not_found", `task not found: ${taskId}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await readTeamTaskApprovalState(teamName, taskId, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "write-task-approval") {
+    const taskId = requiredString(input, "task_id");
+    const approvalStatus = requiredTaskApprovalStatus(input, "status");
+    const reviewer = requiredString(input, "reviewer");
+    const decisionReason = requiredString(input, "decision_reason");
+    const required = optionalBoolean(input, "required");
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    if (isTeamApiError(approvalStatus)) {
+      return buildTeamApiErrorEnvelope(operation, approvalStatus.code, approvalStatus.message);
+    }
+    if (isTeamApiError(reviewer)) {
+      return buildTeamApiErrorEnvelope(operation, reviewer.code, reviewer.message);
+    }
+    if (isTeamApiError(decisionReason)) {
+      return buildTeamApiErrorEnvelope(operation, decisionReason.code, decisionReason.message);
+    }
+    if (isTeamApiError(required)) {
+      return buildTeamApiErrorEnvelope(operation, required.code, required.message);
+    }
+    if (!status.tasks.some((task) => task.id === taskId)) {
+      return buildTeamApiErrorEnvelope(operation, "task_not_found", `task not found: ${taskId}`);
+    }
+    const reviewerIsLeader = reviewer === "leader" || reviewer === "leader-fixed";
+    if (!reviewerIsLeader && !workerExists(status, reviewer)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${reviewer}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await writeTeamTaskApprovalState(
+          teamName,
+          {
+            taskId,
+            status: approvalStatus,
+            reviewer,
+            decisionReason,
+            required: required ?? true
+          },
+          cwd
+        )
       );
     } catch (error) {
       const mapped = mapRuntimeError(error);
