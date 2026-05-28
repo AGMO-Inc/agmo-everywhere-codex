@@ -6,6 +6,7 @@ import {
   buildLeaderMonitorView,
   configureLeaderAlertDelivery,
   deliverLeaderAlerts,
+  deleteTeamRuntime,
   evaluateLeaderEscalations,
   rebalanceTeamAssignments,
   claimTaskForWorker,
@@ -31,16 +32,28 @@ import {
   shutdownTeamRuntime,
   startTeamRuntime
 } from "../team/runtime.js";
-import { resolveTeamMonitorPolicyPath } from "../team/state/index.js";
+import {
+  assertCanonicalTeamName,
+  resolveTeamMonitorPolicyPath
+} from "../team/state/index.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
-import { ellipsize } from "../team/terminal-format.js";
+import { machineJsonEnvelope, uniqueRecommendedActions } from "../utils/machine-json.js";
+import {
+  buildTeamApiErrorEnvelope,
+  executeTeamApiOperation,
+  type TeamApiOperation
+} from "../team/api.js";
+import { ellipsize, fitLines } from "../team/terminal-format.js";
 
 function parseWorkerCount(value: string | undefined): number {
+  if (!value || !/^\d+$/.test(value)) {
+    throw new Error("worker count must be an integer between 1 and 20");
+  }
   const parsed = Number.parseInt(value ?? "", 10);
-  if (!Number.isInteger(parsed)) {
-    throw new Error("worker count must be an integer");
+  if (parsed < 1 || parsed > 20) {
+    throw new Error("worker count must be an integer between 1 and 20");
   }
   return parsed;
 }
@@ -49,6 +62,9 @@ function parseIntegerOption(args: string[], optionName: string): number | undefi
   const raw = parseOption(args, optionName);
   if (!raw) {
     return undefined;
+  }
+  if (!/^-?\d+$/.test(raw)) {
+    throw new Error(`${optionName} must be an integer`);
   }
 
   const parsed = Number.parseInt(raw, 10);
@@ -59,15 +75,14 @@ function parseIntegerOption(args: string[], optionName: string): number | undefi
   return parsed;
 }
 
-function parseStrictIntegerOption(args: string[], optionName: string): number | undefined {
-  const raw = parseOption(args, optionName);
-  if (!raw) {
-    return undefined;
+function assertMinimumOption(
+  value: number | undefined,
+  optionName: string,
+  minimum: number
+): void {
+  if (value !== undefined && value < minimum) {
+    throw new Error(`${optionName} must be at least ${minimum}`);
   }
-  if (!/^-?\d+$/.test(raw)) {
-    throw new Error(`${optionName} must be an integer`);
-  }
-  return Number.parseInt(raw, 10);
 }
 
 function parseBooleanFlag(
@@ -90,14 +105,14 @@ function parseBooleanFlag(
   return undefined;
 }
 
-function parseHudPreset(value: string | undefined): "minimal" | "focused" | "full" | undefined {
+function parseHudPreset(value: string | undefined): "minimal" | "sidecar" | "focused" | "full" | undefined {
   if (!value) {
     return undefined;
   }
-  if (value === "minimal" || value === "focused" || value === "full") {
+  if (value === "minimal" || value === "sidecar" || value === "focused" || value === "full") {
     return value;
   }
-  throw new Error("--preset must be one of: minimal, focused, full");
+  throw new Error("--preset must be one of: minimal, sidecar, focused, full");
 }
 
 function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined {
@@ -115,6 +130,67 @@ function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined
   return undefined;
 }
 
+const TEAM_API_OPERATION_NAMES = [
+  "send-message",
+  "broadcast",
+  "mailbox-list",
+  "mailbox-mark-delivered",
+  "mailbox-mark-notified",
+  "create-task",
+  "update-task",
+  "release-task-claim",
+  "read-config",
+  "read-manifest",
+  "read-worker-status",
+  "read-worker-heartbeat",
+  "update-worker-heartbeat",
+  "write-worker-inbox",
+  "write-worker-identity",
+  "append-event",
+  "read-events",
+  "await-event",
+  "read-monitor-snapshot",
+  "write-monitor-snapshot",
+  "write-shutdown-request",
+  "read-shutdown-ack",
+  "read-idle-state",
+  "read-stall-state",
+  "read-task-approval",
+  "write-task-approval",
+  "read-task",
+  "list-tasks",
+  "get-summary",
+  "cleanup",
+  "orphan-cleanup",
+  "claim-task",
+  "transition-task-status"
+] as const satisfies readonly TeamApiOperation[];
+
+const TEAM_API_OPERATION_USAGE = TEAM_API_OPERATION_NAMES.join("|");
+
+function parseTeamApiOperation(value: string | undefined): TeamApiOperation {
+  if (TEAM_API_OPERATION_NAMES.includes(value as TeamApiOperation)) {
+    return value as TeamApiOperation;
+  }
+  throw new Error(
+    `usage: agmo team api <${TEAM_API_OPERATION_USAGE}> --input '<json>' --json`
+  );
+}
+
+function parseTeamApiInput(args: string[]): { input?: string; error?: string } {
+  let input: string | undefined;
+  try {
+    input = parseOption(args, "--input");
+  } catch (error) {
+    return { error: errorMessage(error) };
+  }
+  const remaining = removeOption(args, "--input").filter((arg) => arg !== "--json");
+  if (remaining.length > 0) {
+    return { error: `unknown team api option: ${remaining[0]}` };
+  }
+  return { input };
+}
+
 function parseRoleMapOption(value: string | undefined): Record<string, string> | undefined {
   if (!value?.trim()) {
     return undefined;
@@ -130,6 +206,9 @@ function parseRoleMapOption(value: string | undefined): Record<string, string> |
     if (!workerName || !role) {
       throw new Error("--role-map must look like worker-1=agmo-planner,worker-2=agmo-executor");
     }
+    if (Object.hasOwn(output, workerName)) {
+      throw new Error(`--role-map repeats ${workerName}`);
+    }
     output[workerName] = role;
   }
   return Object.keys(output).length > 0 ? output : undefined;
@@ -139,14 +218,197 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type TeamHudWatchLoopStreams = {
+  stdout: Pick<NodeJS.WriteStream, "write">;
+  stderr: Pick<NodeJS.WriteStream, "write">;
+};
+
+type TeamHudSignalProcess = {
+  on(signal: "SIGINT", handler: () => void): unknown;
+  off(signal: "SIGINT", handler: () => void): unknown;
+};
+
+type TeamHudWatchLoopOptions = {
+  watch: boolean;
+  clearScreen: boolean;
+  iterations?: number;
+  intervalMs: number;
+  renderFrame: () => Promise<string>;
+  sleepFn?: (ms: number) => Promise<void>;
+  streams?: TeamHudWatchLoopStreams;
+  signalProcess?: TeamHudSignalProcess;
+};
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
+type TeamStatusSnapshot = NonNullable<Awaited<ReturnType<typeof readTeamStatus>>>;
+type TeamTmuxHealthSummary = NonNullable<
+  Awaited<ReturnType<typeof readTeamTmuxHealthSummary>>
+>;
+
+function buildTeamStatusRecommendedActions(
+  teamName: string,
+  status: TeamStatusSnapshot | null,
+  tmuxHealth: TeamTmuxHealthSummary | null
+): string[] {
+  if (!status) {
+    return [`team start <workers> "<task>" --name ${teamName}`];
+  }
+
+  return uniqueRecommendedActions([
+    !status.config.active || !status.phase.active
+      ? `team delete ${teamName} --dry-run`
+      : undefined,
+    tmuxHealth?.layout === "repairable" ? `team layout repair ${teamName}` : undefined,
+    tmuxHealth?.layout === "degraded" ? `team layout rebalance ${teamName} --dry-run` : undefined,
+    (tmuxHealth?.retry_pending ?? 0) > 0 ||
+    (tmuxHealth?.retry_manual_required ?? 0) > 0 ||
+    (tmuxHealth?.orphan_warnings.length ?? 0) > 0
+      ? "team cleanup-stale --retry-pane-closes --sweep-tmux"
+      : undefined
+  ]);
+}
+
+function teamCommandOperation(command: string): string {
+  return command.replace(/^team\s+/, "team.").replace(/\s+/g, ".");
+}
+
+function printTeamMachineJson(
+  command: string,
+  payload: Record<string, unknown>,
+  options: { ok?: boolean } = {}
+): void {
+  console.log(
+    JSON.stringify(
+      machineJsonEnvelope(teamCommandOperation(command), options.ok ?? true, {
+        command,
+        ...payload
+      }),
+      null,
+      2
+    )
+  );
+}
+
+function printTeamMachineJsonPayload(
+  payload: Record<string, unknown> & { command: string },
+  options: { ok?: boolean } = {}
+): void {
+  console.log(
+    JSON.stringify(
+      machineJsonEnvelope(teamCommandOperation(payload.command), options.ok ?? true, payload),
+      null,
+      2
+    )
+  );
+}
+
+function boundedWatchErrorLine(error: unknown, width = 200): string {
+  const sanitized = errorMessage(error).replace(/\s+/g, " ").trim();
+  return ellipsize(`watch render error: ${sanitized}`, width);
+}
+
+export async function runTeamHudWatchLoop({
+  watch,
+  clearScreen,
+  iterations,
+  intervalMs,
+  renderFrame,
+  sleepFn = sleep,
+  streams = { stdout: process.stdout, stderr: process.stderr },
+  signalProcess = process
+}: TeamHudWatchLoopOptions): Promise<void> {
+  let previousText: string | null = null;
+  let previousHeight = 0;
+  let stdoutEndsCleanly = true;
+  let interrupted = false;
+
+  const writeStdout = (text: string): void => {
+    streams.stdout.write(text);
+    stdoutEndsCleanly = text.endsWith("\n");
+  };
+  const ensureFinalStdoutNewline = (): void => {
+    if (!stdoutEndsCleanly) {
+      streams.stdout.write("\n");
+      stdoutEndsCleanly = true;
+    }
+  };
+  const handleSigint = (): void => {
+    interrupted = true;
+  };
+
+  if (watch) {
+    signalProcess.on("SIGINT", handleSigint);
+  }
+
+  try {
+    const maxIterations = watch ? iterations ?? Number.POSITIVE_INFINITY : 1;
+    for (let index = 0; index < maxIterations && !interrupted; index += 1) {
+      let outputText: string;
+      try {
+        outputText = await renderFrame();
+      } catch (error) {
+        ensureFinalStdoutNewline();
+        if (watch) {
+          streams.stderr.write(`${boundedWatchErrorLine(error)}\n`);
+        }
+        throw error;
+      }
+
+      if (watch && clearScreen && outputText === previousText) {
+        if (index + 1 < maxIterations && !interrupted) {
+          await sleepFn(intervalMs);
+        }
+        continue;
+      }
+
+      if (watch && clearScreen) {
+        const nextHeight = outputText.split("\n").length;
+        writeStdout("\x1b[H\x1b[2J");
+        if (previousHeight > nextHeight) {
+          writeStdout("\x1b[J");
+        }
+        previousHeight = nextHeight;
+      }
+      previousText = outputText;
+      writeStdout(`${outputText}\n`);
+
+      if (index + 1 < maxIterations && !interrupted) {
+        await sleepFn(intervalMs);
+      }
+    }
+  } finally {
+    if (watch) {
+      signalProcess.off("SIGINT", handleSigint);
+    }
+    ensureFinalStdoutNewline();
+  }
+}
+
 function parseOption(args: string[], optionName: string): string | undefined {
   const exactIndex = args.findIndex((arg) => arg === optionName);
   if (exactIndex >= 0) {
-    return args[exactIndex + 1];
+    const value = args[exactIndex + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error(`${optionName} requires a value`);
+    }
+    return value;
   }
 
   const inline = args.find((arg) => arg.startsWith(`${optionName}=`));
-  return inline ? inline.slice(optionName.length + 1) : undefined;
+  if (!inline) {
+    return undefined;
+  }
+  const value = inline.slice(optionName.length + 1);
+  if (!value) {
+    throw new Error(`${optionName} requires a value`);
+  }
+  return value;
 }
 
 function removeOption(args: string[], optionName: string): string[] {
@@ -184,10 +446,23 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   const cwd = resolveRuntimeRoot();
 
   switch (subcommand) {
+    case "api": {
+      const operation = parseTeamApiOperation(args[1]);
+      const parsedInput = parseTeamApiInput(args.slice(2));
+      const envelope = parsedInput.error
+        ? buildTeamApiErrorEnvelope(operation, "invalid_input", parsedInput.error)
+        : await executeTeamApiOperation(operation, parsedInput.input, cwd);
+      console.log(JSON.stringify(envelope, null, 2));
+      if (!envelope.ok) {
+        process.exitCode = 1;
+      }
+      return;
+    }
     case "start": {
       parseScopeFlag(args.slice(1));
       const workers = parseWorkerCount(args[1]);
       const hudRefreshMs = parseIntegerOption(args.slice(2), "--hud-refresh-ms");
+      assertMinimumOption(hudRefreshMs, "--hud-refresh-ms", 250);
       const hudClearScreen = parseBooleanFlag(args.slice(2), "--hud-clear", "--hud-no-clear");
       const allocationIntent = parseOption(args.slice(2), "--allocation-intent");
       const roleOverrides = parseRoleMapOption(parseOption(args.slice(2), "--role-map"));
@@ -218,6 +493,9 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
       }
       const teamName = parseOption(args.slice(2), "--name");
+      if (teamName !== undefined) {
+        assertCanonicalTeamName(teamName, "--name");
+      }
       const result = await startTeamRuntime({
         teamName,
         workerCount: workers,
@@ -238,13 +516,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             : undefined,
         roleOverrides
       }, cwd);
-      console.log(
-        JSON.stringify(
-          { command: "team start", ...result },
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team start", result);
       return;
     }
     case "status": {
@@ -254,18 +526,17 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       }
       const status = await readTeamStatus(teamName, cwd);
       const tmuxHealth = status ? await readTeamTmuxHealthSummary(teamName, cwd) : null;
-      console.log(
-        JSON.stringify(
-          {
-            command: "team status",
-            team_name: teamName,
-            found: Boolean(status),
-            tmux_health: tmuxHealth,
-            status
-          },
-          null,
-          2
-        )
+      const recommendedActions = buildTeamStatusRecommendedActions(teamName, status, tmuxHealth);
+      printTeamMachineJson(
+        "team status",
+        {
+          team_name: teamName,
+          found: Boolean(status),
+          recommended_actions: recommendedActions,
+          tmux_health: tmuxHealth,
+          status
+        },
+        { ok: Boolean(status) && recommendedActions.length === 0 }
       );
       return;
     }
@@ -289,7 +560,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team shutdown-ack", ...result }, null, 2));
+      printTeamMachineJson("team shutdown-ack", result);
       return;
     }
     case "shutdown": {
@@ -302,18 +573,38 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("--grace-ms must be at least 0");
       }
       const result = await shutdownTeamRuntime(teamName, { graceMs }, cwd);
-      console.log(
-        JSON.stringify(
-          { command: "team shutdown", ...result },
-          null,
-          2
-        )
+      printTeamMachineJson("team shutdown", result);
+      return;
+    }
+    case "delete": {
+      const teamName = args[1];
+      if (!teamName) {
+        throw new Error(
+          "usage: agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]"
+        );
+      }
+      const keepWorktrees = args.slice(2).includes("--keep-worktrees");
+      const removeWorktrees = args.slice(2).includes("--remove-worktrees");
+      if (keepWorktrees && removeWorktrees) {
+        throw new Error("cannot use both --keep-worktrees and --remove-worktrees");
+      }
+      const result = await deleteTeamRuntime(
+        teamName,
+        {
+          force: args.slice(2).includes("--force"),
+          dryRun: args.slice(2).includes("--dry-run"),
+          keepWorktrees
+        },
+        cwd
       );
+      printTeamMachineJson("team delete", result);
       return;
     }
     case "cleanup-stale": {
       const staleAfterMs = parseIntegerOption(args.slice(1), "--stale-ms");
       const deadAfterMs = parseIntegerOption(args.slice(1), "--dead-ms");
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
       const includeStale = parseBooleanFlag(
         args.slice(1),
         "--include-stale",
@@ -337,7 +628,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team cleanup-stale", ...result }, null, 2));
+      printTeamMachineJson("team cleanup-stale", {
+        recommended_actions: [],
+        ...result
+      });
       return;
     }
     case "send": {
@@ -347,7 +641,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team send <team> <worker> \"<message>\"");
       }
       const result = await sendWorkerMessage(teamName, workerName, message, cwd);
-      console.log(JSON.stringify({ command: "team send", ...result }, null, 2));
+      printTeamMachineJson("team send", result);
       return;
     }
     case "claim": {
@@ -364,7 +658,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team claim", ...result }, null, 2));
+      printTeamMachineJson("team claim", result);
       return;
     }
     case "complete": {
@@ -377,6 +671,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const autoIntegrate = args.slice(1).includes("--auto-integrate");
       const integrateStrategy = parseOption(args.slice(1), "--integrate-strategy");
       const integrateMaxCommits = parseIntegerOption(args.slice(1), "--integrate-max-commits");
+      assertMinimumOption(integrateMaxCommits, "--integrate-max-commits", 1);
       const integrateOnConflict = parseOption(args.slice(1), "--integrate-on-conflict");
       const integrateOnEmpty = parseOption(args.slice(1), "--integrate-on-empty");
       const integrateTargetRef = parseOption(args.slice(1), "--integrate-target-ref");
@@ -439,17 +734,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             cwd
           )
         : null;
-      console.log(
-        JSON.stringify(
-          {
-            command: "team complete",
-            ...result,
-            ...(integration ? { integration } : {})
-          },
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team complete", {
+        ...result,
+        ...(integration ? { integration } : {})
+      });
       return;
     }
     case "fail": {
@@ -464,7 +752,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         errorParts.join(" ").trim() || undefined,
         cwd
       );
-      console.log(JSON.stringify({ command: "team fail", ...result }, null, 2));
+      printTeamMachineJson("team fail", result);
       return;
     }
     case "heartbeat": {
@@ -473,7 +761,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team heartbeat <team> <worker>");
       }
       const result = await heartbeatWorker(teamName, workerName, cwd);
-      console.log(JSON.stringify({ command: "team heartbeat", ...result }, null, 2));
+      printTeamMachineJson("team heartbeat", result);
       return;
     }
     case "report": {
@@ -495,7 +783,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         { taskId, note },
         cwd
       );
-      console.log(JSON.stringify({ command: "team report", ...result }, null, 2));
+      printTeamMachineJson("team report", result);
       return;
     }
     case "monitor": {
@@ -506,8 +794,8 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
       }
       const preset = parseOption(args.slice(2), "--preset");
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
       const autoNudgeOverride = parseBooleanFlag(
         args.slice(2),
         "--auto-nudge",
@@ -550,51 +838,24 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       );
       const leaderView = args.slice(2).includes("--leader-view");
       const repairHud = args.slice(2).includes("--repair-hud");
-      const cooldownRaw = parseOption(args.slice(2), "--nudge-cooldown-ms");
-      const reclaimLeaseRaw = parseOption(args.slice(2), "--reclaim-lease-ms");
-      const leaderAlertCooldownRaw = parseOption(args.slice(2), "--leader-alert-cooldown-ms");
-      const escalationRepeatThresholdRaw = parseOption(
+      const cooldownMs = parseIntegerOption(args.slice(2), "--nudge-cooldown-ms");
+      const reclaimLeaseMs = parseIntegerOption(args.slice(2), "--reclaim-lease-ms");
+      const leaderAlertCooldownMs = parseIntegerOption(args.slice(2), "--leader-alert-cooldown-ms");
+      const escalationRepeatThreshold = parseIntegerOption(
         args.slice(2),
         "--escalation-repeat-threshold"
       );
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      const cooldownMs = cooldownRaw ? Number.parseInt(cooldownRaw, 10) : undefined;
-      const reclaimLeaseMs = reclaimLeaseRaw
-        ? Number.parseInt(reclaimLeaseRaw, 10)
-        : undefined;
-      const leaderAlertCooldownMs = leaderAlertCooldownRaw
-        ? Number.parseInt(leaderAlertCooldownRaw, 10)
-        : undefined;
-      const escalationRepeatThreshold = escalationRepeatThresholdRaw
-        ? Number.parseInt(escalationRepeatThresholdRaw, 10)
-        : undefined;
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(cooldownMs, "--nudge-cooldown-ms", 0);
+      assertMinimumOption(reclaimLeaseMs, "--reclaim-lease-ms", 0);
+      assertMinimumOption(leaderAlertCooldownMs, "--leader-alert-cooldown-ms", 0);
+      assertMinimumOption(escalationRepeatThreshold, "--escalation-repeat-threshold", 1);
       if (
         preset &&
         !["observe", "conservative", "balanced", "aggressive"].includes(preset)
       ) {
         throw new Error("--preset must be: observe, conservative, balanced, aggressive");
-      }
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (cooldownRaw && !Number.isFinite(cooldownMs)) {
-        throw new Error("--nudge-cooldown-ms must be an integer");
-      }
-      if (reclaimLeaseRaw && !Number.isFinite(reclaimLeaseMs)) {
-        throw new Error("--reclaim-lease-ms must be an integer");
-      }
-      if (leaderAlertCooldownRaw && !Number.isFinite(leaderAlertCooldownMs)) {
-        throw new Error("--leader-alert-cooldown-ms must be an integer");
-      }
-      if (
-        escalationRepeatThresholdRaw &&
-        !Number.isFinite(escalationRepeatThreshold)
-      ) {
-        throw new Error("--escalation-repeat-threshold must be an integer");
       }
       const policy = resolveMonitorPolicy({
         preset:
@@ -703,24 +964,17 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
         process.stdout.write(`${leaderMonitor.markdown}\n`);
       } else {
-        console.log(
-          JSON.stringify(
-            {
-              command: "team monitor",
-              policy: effectivePolicy,
-              snapshot: finalSnapshot,
-              ...(leaderAlerts ? { leader_alerts: leaderAlerts.alerts } : {}),
-              ...(leaderAlertDelivery
-                ? { leader_alert_delivery: leaderAlertDelivery }
-                : {}),
-              ...(autoNudges ? { auto_nudges: autoNudges.nudges } : {}),
-              ...(autoRecovery ? { auto_recovery: autoRecovery.reclaimed } : {}),
-              ...(hudRepair ? { hud_repair: hudRepair } : {})
-            },
-            null,
-            2
-          )
-        );
+        printTeamMachineJson("team monitor", {
+          policy: effectivePolicy,
+          snapshot: finalSnapshot,
+          ...(leaderAlerts ? { leader_alerts: leaderAlerts.alerts } : {}),
+          ...(leaderAlertDelivery
+            ? { leader_alert_delivery: leaderAlertDelivery }
+            : {}),
+          ...(autoNudges ? { auto_nudges: autoNudges.nudges } : {}),
+          ...(autoRecovery ? { auto_recovery: autoRecovery.reclaimed } : {}),
+          ...(hudRepair ? { hud_repair: hudRepair } : {})
+        });
       }
       return;
     }
@@ -735,9 +989,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
 
       if (action === "show") {
         const result = await showLeaderAlertDeliveryConfig(teamName, cwd);
-        console.log(
-          JSON.stringify({ command: "team alert-delivery show", ...result }, null, 2)
-        );
+        printTeamMachineJson("team alert-delivery show", result);
         return;
       }
 
@@ -771,9 +1023,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           },
           cwd
         );
-        console.log(
-          JSON.stringify({ command: "team alert-delivery set", ...result }, null, 2)
-        );
+        printTeamMachineJson("team alert-delivery set", result);
         return;
       }
 
@@ -785,14 +1035,14 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
+          "usage: agmo team hud <team> [--json] [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
         );
       }
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
       const refreshMs = parseIntegerOption(args.slice(2), "--refresh-ms");
       const iterations = parseIntegerOption(args.slice(2), "--iterations");
-      const width = parseStrictIntegerOption(args.slice(2), "--width");
+      const width = parseIntegerOption(args.slice(2), "--width");
       const maxLines = parseIntegerOption(args.slice(2), "--max-lines");
       const preset = parseHudPreset(parseOption(args.slice(2), "--preset"));
       const color = parseColorMode(args.slice(2));
@@ -800,30 +1050,38 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const watch = args.slice(2).includes("--watch");
       const repair = args.slice(2).includes("--repair");
       const showLegend = args.slice(2).includes("--legend");
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
+      const json = args.slice(2).includes("--json");
+      if (json && watch) {
+        throw new Error("--json cannot be used with --watch");
       }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (refreshMs !== undefined && refreshMs < 250) {
-        throw new Error("--refresh-ms must be at least 250");
-      }
-      if (iterations !== undefined && iterations < 1) {
-        throw new Error("--iterations must be at least 1");
-      }
-      if (width !== undefined && width < 20) {
-        throw new Error("--width must be at least 20");
-      }
-      if (maxLines !== undefined && maxLines < 1) {
-        throw new Error("--max-lines must be at least 1");
-      }
-      let previousText: string | null = null;
-      let previousHeight = 0;
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(refreshMs, "--refresh-ms", 250);
+      assertMinimumOption(iterations, "--iterations", 1);
+      assertMinimumOption(width, "--width", 20);
+      assertMinimumOption(maxLines, "--max-lines", 1);
       const intervalMs = refreshMs ?? 2000;
-      const runHudOnce = async (): Promise<void> => {
+      if (json) {
+        if (repair) {
+          await repairTeamHudPane(teamName, cwd);
+        }
+        const hud = await buildLeaderHudView(
+          teamName,
+          { staleAfterMs, deadAfterMs, preset, width, maxLines, color, showLegend },
+          cwd
+        );
+        printTeamMachineJson("team hud", {
+          team_name: hud.team_name,
+          path: hud.path,
+          text: hud.text,
+          preset: preset ?? "focused",
+          width: width ?? null,
+          max_lines: maxLines ?? null,
+          legend: showLegend
+        });
+        return;
+      }
+      const renderHudFrame = async (): Promise<string> => {
         if (repair) {
           await repairTeamHudPane(teamName, cwd);
         }
@@ -847,31 +1105,19 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             : footer
               ? `${hud.text}\n${footer}`
               : hud.text;
-        if (watch && clearScreen && outputText === previousText) {
-          return;
+        if (maxLines !== undefined) {
+          const maxWidth = renderWidth ?? width ?? 100;
+          return fitLines(outputText.split("\n"), maxWidth, maxLines).join("\n");
         }
-        if (watch && clearScreen) {
-          const nextHeight = outputText.split("\n").length;
-          process.stdout.write("\x1b[H\x1b[2J");
-          if (previousHeight > nextHeight) {
-            process.stdout.write("\x1b[J");
-          }
-          previousHeight = nextHeight;
-        }
-        previousText = outputText;
-        process.stdout.write(`${outputText}\n`);
+        return outputText;
       };
-      if (watch) {
-        const maxIterations = iterations ?? Number.POSITIVE_INFINITY;
-        for (let index = 0; index < maxIterations; index += 1) {
-          await runHudOnce();
-          if (index + 1 < maxIterations) {
-            await sleep(intervalMs);
-          }
-        }
-      } else {
-        await runHudOnce();
-      }
+      await runTeamHudWatchLoop({
+        watch,
+        clearScreen,
+        iterations,
+        intervalMs,
+        renderFrame: renderHudFrame
+      });
       return;
     }
     case "layout": {
@@ -882,7 +1128,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           throw new Error("usage: agmo team layout status <team>");
         }
         const result = await readTeamLayoutStatus(teamName, cwd);
-        console.log(JSON.stringify(result, null, 2));
+        printTeamMachineJsonPayload(result);
         return;
       }
       if (layoutCommand === "repair") {
@@ -898,7 +1144,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           },
           cwd
         );
-        console.log(JSON.stringify(result, null, 2));
+        printTeamMachineJsonPayload(result);
         return;
       }
       if (layoutCommand === "rebalance") {
@@ -918,7 +1164,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           },
           cwd
         );
-        console.log(JSON.stringify(result, null, 2));
+        printTeamMachineJsonPayload(result);
         return;
       }
       throw new Error(
@@ -931,7 +1177,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team dispatch-ack <team> <request-id>");
       }
       const result = await acknowledgeDispatchRequest(teamName, requestId, cwd);
-      console.log(JSON.stringify({ command: "team dispatch-ack", ...result }, null, 2));
+      printTeamMachineJson("team dispatch-ack", result);
       return;
     }
     case "dispatch-retry": {
@@ -940,7 +1186,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team dispatch-retry <team> [worker]");
       }
       const result = await retryDispatchRequests(teamName, workerName, cwd);
-      console.log(JSON.stringify({ command: "team dispatch-retry", ...result }, null, 2));
+      printTeamMachineJson("team dispatch-retry", result);
       return;
     }
     case "reclaim": {
@@ -952,21 +1198,12 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       }
       const workerName = parseOption(args.slice(2), "--worker");
       const taskId = parseOption(args.slice(2), "--task");
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
-      const leaseRaw = parseOption(args.slice(2), "--lease-ms");
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      const leaseMs = leaseRaw ? Number.parseInt(leaseRaw, 10) : undefined;
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (leaseRaw && !Number.isFinite(leaseMs)) {
-        throw new Error("--lease-ms must be an integer");
-      }
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
+      const leaseMs = parseIntegerOption(args.slice(2), "--lease-ms");
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(leaseMs, "--lease-ms", 0);
       const result = await reclaimTeamClaims(
         teamName,
         {
@@ -980,7 +1217,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team reclaim", ...result }, null, 2));
+      printTeamMachineJson("team reclaim", result);
       return;
     }
     case "rebalance": {
@@ -991,42 +1228,18 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
       }
       const workerName = parseOption(args.slice(2), "--worker");
-      const staleRaw = parseOption(args.slice(2), "--stale-ms");
-      const deadRaw = parseOption(args.slice(2), "--dead-ms");
-      const maxOpenDeltaRaw = parseOption(args.slice(2), "--max-open-delta");
-      const maxOpenPerWorkerRaw = parseOption(args.slice(2), "--max-open-per-worker");
-      const maxPendingDispatchRaw = parseOption(args.slice(2), "--max-pending-dispatch");
-      const limitRaw = parseOption(args.slice(2), "--limit");
-      const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
-      const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
-      const maxOpenDelta = maxOpenDeltaRaw
-        ? Number.parseInt(maxOpenDeltaRaw, 10)
-        : undefined;
-      const maxOpenPerWorker = maxOpenPerWorkerRaw
-        ? Number.parseInt(maxOpenPerWorkerRaw, 10)
-        : undefined;
-      const maxPendingDispatch = maxPendingDispatchRaw
-        ? Number.parseInt(maxPendingDispatchRaw, 10)
-        : undefined;
-      const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
-      if (staleRaw && !Number.isFinite(staleAfterMs)) {
-        throw new Error("--stale-ms must be an integer");
-      }
-      if (deadRaw && !Number.isFinite(deadAfterMs)) {
-        throw new Error("--dead-ms must be an integer");
-      }
-      if (maxOpenDeltaRaw && !Number.isFinite(maxOpenDelta)) {
-        throw new Error("--max-open-delta must be an integer");
-      }
-      if (maxOpenPerWorkerRaw && !Number.isFinite(maxOpenPerWorker)) {
-        throw new Error("--max-open-per-worker must be an integer");
-      }
-      if (maxPendingDispatchRaw && !Number.isFinite(maxPendingDispatch)) {
-        throw new Error("--max-pending-dispatch must be an integer");
-      }
-      if (limitRaw && !Number.isFinite(limit)) {
-        throw new Error("--limit must be an integer");
-      }
+      const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
+      const deadAfterMs = parseIntegerOption(args.slice(2), "--dead-ms");
+      const maxOpenDelta = parseIntegerOption(args.slice(2), "--max-open-delta");
+      const maxOpenPerWorker = parseIntegerOption(args.slice(2), "--max-open-per-worker");
+      const maxPendingDispatch = parseIntegerOption(args.slice(2), "--max-pending-dispatch");
+      const limit = parseIntegerOption(args.slice(2), "--limit");
+      assertMinimumOption(staleAfterMs, "--stale-ms", 0);
+      assertMinimumOption(deadAfterMs, "--dead-ms", 0);
+      assertMinimumOption(maxOpenDelta, "--max-open-delta", 0);
+      assertMinimumOption(maxOpenPerWorker, "--max-open-per-worker", 0);
+      assertMinimumOption(maxPendingDispatch, "--max-pending-dispatch", 0);
+      assertMinimumOption(limit, "--limit", 1);
       const result = await rebalanceTeamAssignments(
         teamName,
         {
@@ -1042,7 +1255,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team rebalance", ...result }, null, 2));
+      printTeamMachineJson("team rebalance", result);
       return;
     }
     case "integrate": {
@@ -1057,15 +1270,14 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const strategy = parseOption(args.slice(2), "--strategy");
       const maxCommits = parseIntegerOption(args.slice(2), "--max-commits");
       const batchSize = parseIntegerOption(args.slice(2), "--batch-size");
+      assertMinimumOption(maxCommits, "--max-commits", 1);
+      assertMinimumOption(batchSize, "--batch-size", 1);
       const batchOrder = parseOption(args.slice(2), "--batch-order");
       const targetRef = parseOption(args.slice(2), "--target-ref");
       const onConflict = parseOption(args.slice(2), "--on-conflict");
       const onEmpty = parseOption(args.slice(2), "--on-empty");
       if (strategy && !["cherry-pick", "squash"].includes(strategy)) {
         throw new Error("--strategy must be: cherry-pick, squash");
-      }
-      if (batchSize !== undefined && batchSize < 1) {
-        throw new Error("--batch-size must be at least 1");
       }
       if (batchOrder && !["oldest", "newest", "task-id"].includes(batchOrder)) {
         throw new Error("--batch-order must be: oldest, newest, task-id");
@@ -1098,7 +1310,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team integrate", ...result }, null, 2));
+      printTeamMachineJson("team integrate", result);
       return;
     }
     case "integrate-assist": {
@@ -1120,8 +1332,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
     default:
       console.log(`Usage:
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
+  agmo team api <${TEAM_API_OPERATION_USAGE}> --input '<json>' --json
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
+  agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]
   agmo team shutdown-ack <team> <worker> <accepted|busy|rejected> [--reason <text>] [--task <id>]
   agmo team cleanup-stale [--stale-ms <ms>] [--dead-ms <ms>] [--include-stale|--no-include-stale] [--dry-run|--no-dry-run] [--retry-pane-closes|--no-retry-pane-closes] [--sweep-tmux|--no-sweep-tmux]
   agmo team send <team> <worker> "<message>"
@@ -1133,7 +1347,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--slack-username <name>] [--slack-icon-emoji <emoji>] [--email|--no-email] [--email-to <a,b>] [--email-from <addr>] [--email-sendmail-path <path>] [--email-subject-prefix <prefix>]
-  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
+  agmo team hud <team> [--json] [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
   agmo team layout status <team>
   agmo team layout repair <team> [--dry-run] [--force]
   agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]

@@ -6,6 +6,7 @@ import { resolveLaunchPolicy } from "../config/runtime.js";
 import { listLaunchWorkspaces } from "../launch/session-workspace.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { readTextFileIfExists } from "../utils/fs.js";
+import { machineJsonEnvelope, uniqueRecommendedActions } from "../utils/machine-json.js";
 import { resolveInstallPaths, codexHomeDir, resolveRuntimeRoot } from "../utils/paths.js";
 import { resolveVaultRoot } from "../vault/runtime.js";
 
@@ -149,10 +150,21 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
     );
   }
 
+  const recommendations = {
+    setup: setupRecommendations,
+    vault: vaultRecommendations,
+    team: teamRecommendations,
+    launch_workspaces: launchWorkspaceRecommendations
+  };
+  const allRecommendations = Object.values(recommendations).flat();
+  const ok = allRecommendations.every((recommendation) => recommendation.severity !== "warning");
+  const recommendedActions = uniqueRecommendedActions(
+    allRecommendations.map((recommendation) => recommendation.command)
+  );
 
   console.log(
     JSON.stringify(
-      {
+      machineJsonEnvelope("doctor", ok, {
         command: "doctor",
         scope,
         checks: {
@@ -177,12 +189,8 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
           sources: launchPolicy.sources
         },
         launch_workspaces: launchWorkspaceSummary,
-        recommendations: {
-          setup: setupRecommendations,
-          vault: vaultRecommendations,
-          team: teamRecommendations,
-          launch_workspaces: launchWorkspaceRecommendations
-        },
+        recommendations,
+        recommended_actions: recommendedActions,
         paths: {
           codex_home: codexHomeDir(),
           codex_dir: paths.codexDir,
@@ -192,7 +200,7 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
           session_instructions_dir: paths.sessionInstructionsDir,
           launch_workspace_cache_dir: join(paths.cacheDir, "launch-workspaces")
         }
-      },
+      }),
       null,
       2
     )

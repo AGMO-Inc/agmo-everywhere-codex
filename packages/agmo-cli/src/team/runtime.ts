@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { appendFile, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { buildHookCommand, mergeManagedHooksConfig } from "../hooks/codex-hooks.js";
 import { agmoCliDistEntryPath } from "../utils/paths.js";
 import {
@@ -31,12 +32,21 @@ import {
   type TeamHudSuggestedAction
 } from "./hud-renderer.js";
 import type { AgmoColorMode } from "./terminal-format.js";
-import type { TeamLayoutPreset } from "./layout-planner.js";
+import type {
+  TeamLayoutCapacityMetrics,
+  TeamLayoutPlan,
+  TeamLayoutPreset
+} from "./layout-planner.js";
 import {
   buildInitialWorkerInbox,
   buildWorkerInstructions
 } from "./worker-bootstrap.js";
-import { provisionWorkerWorktree } from "./worktree.js";
+import {
+  cleanupTeamWorktrees,
+  provisionWorkerWorktree,
+  type TeamWorktreeCleanupSummary,
+  writeTeamWorktreeManifest
+} from "./worktree.js";
 import {
   buildDefaultWorkerHeartbeat,
   buildDefaultWorkerStatus,
@@ -46,6 +56,7 @@ import {
   createMessageId,
   generateTeamName,
   nowIso,
+  assertCanonicalTeamName,
   resolveTeamConfigPath,
   resolveTeamDir,
   resolveTeamDispatchPath,
@@ -69,6 +80,7 @@ import {
   resolveTeamPhasePath,
   resolveTeamShutdownPath,
   resolveTeamStateRoot,
+  resolveTeamTaskApprovalPath,
   resolveTeamTaskPath,
   resolveTeamTasksDir,
   resolveWorkerDir,
@@ -89,6 +101,7 @@ import {
   type AgmoTeamHudRepairState,
   type AgmoTeamShutdownAck,
   type AgmoTeamShutdownState,
+  type AgmoTeamTaskApprovalRecord,
   type AgmoWorkerIdentity
 } from "./state/index.js";
 import type {
@@ -165,6 +178,7 @@ type AgmoLeaderAlertDeliveryResult = {
 };
 
 const LEADER_ALERT_DELIVERY_HISTORY_LIMIT = 200;
+const TEAM_TASK_HIGH_WATERMARK_FILE = ".highwatermark";
 const DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail";
 const DEFAULT_EMAIL_FROM = "agmo@localhost";
 const DEFAULT_EMAIL_SUBJECT_PREFIX = "[AGMO Leader Alert]";
@@ -173,6 +187,16 @@ const PANE_CLOSE_RETRY_DELAY_MS = 30_000;
 const PANE_CLOSE_RETRY_MAX_ATTEMPTS = 3;
 const HUD_REPAIR_DEBOUNCE_MS = 30_000;
 const HUD_REPAIR_HISTORY_LIMIT = 20;
+const TEAM_ROLE_NAMES = [
+  "agmo-planner",
+  "agmo-executor",
+  "agmo-verifier",
+  "agmo-wisdom",
+  "agmo-architect",
+  "agmo-critic",
+  "agmo-explore"
+] as const;
+const TEAM_ROLE_NAME_SET = new Set<string>(TEAM_ROLE_NAMES);
 
 function emptyTmuxPaneDestructionSummary(): TmuxPaneDestructionSummary {
   return {
@@ -201,6 +225,34 @@ type TeamAutoShutdownResult =
 function assertValidWorkerCount(workerCount: number): void {
   if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > 20) {
     throw new Error("workerCount must be an integer between 1 and 20");
+  }
+}
+
+function assertValidTeamTask(task: string): void {
+  if (task.trim().length === 0) {
+    throw new Error("task is required");
+  }
+  if (task.length > 32_000) {
+    throw new Error("task must be at most 32000 characters");
+  }
+}
+
+function assertValidRoleOverrides(
+  roleOverrides: Record<string, string> | undefined,
+  workerNames: string[]
+): void {
+  if (!roleOverrides) {
+    return;
+  }
+
+  const workerNameSet = new Set(workerNames);
+  for (const [workerName, role] of Object.entries(roleOverrides)) {
+    if (!workerNameSet.has(workerName)) {
+      throw new Error(`roleOverrides references unknown worker: ${workerName}`);
+    }
+    if (!TEAM_ROLE_NAME_SET.has(role)) {
+      throw new Error(`roleOverrides for ${workerName} must be one of: ${TEAM_ROLE_NAMES.join(", ")}`);
+    }
   }
 }
 
@@ -240,6 +292,19 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
   return JSON.parse(content) as T;
 }
 
+function isPathWithin(parent: string, child: string): boolean {
+  const pathRelative = relative(parent, child);
+  return pathRelative === "" || (pathRelative.length > 0 && !pathRelative.startsWith("..") && !isAbsolute(pathRelative));
+}
+
+async function canonicalExistingPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
 async function readTaskRecord(
   teamName: string,
   taskId: string,
@@ -254,6 +319,52 @@ async function readTaskRecord(
   }
 
   return task;
+}
+
+async function readTaskRecords(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoTeamTaskRecord[]> {
+  const tasksDir = resolveTeamTasksDir(teamName, cwd);
+  let entries: string[];
+  try {
+    entries = await readdir(tasksDir);
+  } catch {
+    return [];
+  }
+
+  const taskIds = entries
+    .map((entry) => {
+      const match = /^task-(\d+)\.json$/.exec(entry);
+      return match ? Number.parseInt(match[1] ?? "", 10) : null;
+    })
+    .filter((entry): entry is number => entry !== null && Number.isInteger(entry))
+    .sort((left, right) => left - right);
+
+  const tasks = await Promise.all(
+    taskIds.map((taskId) => readJsonFile<AgmoTeamTaskRecord>(
+      resolveTeamTaskPath(teamName, String(taskId), cwd)
+    ))
+  );
+
+  return tasks.filter((entry): entry is AgmoTeamTaskRecord => entry !== null);
+}
+
+async function readTaskHighWatermark(tasksDir: string): Promise<number> {
+  const stored = await readTextFileIfExists(join(tasksDir, TEAM_TASK_HIGH_WATERMARK_FILE));
+  if (!stored?.trim()) {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(stored.trim(), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function maxNumericTaskId(tasks: AgmoTeamTaskRecord[]): number {
+  return tasks.reduce((max, task) => {
+    const parsed = Number.parseInt(task.id, 10);
+    return String(parsed) === task.id && parsed > max ? parsed : max;
+  }, 0);
 }
 
 function parseCsvList(value: string | undefined): string[] {
@@ -623,6 +734,45 @@ function assertWorkerOwnsTask(task: AgmoTeamTaskRecord, workerName: string): voi
     throw new Error(
       `task ${task.id} is owned by ${task.owner}, cannot operate as ${workerName}`
     );
+  }
+}
+
+function buildTaskClaim(workerName: string, claimedAt: string): NonNullable<AgmoTeamTaskRecord["claim"]> {
+  return {
+    owner: workerName,
+    claimed_at: claimedAt,
+    token: randomUUID(),
+    leased_until: new Date(Date.now() + DEFAULT_TASK_CLAIM_LEASE_MS).toISOString()
+  };
+}
+
+function assertTaskMutationGuard(
+  task: AgmoTeamTaskRecord,
+  workerName: string,
+  options: {
+    expectedStatus?: AgmoTeamTaskStatus;
+    claimToken?: string;
+  }
+): void {
+  if (options.expectedStatus && task.status !== options.expectedStatus) {
+    throw new Error(
+      `invalid transition: expected ${options.expectedStatus}, found ${task.status}`
+    );
+  }
+
+  if (!options.claimToken) {
+    return;
+  }
+
+  if (!task.claim || task.claim.owner !== workerName || task.claim.token !== options.claimToken) {
+    throw new Error(`claim token mismatch for task ${task.id}`);
+  }
+
+  if (task.claim.leased_until) {
+    const leasedUntilMs = Date.parse(task.claim.leased_until);
+    if (Number.isFinite(leasedUntilMs) && leasedUntilMs <= Date.now()) {
+      throw new Error(`claim lease expired for task ${task.id}`);
+    }
   }
 }
 
@@ -3093,17 +3243,86 @@ type LayoutAction = {
   reason: string;
 };
 
+type LayoutPlanStatus = {
+  preset: TeamLayoutPlan["preset"];
+  choice: TeamLayoutPlan["choice"];
+  health: TeamLayoutPlan["health"];
+  selected_reason: string;
+  worker_count: number;
+  window_width: number | null;
+  window_height: number | null;
+  leader_width: number | null;
+  hud_height: number;
+  columns: number;
+  rows: number;
+  metrics: {
+    window_area: TeamLayoutCapacityMetrics["windowArea"];
+    usable_height: TeamLayoutCapacityMetrics["usableHeight"];
+    reserved_hud_height: TeamLayoutCapacityMetrics["reservedHudHeight"];
+    available_worker_width: TeamLayoutCapacityMetrics["availableWorkerWidth"];
+    available_worker_height: TeamLayoutCapacityMetrics["availableWorkerHeight"];
+    worker_cell_width: TeamLayoutCapacityMetrics["workerCellWidth"];
+    worker_cell_height: TeamLayoutCapacityMetrics["workerCellHeight"];
+    worker_cell_area: TeamLayoutCapacityMetrics["workerCellArea"];
+    requested_workers: TeamLayoutCapacityMetrics["requestedWorkers"];
+    visible_worker_capacity: TeamLayoutCapacityMetrics["visibleWorkerCapacity"];
+    overflow_workers: TeamLayoutCapacityMetrics["overflowWorkers"];
+    leader_meets_minimum: TeamLayoutCapacityMetrics["leaderMeetsMinimum"];
+    workers_meet_minimum_width: TeamLayoutCapacityMetrics["workersMeetMinimumWidth"];
+    workers_meet_minimum_height: TeamLayoutCapacityMetrics["workersMeetMinimumHeight"];
+    hud_fits: TeamLayoutCapacityMetrics["hudFits"];
+    hud_disabled: TeamLayoutCapacityMetrics["hudDisabled"];
+  };
+  warnings: string[];
+};
+
 type LayoutOperation = {
   command: "team layout repair" | "team layout rebalance";
   team_name: string;
   dry_run: boolean;
   status: "completed" | "partial" | "skipped" | "failed" | "refused";
+  layout_plan?: LayoutPlanStatus;
   planned: LayoutAction[];
   performed: LayoutAction[];
   skipped: LayoutAction[];
   failed: Array<LayoutAction & { error: string }>;
   refused: Array<LayoutAction & { reason: string }>;
 };
+
+function mapLayoutPlanStatus(plan: TeamLayoutPlan): LayoutPlanStatus {
+  return {
+    preset: plan.preset,
+    choice: plan.choice,
+    health: plan.health,
+    selected_reason: plan.selectedReason,
+    worker_count: plan.workerCount,
+    window_width: plan.windowWidth,
+    window_height: plan.windowHeight,
+    leader_width: plan.leaderWidth,
+    hud_height: plan.hudHeight,
+    columns: plan.columns,
+    rows: plan.rows,
+    metrics: {
+      window_area: plan.metrics.windowArea,
+      usable_height: plan.metrics.usableHeight,
+      reserved_hud_height: plan.metrics.reservedHudHeight,
+      available_worker_width: plan.metrics.availableWorkerWidth,
+      available_worker_height: plan.metrics.availableWorkerHeight,
+      worker_cell_width: plan.metrics.workerCellWidth,
+      worker_cell_height: plan.metrics.workerCellHeight,
+      worker_cell_area: plan.metrics.workerCellArea,
+      requested_workers: plan.metrics.requestedWorkers,
+      visible_worker_capacity: plan.metrics.visibleWorkerCapacity,
+      overflow_workers: plan.metrics.overflowWorkers,
+      leader_meets_minimum: plan.metrics.leaderMeetsMinimum,
+      workers_meet_minimum_width: plan.metrics.workersMeetMinimumWidth,
+      workers_meet_minimum_height: plan.metrics.workersMeetMinimumHeight,
+      hud_fits: plan.metrics.hudFits,
+      hud_disabled: plan.metrics.hudDisabled
+    },
+    warnings: plan.warnings
+  };
+}
 
 function mapHudReapAction(entry: { pane_id: string; reason: string }): LayoutAction {
   return {
@@ -3179,6 +3398,7 @@ export async function readTeamLayoutStatus(
   transport: "tmux" | "none";
   dry_run: false;
   layout_health: "ok" | "degraded" | "repairable" | "unknown" | "skipped";
+  layout_plan?: LayoutPlanStatus;
   panes: {
     leader: LayoutPaneHealth;
     hud?: LayoutPaneHealth;
@@ -3257,7 +3477,8 @@ export async function readTeamLayoutStatus(
   const recommended_actions = [
     ...(hud.health === "missing" || hud.health === "dead" ? ["team layout repair"] : []),
     ...(orphanHudReap.planned.length > 0 ? ["team layout repair --dry-run"] : []),
-    ...(plan.health === "degraded" ? ["team layout rebalance --dry-run"] : [])
+    ...(plan.health === "degraded" ? ["team layout rebalance --dry-run"] : []),
+    ...(plan.metrics.overflowWorkers > 0 ? ["resize terminal or reduce worker count"] : [])
   ];
   const repairable = hud.health === "missing" || hud.health === "dead";
   return {
@@ -3271,6 +3492,7 @@ export async function readTeamLayoutStatus(
       hud,
       workers
     },
+    layout_plan: mapLayoutPlanStatus(plan),
     warnings,
     recommended_actions
   };
@@ -3381,7 +3603,13 @@ export async function rebalanceTeamLayout(
     command: "team layout rebalance",
     team_name: normalizedTeamName,
     dry_run: Boolean(options.dryRun),
-    ...operation
+    status: operation.status,
+    layout_plan: operation.layoutPlan ? mapLayoutPlanStatus(operation.layoutPlan) : undefined,
+    planned: operation.planned,
+    performed: operation.performed,
+    skipped: operation.skipped,
+    failed: operation.failed,
+    refused: operation.refused
   };
 }
 
@@ -3483,8 +3711,14 @@ export async function startTeamRuntime(
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
   assertValidWorkerCount(request.workerCount);
+  assertValidTeamTask(request.task);
 
-  const teamName = sanitizeTeamName(request.teamName ?? generateTeamName(request.task));
+  const teamName =
+    request.teamName === undefined
+      ? sanitizeTeamName(generateTeamName(request.task))
+      : assertCanonicalTeamName(request.teamName);
+  const workerNames = buildWorkerNames(request.workerCount);
+  assertValidRoleOverrides(request.roleOverrides, workerNames);
   const existingConfig = await readJsonFile<AgmoTeamConfig>(
     resolveTeamConfigPath(teamName, cwd)
   );
@@ -3493,7 +3727,6 @@ export async function startTeamRuntime(
     throw new Error(`team already active: ${teamName}`);
   }
 
-  const workerNames = buildWorkerNames(request.workerCount);
   const tmux = describeTmuxSessionTopology(request.workerCount);
   const timestamp = nowIso();
   const stateRoot = resolveTeamStateRoot(cwd);
@@ -3645,6 +3878,23 @@ export async function startTeamRuntime(
     })
   );
 
+  const worktreeManifest = await writeTeamWorktreeManifest(
+    teamName,
+    workerRuntimeSpecs.map((spec) => ({
+      worker_name: spec.workerName,
+      path: spec.worktree.path,
+      git_enabled: spec.worktree.git_enabled,
+      repo_root: spec.worktree.repo_root,
+      base_ref: spec.worktree.base_ref,
+      ...(spec.worktree.branch_name ? { branch_name: spec.worktree.branch_name } : {}),
+      status: spec.worktree.status
+    })),
+    {
+      createdAt: timestamp,
+      cwd
+    }
+  );
+
   const primaryGitWorktree = workerRuntimeSpecs.find((spec) => spec.worktree.git_enabled)?.worktree;
   if (primaryGitWorktree) {
     config.workspace = {
@@ -3738,6 +3988,7 @@ export async function startTeamRuntime(
     team_name: teamName,
     config,
     manifest,
+    worktree_manifest: worktreeManifest,
     phase,
     tasks_created: tasks.length,
     ...(request.allocationIntent ? { allocation_intent: request.allocationIntent } : {}),
@@ -3785,13 +4036,7 @@ export async function readTeamStatus(
   const paneCloseRetry = await readPaneCloseRetryState(normalizedTeamName, cwd);
   const hudRepair = await readHudRepairState(normalizedTeamName, cwd);
 
-  const tasks = await Promise.all(
-    config.worker_names.map(async (_, index) => {
-      return await readJsonFile<AgmoTeamTaskRecord>(
-        resolveTeamTaskPath(normalizedTeamName, String(index + 1), cwd)
-      );
-    })
-  );
+  const tasks = await readTaskRecords(normalizedTeamName, cwd);
 
   const workers = await Promise.all(
     config.worker_names.map(async (workerName) => {
@@ -3842,7 +4087,7 @@ export async function readTeamStatus(
     config,
     manifest,
     phase,
-    tasks: tasks.filter((entry): entry is AgmoTeamTaskRecord => entry !== null),
+    tasks,
     workers,
     mailbox,
     dispatch_requests: dispatchRequests,
@@ -4071,6 +4316,175 @@ export async function shutdownTeamRuntime(
     tmux_pane_destruction: tmuxPaneDestruction,
     pane_close_retry: paneCloseRetry,
     preserved_state_root: resolveTeamDir(latestStatus.config.name, cwd)
+  };
+}
+
+async function removeTeamStateDirSafely(
+  teamName: string,
+  options: { dryRun?: boolean },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const stateRoot = resolveTeamStateRoot(cwd);
+  const teamDir = resolveTeamDir(normalizedTeamName, cwd);
+  const stateRootCanonical = await canonicalExistingPath(stateRoot);
+  const teamDirCanonical = await canonicalExistingPath(teamDir);
+
+  if (!isPathWithin(stateRootCanonical, teamDirCanonical) || teamDirCanonical === stateRootCanonical) {
+    throw new Error(`refusing to remove unsafe team state path: ${teamDir}`);
+  }
+
+  if (options.dryRun) {
+    return {
+      status: "would_remove",
+      path: teamDir
+    };
+  }
+
+  await rm(teamDirCanonical, { recursive: true, force: true });
+  return {
+    status: "removed",
+    path: teamDir
+  };
+}
+
+function describeBlockingWorktreeCleanup(
+  cleanup: TeamWorktreeCleanupSummary,
+  options: { keepWorktrees?: boolean }
+): string | null {
+  if (options.keepWorktrees) {
+    return null;
+  }
+
+  if (cleanup.manifest_status === "missing") {
+    return existsSync(cleanup.worktree_root)
+      ? "worktree ownership manifest missing while worktree root exists"
+      : null;
+  }
+
+  if (cleanup.manifest_status === "invalid") {
+    return "worktree ownership manifest failed validation";
+  }
+
+  if (cleanup.status === "failed" || cleanup.status === "partial") {
+    return "worktree cleanup did not complete";
+  }
+
+  const unsafeWorker = cleanup.workers.find(
+    (worker) => worker.reason === "worker path escapes team worktree root"
+  );
+  if (unsafeWorker) {
+    return `unsafe worker worktree path detected: ${unsafeWorker.worker_name}`;
+  }
+
+  return null;
+}
+
+export async function deleteTeamRuntime(
+  teamName: string,
+  options: {
+    force?: boolean;
+    dryRun?: boolean;
+    keepWorktrees?: boolean;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const force = options.force === true;
+  const dryRun = options.dryRun === true;
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+
+  if (!status) {
+    return {
+      team_name: normalizedTeamName,
+      dry_run: dryRun,
+      force,
+      status: "not_found",
+      shutdown: null,
+      worktree_cleanup: await cleanupTeamWorktrees(
+        normalizedTeamName,
+        { dryRun, force, keepWorktrees: options.keepWorktrees },
+        cwd
+      ),
+      state_removal: {
+        status: "skipped",
+        reason: "team state not found",
+        path: resolveTeamDir(normalizedTeamName, cwd)
+      }
+    };
+  }
+
+  if (status.config.active && !force) {
+    return {
+      team_name: normalizedTeamName,
+      dry_run: dryRun,
+      force,
+      status: "refused_active",
+      active: true,
+      error: "team is active; use --force to shut it down before deletion",
+      shutdown: null,
+      worktree_cleanup: {
+        status: "skipped",
+        reason: "team is active"
+      },
+      state_removal: {
+        status: "skipped",
+        reason: "team is active",
+        path: resolveTeamDir(normalizedTeamName, cwd)
+      }
+    };
+  }
+
+  const shutdown =
+    status.config.active && force && !dryRun
+      ? await shutdownTeamRuntime(normalizedTeamName, { graceMs: 0 }, cwd)
+      : status.config.active && force && dryRun
+        ? {
+            status: "would_shutdown",
+            grace_ms: 0
+          }
+        : null;
+
+  const worktreeCleanup = await cleanupTeamWorktrees(
+    normalizedTeamName,
+    { dryRun, force, keepWorktrees: options.keepWorktrees },
+    cwd
+  );
+  const blockingWorktreeCleanup = describeBlockingWorktreeCleanup(worktreeCleanup, {
+    keepWorktrees: options.keepWorktrees
+  });
+  if (blockingWorktreeCleanup) {
+    return {
+      team_name: normalizedTeamName,
+      dry_run: dryRun,
+      force,
+      status: "blocked_worktree_cleanup",
+      shutdown,
+      worktree_cleanup: worktreeCleanup,
+      state_removal: {
+        status: "skipped",
+        reason: blockingWorktreeCleanup,
+        path: resolveTeamDir(normalizedTeamName, cwd)
+      }
+    };
+  }
+
+  const stateRemoval = await removeTeamStateDirSafely(normalizedTeamName, { dryRun }, cwd);
+  const deleteStatus =
+    dryRun
+      ? "would_delete"
+      : worktreeCleanup.status === "failed" || worktreeCleanup.status === "partial"
+        ? "deleted_with_worktree_errors"
+        : "deleted";
+
+  return {
+    team_name: normalizedTeamName,
+    dry_run: dryRun,
+    force,
+    status: deleteStatus,
+    shutdown,
+    worktree_cleanup: worktreeCleanup,
+    state_removal: stateRemoval
   };
 }
 
@@ -4333,7 +4747,10 @@ export async function sendWorkerMessage(
   teamName: string,
   workerName: string,
   body: string,
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  options: {
+    fromWorker?: string;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
   const status = await readTeamStatus(normalizedTeamName, cwd);
@@ -4344,12 +4761,16 @@ export async function sendWorkerMessage(
   if (!status.config.worker_names.includes(workerName)) {
     throw new Error(`worker not found: ${workerName}`);
   }
+  const fromWorker = options.fromWorker ?? "leader-fixed";
+  if (fromWorker !== "leader-fixed" && !status.config.worker_names.includes(fromWorker)) {
+    throw new Error(`worker not found: ${fromWorker}`);
+  }
 
   const timestamp = nowIso();
   const identity = await readWorkerIdentity(normalizedTeamName, workerName, cwd);
   const message: AgmoMailboxMessage = {
     message_id: createMessageId(),
-    from_worker: "leader-fixed",
+    from_worker: fromWorker,
     to_worker: workerName,
     body,
     created_at: timestamp
@@ -4414,9 +4835,261 @@ export async function sendWorkerMessage(
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
+    from_worker: message.from_worker,
     message_id: message.message_id,
     dispatch_request_id: request.request_id,
     dispatch_status: request.status
+  };
+}
+
+export async function broadcastWorkerMessage(
+  teamName: string,
+  fromWorker: string,
+  body: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  from_worker: string;
+  count: number;
+  messages: Record<string, unknown>[];
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (fromWorker !== "leader-fixed" && !status.config.worker_names.includes(fromWorker)) {
+    throw new Error(`worker not found: ${fromWorker}`);
+  }
+
+  const messages: Record<string, unknown>[] = [];
+  for (const workerName of status.config.worker_names) {
+    if (workerName === fromWorker) {
+      continue;
+    }
+    messages.push(
+      await sendWorkerMessage(normalizedTeamName, workerName, body, cwd, { fromWorker })
+    );
+  }
+
+  return {
+    team_name: normalizedTeamName,
+    from_worker: fromWorker,
+    count: messages.length,
+    messages
+  };
+}
+
+export async function listWorkerMailboxMessages(
+  teamName: string,
+  workerName: string,
+  options: {
+    includeDelivered?: boolean;
+  } = {},
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  worker: string;
+  count: number;
+  messages: AgmoMailboxMessage[];
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.config.worker_names.includes(workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const allMessages = status.mailbox[workerName] ?? [];
+  const messages = options.includeDelivered === false
+    ? allMessages.filter((message) => !message.delivered_at)
+    : allMessages;
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    count: messages.length,
+    messages
+  };
+}
+
+function findLatestDispatchRequestForMessage(
+  requests: AgmoDispatchRequest[],
+  workerName: string,
+  messageId: string
+): AgmoDispatchRequest | undefined {
+  return requests
+    .filter((request) => request.to_worker === workerName && request.message_id === messageId)
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))[0];
+}
+
+export async function markWorkerMailboxMessageNotified(
+  teamName: string,
+  workerName: string,
+  messageId: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  worker: string;
+  message_id: string;
+  notified: boolean;
+  dispatch_request_id: string | null;
+  dispatch_updated: boolean;
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.config.worker_names.includes(workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const message = (status.mailbox[workerName] ?? []).find((entry) => entry.message_id === messageId);
+  if (!message) {
+    return {
+      team_name: normalizedTeamName,
+      worker: workerName,
+      message_id: messageId,
+      notified: false,
+      dispatch_request_id: null,
+      dispatch_updated: false
+    };
+  }
+
+  const timestamp = nowIso();
+  const requests = await readDispatchRequests(normalizedTeamName, cwd);
+  const dispatch = findLatestDispatchRequestForMessage(requests, workerName, messageId);
+  let dispatchUpdated = false;
+
+  if (dispatch && dispatch.status !== "notified" && dispatch.status !== "delivered") {
+    dispatch.status = "notified";
+    dispatch.notified_at = dispatch.notified_at ?? timestamp;
+    dispatch.failed_at = undefined;
+    dispatchUpdated = true;
+  }
+
+  await Promise.all([
+    updateMailboxMessage(
+      normalizedTeamName,
+      workerName,
+      messageId,
+      { notified_at: message.notified_at ?? timestamp },
+      cwd
+    ),
+    dispatchUpdated
+      ? writeDispatchRequests(normalizedTeamName, requests, cwd)
+      : Promise.resolve(),
+    writeEvent(
+      normalizedTeamName,
+      {
+        timestamp,
+        type: "mailbox_message_notified",
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        message_id: messageId,
+        dispatch_request_id: dispatch?.request_id ?? null,
+        dispatch_updated: dispatchUpdated
+      },
+      cwd
+    )
+  ]);
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    message_id: messageId,
+    notified: true,
+    dispatch_request_id: dispatch?.request_id ?? null,
+    dispatch_updated: dispatchUpdated
+  };
+}
+
+export async function markWorkerMailboxMessageDelivered(
+  teamName: string,
+  workerName: string,
+  messageId: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  worker: string;
+  message_id: string;
+  updated: boolean;
+  dispatch_request_id: string | null;
+  dispatch_updated: boolean;
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.config.worker_names.includes(workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const message = (status.mailbox[workerName] ?? []).find((entry) => entry.message_id === messageId);
+  if (!message) {
+    return {
+      team_name: normalizedTeamName,
+      worker: workerName,
+      message_id: messageId,
+      updated: false,
+      dispatch_request_id: null,
+      dispatch_updated: false
+    };
+  }
+
+  const timestamp = nowIso();
+  const requests = await readDispatchRequests(normalizedTeamName, cwd);
+  const dispatch = findLatestDispatchRequestForMessage(requests, workerName, messageId);
+  let dispatchUpdated = false;
+
+  if (dispatch && dispatch.status !== "delivered") {
+    dispatch.status = "delivered";
+    dispatch.notified_at = dispatch.notified_at ?? timestamp;
+    dispatch.delivered_at = timestamp;
+    dispatch.failed_at = undefined;
+    dispatchUpdated = true;
+  }
+
+  await Promise.all([
+    updateMailboxMessage(
+      normalizedTeamName,
+      workerName,
+      messageId,
+      {
+        notified_at: message.notified_at ?? dispatch?.notified_at ?? timestamp,
+        delivered_at: message.delivered_at ?? timestamp
+      },
+      cwd
+    ),
+    dispatchUpdated
+      ? writeDispatchRequests(normalizedTeamName, requests, cwd)
+      : Promise.resolve(),
+    writeEvent(
+      normalizedTeamName,
+      {
+        timestamp,
+        type: "mailbox_message_delivered",
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        message_id: messageId,
+        dispatch_request_id: dispatch?.request_id ?? null,
+        dispatch_updated: dispatchUpdated
+      },
+      cwd
+    )
+  ]);
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    message_id: messageId,
+    updated: true,
+    dispatch_request_id: dispatch?.request_id ?? null,
+    dispatch_updated: dispatchUpdated
   };
 }
 
@@ -4574,6 +5247,7 @@ export async function claimTaskForWorker(
   workerName: string,
   options: {
     ignoreDependencies?: boolean;
+    expectedVersion?: number;
   } = {},
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
@@ -4585,6 +5259,11 @@ export async function claimTaskForWorker(
     async () => {
       const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
       assertWorkerOwnsTask(task, workerName);
+      if (options.expectedVersion !== undefined && task.version !== options.expectedVersion) {
+        throw new Error(
+          `claim conflict: expected task version ${options.expectedVersion}, found ${task.version}`
+        );
+      }
       const status = await readTeamStatus(normalizedTeamName, cwd);
       if (!status) {
         throw new Error(`team not found: ${normalizedTeamName}`);
@@ -4626,15 +5305,13 @@ export async function claimTaskForWorker(
       }
 
       const timestamp = nowIso();
+      const claim = buildTaskClaim(workerName, timestamp);
       const nextTask: AgmoTeamTaskRecord = {
         ...task,
         owner: workerName,
         status: "in_progress",
         blocked_by_dependencies: undefined,
-        claim: {
-          owner: workerName,
-          claimed_at: timestamp
-        },
+        claim,
         error: undefined,
         version: task.version + 1,
         updated_at: timestamp
@@ -4676,7 +5353,274 @@ export async function claimTaskForWorker(
         team_name: normalizedTeamName,
         worker_name: workerName,
         ignored_dependencies: options.ignoreDependencies ?? false,
+        claim_token: claim.token,
+        claimToken: claim.token,
         task: nextTask
+      };
+    },
+    cwd
+  );
+}
+
+export async function createTeamTask(
+  teamName: string,
+  input: {
+    subject: string;
+    description: string;
+    owner?: string;
+    role?: string;
+    dependsOn?: string[];
+    requiresCodeChange?: boolean;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    "create task",
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      if (input.owner) {
+        await readWorkerIdentity(normalizedTeamName, input.owner, cwd);
+      }
+
+      const tasksDir = resolveTeamTasksDir(normalizedTeamName, cwd);
+      await ensureDir(tasksDir);
+      const currentTasks = status.tasks;
+      const currentHighWatermark = await readTaskHighWatermark(tasksDir);
+      const nextId = Math.max(currentHighWatermark, maxNumericTaskId(currentTasks)) + 1;
+      const taskId = String(nextId);
+      const timestamp = nowIso();
+      const draftTask: AgmoTeamTaskRecord = {
+        id: taskId,
+        subject: input.subject,
+        description: input.description,
+        ...(input.owner ? { owner: input.owner } : {}),
+        ...(input.role
+          ? { role: input.role }
+          : input.owner
+            ? { role: status.workers.find((worker) => worker.identity.name === input.owner)?.identity.role }
+            : {}),
+        status: "pending",
+        ...(input.dependsOn && input.dependsOn.length > 0 ? { depends_on: input.dependsOn } : {}),
+        requires_code_change: input.requiresCodeChange ?? true,
+        ...(input.owner
+          ? {
+              assignment_history: [
+                {
+                  owner: input.owner,
+                  assigned_at: timestamp,
+                  reason: "api_create_task"
+                }
+              ]
+            }
+          : {}),
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp
+      };
+      const blockers = computeTaskDependencyBlockers(
+        draftTask,
+        new Map(currentTasks.map((task) => [task.id, task]))
+      );
+      const task: AgmoTeamTaskRecord = {
+        ...draftTask,
+        status: blockers.length > 0 ? "blocked" : "pending",
+        ...(blockers.length > 0 ? { blocked_by_dependencies: blockers } : {})
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, task, cwd),
+        writeTextFile(join(tasksDir, TEAM_TASK_HIGH_WATERMARK_FILE), `${nextId}\n`),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_created",
+            team_name: normalizedTeamName,
+            task_id: task.id,
+            owner: task.owner ?? null,
+            status: task.status
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        task
+      };
+    },
+    cwd
+  );
+}
+
+export async function updateTeamTask(
+  teamName: string,
+  taskId: string,
+  updates: {
+    subject?: string;
+    description?: string;
+    dependsOn?: string[];
+    requiresCodeChange?: boolean;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `update task ${taskId}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      const task = status.tasks.find((candidate) => candidate.id === taskId);
+      if (!task) {
+        throw new Error(`task not found: ${taskId}`);
+      }
+
+      const timestamp = nowIso();
+      const nextTaskBase: AgmoTeamTaskRecord = {
+        ...task,
+        ...(updates.subject !== undefined ? { subject: updates.subject } : {}),
+        ...(updates.description !== undefined ? { description: updates.description } : {}),
+        ...(updates.dependsOn !== undefined
+          ? { depends_on: updates.dependsOn.length > 0 ? updates.dependsOn : undefined }
+          : {}),
+        ...(updates.requiresCodeChange !== undefined
+          ? { requires_code_change: updates.requiresCodeChange }
+          : {}),
+        version: task.version + 1,
+        updated_at: timestamp
+      };
+      const blockers = computeTaskDependencyBlockers(
+        nextTaskBase,
+        new Map(status.tasks.map((entry) => [entry.id, entry]))
+      );
+      const nextTask: AgmoTeamTaskRecord =
+        task.status === "pending" || task.status === "blocked"
+          ? {
+              ...nextTaskBase,
+              status: blockers.length > 0 ? "blocked" : "pending",
+              blocked_by_dependencies: blockers.length > 0 ? blockers : undefined
+            }
+          : nextTaskBase;
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_updated",
+            team_name: normalizedTeamName,
+            task_id: taskId,
+            updated_fields: Object.keys(updates)
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        task: nextTask
+      };
+    },
+    cwd
+  );
+}
+
+export async function releaseTaskClaimForWorker(
+  teamName: string,
+  taskId: string,
+  workerName: string,
+  claimToken: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `release task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
+      assertTaskMutationGuard(task, workerName, {
+        expectedStatus: "in_progress",
+        claimToken
+      });
+      if (!task.claim) {
+        throw new Error(`task ${taskId} has no active claim`);
+      }
+
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: undefined,
+        status: "pending",
+        blocked_by_dependencies: undefined,
+        claim_history: [
+          ...(task.claim_history ?? []),
+          {
+            owner: task.claim.owner,
+            claimed_at: task.claim.claimed_at,
+            released_at: timestamp,
+            release_reason: "released"
+          }
+        ],
+        claim: undefined,
+        version: task.version + 1,
+        updated_at: timestamp
+      };
+      const workerStatus = await readWorkerStatusRecord(normalizedTeamName, workerName, cwd);
+      const workerWasOnTask = workerStatus.current_task_id === taskId;
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        ...(workerWasOnTask
+          ? [
+              writeWorkerStatus(
+                normalizedTeamName,
+                workerName,
+                {
+                  state: "idle",
+                  updated_at: timestamp
+                },
+                cwd
+              ),
+              bumpWorkerHeartbeat(
+                normalizedTeamName,
+                workerName,
+                { pid: resolveReportedWorkerPid() },
+                cwd
+              )
+            ]
+          : []),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_claim_released",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId,
+            worker_marked_idle: workerWasOnTask
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        task: nextTask,
+        worker_marked_idle: workerWasOnTask
       };
     },
     cwd
@@ -4688,7 +5632,11 @@ export async function completeTaskForWorker(
   taskId: string,
   workerName: string,
   result: string | undefined,
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  options: {
+    expectedStatus?: AgmoTeamTaskStatus;
+    claimToken?: string;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
   const completed = await withTeamStateLock(
@@ -4698,6 +5646,7 @@ export async function completeTaskForWorker(
     async () => {
       const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
       assertWorkerOwnsTask(task, workerName);
+      assertTaskMutationGuard(task, workerName, options);
 
       const timestamp = nowIso();
       const nextTask: AgmoTeamTaskRecord = {
@@ -4776,7 +5725,11 @@ export async function failTaskForWorker(
   taskId: string,
   workerName: string,
   error: string | undefined,
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  options: {
+    expectedStatus?: AgmoTeamTaskStatus;
+    claimToken?: string;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
   const failed = await withTeamStateLock(
@@ -4786,6 +5739,7 @@ export async function failTaskForWorker(
     async () => {
       const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
       assertWorkerOwnsTask(task, workerName);
+      assertTaskMutationGuard(task, workerName, options);
 
       const timestamp = nowIso();
       const nextTask: AgmoTeamTaskRecord = {
@@ -4892,6 +5846,777 @@ export async function heartbeatWorker(
     worker_name: workerName,
     heartbeat
   };
+}
+
+export async function updateWorkerHeartbeatState(
+  teamName: string,
+  workerName: string,
+  heartbeat: {
+    turnCount: number;
+    alive: boolean;
+    pid?: number;
+    lastTurnAt?: string;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const heartbeatPath = resolveWorkerHeartbeatPath(normalizedTeamName, workerName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `update worker heartbeat for ${workerName}`,
+    async () => {
+      await readWorkerIdentity(normalizedTeamName, workerName, cwd);
+      const current =
+        (await readJsonFile<AgmoWorkerHeartbeat>(heartbeatPath)) ??
+        buildDefaultWorkerHeartbeat();
+      const next: AgmoWorkerHeartbeat = {
+        ...current,
+        ...(heartbeat.pid !== undefined ? { pid: heartbeat.pid } : {}),
+        alive: heartbeat.alive,
+        turn_count: heartbeat.turnCount,
+        last_turn_at: heartbeat.lastTurnAt ?? nowIso()
+      };
+      await writeWorkerHeartbeat(normalizedTeamName, workerName, next, cwd);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        path: heartbeatPath,
+        written: true,
+        heartbeat: next
+      };
+    },
+    cwd
+  );
+}
+
+export async function writeWorkerInboxContent(
+  teamName: string,
+  workerName: string,
+  content: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const inboxPath = resolveWorkerInboxPath(normalizedTeamName, workerName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write worker inbox for ${workerName}`,
+    async () => {
+      await readWorkerIdentity(normalizedTeamName, workerName, cwd);
+      await writeTextFile(inboxPath, content);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        path: inboxPath,
+        written: true
+      };
+    },
+    cwd
+  );
+}
+
+export async function writeWorkerIdentityState(
+  teamName: string,
+  workerName: string,
+  identityUpdate: {
+    index: number;
+    role: string;
+    workingDir?: string;
+    worktreePath?: string;
+    teamStateRoot?: string;
+    paneId?: string;
+    gitBranch?: string;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const identityPath = resolveWorkerIdentityPath(normalizedTeamName, workerName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write worker identity for ${workerName}`,
+    async () => {
+      const current = await readWorkerIdentity(normalizedTeamName, workerName, cwd);
+      const next: AgmoWorkerIdentity = {
+        ...current,
+        name: workerName,
+        index: identityUpdate.index,
+        role: identityUpdate.role,
+        ...(identityUpdate.workingDir !== undefined
+          ? { working_dir: identityUpdate.workingDir }
+          : {}),
+        ...(identityUpdate.worktreePath !== undefined
+          ? { worktree_path: identityUpdate.worktreePath }
+          : {}),
+        ...(identityUpdate.teamStateRoot !== undefined
+          ? { team_state_root: identityUpdate.teamStateRoot }
+          : {}),
+        ...(identityUpdate.paneId !== undefined
+          ? { pane_id: identityUpdate.paneId }
+          : {}),
+        ...(identityUpdate.gitBranch !== undefined
+          ? { git_branch: identityUpdate.gitBranch }
+          : {})
+      };
+      await writeJsonFile(identityPath, next);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        path: identityPath,
+        written: true,
+        identity: next
+      };
+    },
+    cwd
+  );
+}
+
+export async function appendTeamApiEvent(
+  teamName: string,
+  input: {
+    type: string;
+    worker: string;
+    taskId?: string;
+    messageId?: string | null;
+    reason?: string;
+    state?: string;
+    prevState?: string;
+    toWorker?: string;
+    workerCount?: number;
+    sourceType?: string;
+    metadata?: Record<string, unknown>;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `append event ${input.type}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      const isLeaderEvent = input.worker === "leader" || input.worker === "leader-fixed";
+      if (!isLeaderEvent && !status.workers.some((worker) => worker.identity.name === input.worker)) {
+        throw new Error(`worker not found: ${input.worker}`);
+      }
+
+      const timestamp = nowIso();
+      const event = {
+        event_id: `evt-${randomUUID()}`,
+        team: normalizedTeamName,
+        team_name: normalizedTeamName,
+        type: input.type,
+        worker: input.worker,
+        worker_name: input.worker,
+        ...(input.taskId !== undefined ? { task_id: input.taskId } : {}),
+        ...(input.messageId !== undefined ? { message_id: input.messageId } : {}),
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        ...(input.state !== undefined ? { state: input.state } : {}),
+        ...(input.prevState !== undefined ? { prev_state: input.prevState } : {}),
+        ...(input.toWorker !== undefined ? { to_worker: input.toWorker } : {}),
+        ...(input.workerCount !== undefined ? { worker_count: input.workerCount } : {}),
+        ...(input.sourceType !== undefined ? { source_type: input.sourceType } : {}),
+        ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+        created_at: timestamp,
+        timestamp
+      };
+
+      await writeEvent(normalizedTeamName, event, cwd);
+
+      return {
+        team_name: normalizedTeamName,
+        event
+      };
+    },
+    cwd
+  );
+}
+
+type TeamApiEventRecord = Record<string, unknown> & {
+  event_id: string;
+  team: string;
+  team_name: string;
+  type: string;
+  worker: string;
+  worker_name: string;
+  created_at: string;
+  timestamp: string;
+};
+
+type TeamApiEventReadOptions = {
+  afterEventId?: string;
+  wakeableOnly?: boolean;
+  type?: string;
+  worker?: string;
+  taskId?: string;
+  wakeableEventTypes?: string[];
+};
+
+function cleanString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeTeamApiEvent(
+  raw: unknown,
+  teamName: string,
+  lineNumber: number
+): TeamApiEventRecord | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const value = raw as Record<string, unknown>;
+  const type = cleanString(value.type);
+  const createdAt = cleanString(value.created_at) ?? cleanString(value.timestamp);
+  if (!type || !createdAt) {
+    return null;
+  }
+
+  const eventId = cleanString(value.event_id) ?? `line-${lineNumber}`;
+  const team = cleanString(value.team) ?? cleanString(value.team_name) ?? teamName;
+  const worker = cleanString(value.worker) ?? cleanString(value.worker_name) ?? "leader-fixed";
+  const normalizedType = type === "worker_idle" ? "worker_state_changed" : type;
+  const sourceType = type === "worker_idle"
+    ? "worker_idle"
+    : cleanString(value.source_type);
+
+  return {
+    ...value,
+    event_id: eventId,
+    team,
+    team_name: cleanString(value.team_name) ?? team,
+    type: normalizedType,
+    worker,
+    worker_name: cleanString(value.worker_name) ?? worker,
+    ...(sourceType !== undefined ? { source_type: sourceType } : {}),
+    ...(type === "worker_idle" ? { state: "idle" } : {}),
+    created_at: createdAt,
+    timestamp: cleanString(value.timestamp) ?? createdAt
+  };
+}
+
+function eventMatchesTeamApiQuery(
+  event: TeamApiEventRecord,
+  options: TeamApiEventReadOptions
+): boolean {
+  if (options.type) {
+    const sourceType = cleanString(event.source_type);
+    if (event.type !== options.type && !(options.type === "worker_idle" && sourceType === "worker_idle")) {
+      return false;
+    }
+  }
+  if (options.worker && event.worker !== options.worker && event.worker_name !== options.worker) {
+    return false;
+  }
+  if (options.taskId && event.task_id !== options.taskId) {
+    return false;
+  }
+  if (options.wakeableOnly) {
+    const wakeable = new Set(options.wakeableEventTypes ?? []);
+    if (!wakeable.has(event.type)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function readTeamApiEvents(
+  teamName: string,
+  options: TeamApiEventReadOptions = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+
+  const path = resolveTeamEventsPath(normalizedTeamName, cwd);
+  if (!existsSync(path)) {
+    return {
+      team_name: normalizedTeamName,
+      count: 0,
+      cursor: options.afterEventId ?? "",
+      events: []
+    };
+  }
+
+  const raw = await readFile(path, "utf-8").catch(() => "");
+  const events: TeamApiEventRecord[] = [];
+  let started = !options.afterEventId;
+  let lastCursor = options.afterEventId ?? "";
+
+  raw.split("\n").forEach((line, index) => {
+    if (!line.trim()) {
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const event = normalizeTeamApiEvent(parsed, normalizedTeamName, index + 1);
+    if (!event) {
+      return;
+    }
+    if (!started) {
+      if (event.event_id === options.afterEventId) {
+        started = true;
+        lastCursor = event.event_id;
+      }
+      return;
+    }
+    if (!eventMatchesTeamApiQuery(event, options)) {
+      return;
+    }
+    lastCursor = event.event_id;
+    events.push(event);
+  });
+
+  return {
+    team_name: normalizedTeamName,
+    count: events.length,
+    cursor: events.at(-1)?.event_id ?? lastCursor,
+    events
+  };
+}
+
+export async function awaitTeamApiEvent(
+  teamName: string,
+  options: TeamApiEventReadOptions & {
+    timeoutMs: number;
+    pollMs?: number;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const deadline = Date.now() + Math.max(0, options.timeoutMs);
+  const pollMs = Math.max(25, options.pollMs ?? 100);
+
+  let cursor = options.afterEventId;
+  if (!cursor) {
+    const baseline = await readTeamApiEvents(
+      normalizedTeamName,
+      {
+        wakeableEventTypes: options.wakeableEventTypes
+      },
+      cwd
+    );
+    cursor = typeof baseline.cursor === "string" ? baseline.cursor : "";
+  }
+
+  while (Date.now() <= deadline) {
+    const result = await readTeamApiEvents(
+      normalizedTeamName,
+      {
+        ...options,
+        afterEventId: cursor
+      },
+      cwd
+    );
+    const events = Array.isArray(result.events) ? result.events as TeamApiEventRecord[] : [];
+    if (events.length > 0) {
+      const event = events[0];
+      return {
+        team_name: normalizedTeamName,
+        status: "event",
+        cursor: event.event_id,
+        event
+      };
+    }
+    if (typeof result.cursor === "string" && result.cursor) {
+      cursor = result.cursor;
+    }
+    if (Date.now() > deadline) {
+      break;
+    }
+    await sleepMs(pollMs);
+  }
+
+  return {
+    team_name: normalizedTeamName,
+    status: "timeout",
+    cursor: cursor ?? "",
+    event: null
+  };
+}
+
+type TeamApiMonitorSnapshotRecord = Record<string, unknown> & {
+  team_name: string;
+  checked_at: string;
+};
+
+function normalizeTeamApiMonitorSnapshot(
+  teamName: string,
+  raw: unknown
+): TeamApiMonitorSnapshotRecord {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("snapshot must be an object");
+  }
+
+  const snapshot = raw as Record<string, unknown>;
+  const snapshotTeamName = cleanString(snapshot.team_name);
+  const snapshotTeam = cleanString(snapshot.team);
+  if (snapshotTeamName && snapshotTeamName !== teamName) {
+    throw new Error(`snapshot team_name must match team_name: ${teamName}`);
+  }
+  if (snapshotTeam && snapshotTeam !== teamName) {
+    throw new Error(`snapshot team must match team_name: ${teamName}`);
+  }
+
+  return {
+    ...snapshot,
+    team_name: teamName,
+    checked_at: cleanString(snapshot.checked_at) ?? nowIso()
+  };
+}
+
+export async function readTeamApiMonitorSnapshot(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+
+  const path = resolveTeamMonitorSnapshotPath(normalizedTeamName, cwd);
+  const snapshot = await readJsonFile<Record<string, unknown>>(path);
+  if (!snapshot) {
+    return {
+      team_name: normalizedTeamName,
+      path,
+      found: false,
+      snapshot: null
+    };
+  }
+
+  return {
+    team_name: normalizedTeamName,
+    path,
+    found: true,
+    snapshot: normalizeTeamApiMonitorSnapshot(normalizedTeamName, snapshot)
+  };
+}
+
+export async function writeTeamApiMonitorSnapshot(
+  teamName: string,
+  snapshot: Record<string, unknown>,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const path = resolveTeamMonitorSnapshotPath(normalizedTeamName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    "write monitor snapshot",
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+
+      const nextSnapshot = normalizeTeamApiMonitorSnapshot(normalizedTeamName, snapshot);
+      await Promise.all([
+        writeJsonFile(path, nextSnapshot),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp: nowIso(),
+            type: "team_monitor_snapshot",
+            team_name: normalizedTeamName,
+            source: "team_api",
+            snapshot_checked_at: nextSnapshot.checked_at,
+            stale_workers:
+              typeof nextSnapshot.stale_workers === "number"
+                ? nextSnapshot.stale_workers
+                : undefined,
+            dead_workers:
+              typeof nextSnapshot.dead_workers === "number"
+                ? nextSnapshot.dead_workers
+                : undefined,
+            leader_health:
+              nextSnapshot.leader &&
+              typeof nextSnapshot.leader === "object" &&
+              "health" in nextSnapshot.leader
+                ? (nextSnapshot.leader as { health?: unknown }).health
+                : undefined,
+            hud_health:
+              nextSnapshot.hud &&
+              typeof nextSnapshot.hud === "object" &&
+              "health" in nextSnapshot.hud
+                ? (nextSnapshot.hud as { health?: unknown }).health
+                : undefined,
+            layout_health: nextSnapshot.layout_health
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        path,
+        written: true,
+        snapshot: nextSnapshot
+      };
+    },
+    cwd
+  );
+}
+
+export async function writeTeamApiShutdownRequest(
+  teamName: string,
+  workerName: string,
+  requestedBy: string,
+  options: {
+    graceMs?: number;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write shutdown request for ${workerName}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      if (!status.workers.some((worker) => worker.identity.name === workerName)) {
+        throw new Error(`worker not found: ${workerName}`);
+      }
+
+      const previous = await readShutdownState(normalizedTeamName, cwd);
+      const timestamp = nowIso();
+      const graceMs = Math.max(options.graceMs ?? DEFAULT_SHUTDOWN_GRACE_MS, 0);
+      const acknowledgements = previous?.acknowledgements ?? [];
+      const shutdownState: AgmoTeamShutdownState = {
+        requested: true,
+        request_id: `shutdown-${randomUUID()}`,
+        requested_at: timestamp,
+        requested_by: requestedBy,
+        requested_worker: workerName,
+        grace_ms: graceMs,
+        hard_kill_after_at: new Date(Date.parse(timestamp) + graceMs).toISOString(),
+        message: `Shutdown requested by ${requestedBy}. Finish current note, report idle, and exit worker ${workerName}.`,
+        acknowledgements,
+        aggregate: buildShutdownAckAggregate(acknowledgements)
+      };
+
+      await Promise.all([
+        writeShutdownState(normalizedTeamName, shutdownState, cwd),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "shutdown_gate",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            requested_by: requestedBy,
+            shutdown_request_id: shutdownState.request_id,
+            grace_ms: graceMs
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        worker: workerName,
+        shutdown_request: shutdownState
+      };
+    },
+    cwd
+  );
+}
+
+export async function readTeamApiShutdownAck(
+  teamName: string,
+  workerName: string,
+  options: {
+    minUpdatedAt?: string;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.workers.some((worker) => worker.identity.name === workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const shutdown = await readShutdownState(normalizedTeamName, cwd);
+  const ack = shutdown?.acknowledgements.find((entry) => entry.worker_name === workerName) ?? null;
+  const minUpdatedAt = cleanString(options.minUpdatedAt);
+  const freshAck =
+    ack && minUpdatedAt
+      ? (() => {
+          const minTs = Date.parse(minUpdatedAt);
+          const ackTs = Date.parse(ack.acked_at);
+          return Number.isFinite(minTs) && Number.isFinite(ackTs) && ackTs >= minTs
+            ? ack
+            : null;
+        })()
+      : ack;
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    ack: freshAck,
+    shutdown_request: shutdown
+      ? {
+          request_id: shutdown.request_id,
+          requested: shutdown.requested,
+          requested_at: shutdown.requested_at,
+          requested_by: shutdown.requested_by,
+          requested_worker: shutdown.requested_worker,
+          aggregate: shutdown.aggregate ?? buildShutdownAckAggregate(shutdown.acknowledgements)
+        }
+      : null
+  };
+}
+
+function normalizeTeamTaskApprovalRecord(
+  taskId: string,
+  raw: unknown
+): AgmoTeamTaskApprovalRecord | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const value = raw as Record<string, unknown>;
+  if (value.task_id !== taskId) {
+    return null;
+  }
+  if (
+    value.status !== "pending" &&
+    value.status !== "approved" &&
+    value.status !== "rejected"
+  ) {
+    return null;
+  }
+  const reviewer = cleanString(value.reviewer);
+  const decisionReason = cleanString(value.decision_reason);
+  const decidedAt = cleanString(value.decided_at);
+  if (!reviewer || !decisionReason || !decidedAt) {
+    return null;
+  }
+
+  return {
+    task_id: taskId,
+    required: value.required !== false,
+    status: value.status,
+    reviewer,
+    decision_reason: decisionReason,
+    decided_at: decidedAt
+  };
+}
+
+export async function readTeamTaskApprovalState(
+  teamName: string,
+  taskId: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.tasks.some((task) => task.id === taskId)) {
+    throw new Error(`task not found: ${taskId}`);
+  }
+
+  const path = resolveTeamTaskApprovalPath(normalizedTeamName, taskId, cwd);
+  const raw = await readJsonFile<Record<string, unknown>>(path);
+  const approval = normalizeTeamTaskApprovalRecord(taskId, raw);
+  return {
+    team_name: normalizedTeamName,
+    task_id: taskId,
+    path,
+    approval
+  };
+}
+
+export async function writeTeamTaskApprovalState(
+  teamName: string,
+  input: {
+    taskId: string;
+    required: boolean;
+    status: AgmoTeamTaskApprovalRecord["status"];
+    reviewer: string;
+    decisionReason: string;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const path = resolveTeamTaskApprovalPath(normalizedTeamName, input.taskId, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write task approval for ${input.taskId}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      if (!status.tasks.some((task) => task.id === input.taskId)) {
+        throw new Error(`task not found: ${input.taskId}`);
+      }
+      const reviewerIsLeader = input.reviewer === "leader" || input.reviewer === "leader-fixed";
+      if (
+        !reviewerIsLeader &&
+        !status.workers.some((worker) => worker.identity.name === input.reviewer)
+      ) {
+        throw new Error(`worker not found: ${input.reviewer}`);
+      }
+
+      const approval: AgmoTeamTaskApprovalRecord = {
+        task_id: input.taskId,
+        required: input.required,
+        status: input.status,
+        reviewer: input.reviewer,
+        decision_reason: input.decisionReason,
+        decided_at: nowIso()
+      };
+
+      await Promise.all([
+        writeJsonFile(path, approval),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp: approval.decided_at,
+            type: "approval_decision",
+            team_name: normalizedTeamName,
+            worker_name: input.reviewer,
+            worker: input.reviewer,
+            task_id: input.taskId,
+            status: input.status,
+            required: input.required,
+            reason: `${input.status}:${input.decisionReason}`
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        task_id: input.taskId,
+        path,
+        approval
+      };
+    },
+    cwd
+  );
 }
 
 export async function reportWorkerStatus(

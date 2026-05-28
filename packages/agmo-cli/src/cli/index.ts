@@ -104,8 +104,10 @@ Usage:
   agmo hooks sync
   agmo internal hook
   agmo team start <workers> "<task>" [--allocation-intent <intent>] [--role-map worker-1=role,...] [--hud] [--hud-refresh-ms <ms>]
+  agmo team api <send-message|broadcast|mailbox-list|mailbox-mark-delivered|mailbox-mark-notified|create-task|update-task|release-task-claim|read-config|read-manifest|read-worker-status|read-worker-heartbeat|update-worker-heartbeat|write-worker-inbox|write-worker-identity|append-event|read-events|await-event|read-monitor-snapshot|write-monitor-snapshot|write-shutdown-request|read-shutdown-ack|read-idle-state|read-stall-state|read-task-approval|write-task-approval|read-task|list-tasks|get-summary|cleanup|orphan-cleanup|claim-task|transition-task-status> --input '<json>' --json
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
+  agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]
   agmo team shutdown-ack <team> <worker> <accepted|busy|rejected> [--reason <text>] [--task <id>]
   agmo team cleanup-stale [--stale-ms <ms>] [--dead-ms <ms>] [--include-stale|--no-include-stale] [--dry-run|--no-dry-run] [--retry-pane-closes|--no-retry-pane-closes] [--sweep-tmux|--no-sweep-tmux]
   agmo team claim <team> <task-id> <worker> [--ignore-dependencies]
@@ -114,7 +116,7 @@ Usage:
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--auto-nudge] [--auto-reclaim] [--escalate-leader] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--email|--no-email] [--email-to <a,b>]
-  agmo team hud <team> [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
+  agmo team hud <team> [--json] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
   agmo team layout status <team>
   agmo team layout repair <team> [--dry-run] [--force]
   agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]

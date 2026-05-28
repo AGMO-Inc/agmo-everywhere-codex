@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,8 +9,10 @@ import {
   claimTaskForWorker,
   cleanupStaleTeamRuntimes,
   completeTaskForWorker,
+  deleteTeamRuntime,
   heartbeatWorker,
   monitorTeamRuntime,
+  readTeamLayoutStatus,
   readTeamStatus,
   readTeamTmuxHealthSummary,
   recordWorkerHookActivity,
@@ -23,6 +26,7 @@ import {
 import {
   resolveTeamConfigPath,
   resolveTeamDispatchPath,
+  resolveTeamDir,
   resolveTeamHudRepairPath,
   resolveTeamPaneCloseRetryPath,
   resolveTeamTaskPath,
@@ -33,6 +37,202 @@ import {
   acquireTeamStateLock,
   resolveTeamStateLockPath
 } from "./state/locks.js";
+import {
+  resolveTeamWorktreeManifestPath,
+  resolveTeamWorktreeRoot
+} from "./worktree.js";
+
+test("startTeamRuntime writes a worktree ownership manifest after provisioning", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-worktree-manifest-"));
+  const teamName = "manifest-team";
+
+  const result = await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Write worktree manifest",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+
+  const manifest = JSON.parse(
+    await readFile(resolveTeamWorktreeManifestPath(teamName, tempRoot), "utf8")
+  ) as {
+    team_name: string;
+    worktree_root: string;
+    workers: Array<{ worker_name: string; path: string; git_enabled: boolean }>;
+  };
+
+  assert.equal(manifest.team_name, teamName);
+  assert.equal(manifest.worktree_root, join(tempRoot, ".agmo", "worktrees", teamName));
+  assert.deepEqual(
+    manifest.workers.map((worker) => worker.worker_name),
+    ["worker-1", "worker-2"]
+  );
+  assert.equal(
+    ((result.worktree_manifest as { workers: unknown[] }).workers).length,
+    2
+  );
+});
+
+test("startTeamRuntime rejects non-canonical explicit team names before writing state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-invalid-name-"));
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "Invalid Team",
+        workerCount: 1,
+        task: "Reject non-canonical team name",
+        mode: "interactive"
+      },
+      tempRoot
+    ),
+    /teamName must match/
+  );
+
+  assert.equal(existsSync(resolveTeamDir("invalid-team", tempRoot)), false);
+});
+
+test("startTeamRuntime validates task text and role overrides before writing state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-start-validation-"));
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "blank-task",
+        workerCount: 1,
+        task: "   ",
+        mode: "interactive"
+      },
+      tempRoot
+    ),
+    /task is required/
+  );
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "unknown-worker-role",
+        workerCount: 1,
+        task: "Reject unknown worker role override",
+        mode: "interactive",
+        roleOverrides: {
+          "worker-2": "agmo-executor"
+        }
+      },
+      tempRoot
+    ),
+    /unknown worker: worker-2/
+  );
+
+  await assert.rejects(
+    startTeamRuntime(
+      {
+        teamName: "unknown-role",
+        workerCount: 1,
+        task: "Reject unsupported role override",
+        mode: "interactive",
+        roleOverrides: {
+          "worker-1": "executor"
+        }
+      },
+      tempRoot
+    ),
+    /must be one of: agmo-planner/
+  );
+
+  assert.equal(existsSync(resolveTeamDir("blank-task", tempRoot)), false);
+  assert.equal(existsSync(resolveTeamDir("unknown-worker-role", tempRoot)), false);
+  assert.equal(existsSync(resolveTeamDir("unknown-role", tempRoot)), false);
+});
+
+test("deleteTeamRuntime preserves state when worktree manifest points outside the team root", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-delete-unsafe-worktree-"));
+  const teamName = "delete-unsafe-worktree";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Preserve state on unsafe worktree cleanup",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  await shutdownTeamRuntime(teamName, { graceMs: 0 }, tempRoot);
+
+  const outsideWorkerPath = join(tempRoot, "outside-worker");
+  await mkdir(outsideWorkerPath, { recursive: true });
+  await writeFile(
+    resolveTeamWorktreeManifestPath(teamName, tempRoot),
+    `${JSON.stringify(
+      {
+        version: 1,
+        team_name: teamName,
+        created_at: new Date().toISOString(),
+        project_root: tempRoot,
+        cwd: tempRoot,
+        worktree_root: resolveTeamWorktreeRoot(teamName, tempRoot),
+        workers: [
+          {
+            worker_name: "worker-1",
+            path: outsideWorkerPath,
+            git_enabled: false,
+            repo_root: tempRoot,
+            base_ref: "filesystem",
+            status: "existing"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = await deleteTeamRuntime(teamName, {}, tempRoot);
+
+  assert.equal(result.status, "blocked_worktree_cleanup");
+  assert.equal((result.worktree_cleanup as { status?: string }).status, "skipped");
+  assert.equal((result.state_removal as { status?: string }).status, "skipped");
+  assert.match(
+    (result.state_removal as { reason?: string }).reason ?? "",
+    /unsafe worker worktree path/
+  );
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), true);
+  assert.equal(existsSync(outsideWorkerPath), true);
+});
+
+test("deleteTeamRuntime preserves state when the worktree manifest is missing but root remains", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-delete-missing-manifest-"));
+  const teamName = "delete-missing-manifest";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Preserve state without worktree ownership proof",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  await shutdownTeamRuntime(teamName, { graceMs: 0 }, tempRoot);
+  await unlink(resolveTeamWorktreeManifestPath(teamName, tempRoot));
+
+  const result = await deleteTeamRuntime(teamName, {}, tempRoot);
+
+  assert.equal(result.status, "blocked_worktree_cleanup");
+  assert.equal((result.worktree_cleanup as { manifest_status?: string }).manifest_status, "missing");
+  assert.equal((result.state_removal as { status?: string }).status, "skipped");
+  assert.match(
+    (result.state_removal as { reason?: string }).reason ?? "",
+    /ownership manifest missing/
+  );
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), true);
+  assert.equal(existsSync(resolveTeamWorktreeRoot(teamName, tempRoot)), true);
+});
 
 test("shutdownTeamRuntime clears active worker, task, and dispatch state", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-shutdown-"));
@@ -1107,6 +1307,51 @@ test("repairTeamHudPane debounces repeated repair attempts", async () => {
     repairState.recent.map((entry) => entry.status),
     ["failed", "debounced"]
   );
+});
+
+test("readTeamLayoutStatus exposes tmux layout planner capacity details", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-layout-plan-"));
+  const teamName = "layout-plan-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Expose layout plan",
+      mode: "interactive"
+    },
+    tempRoot
+  );
+  const configPath = resolveTeamConfigPath(teamName, tempRoot);
+  const config = JSON.parse(await readFile(configPath, "utf8")) as {
+    transport: string;
+    tmux: {
+      session_id?: string | null;
+      leader_pane_id: string | null;
+      hud_pane_id?: string | null;
+      worker_pane_ids: Record<string, string>;
+    };
+  };
+  config.transport = "tmux";
+  config.tmux.session_id = "$missing-session";
+  config.tmux.leader_pane_id = "%997";
+  config.tmux.hud_pane_id = "%998";
+  config.tmux.worker_pane_ids = {
+    "worker-1": "%996",
+    "worker-2": "%995"
+  };
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+  const status = await readTeamLayoutStatus(teamName, tempRoot);
+  assert.equal(status.transport, "tmux");
+  assert.equal(status.layout_plan?.choice, "leader-left-stack-right");
+  assert.equal(status.layout_plan?.selected_reason, "geometry_unavailable_fallback");
+  assert.equal(status.layout_plan?.metrics.requested_workers, 2);
+  assert.equal(status.layout_plan?.metrics.usable_height, null);
+  assert.equal(status.layout_plan?.metrics.overflow_workers, 2);
+  assert.ok(status.warnings.includes("tmux_geometry_unavailable"));
+  assert.ok(status.recommended_actions.includes("team layout rebalance --dry-run"));
+  assert.ok(status.recommended_actions.includes("resize terminal or reduce worker count"));
 });
 
 test("shutdown acknowledgement protocol records accepted, busy, and rejected states", async () => {

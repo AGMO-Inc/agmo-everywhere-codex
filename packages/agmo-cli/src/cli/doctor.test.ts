@@ -44,11 +44,18 @@ test("runDoctorCommand reports launch workspace cleanup guidance without legacy 
     "command",
     "launch_policy",
     "launch_workspaces",
+    "ok",
+    "operation",
     "paths",
     "recommendations",
+    "recommended_actions",
+    "schema_version",
     "scope",
     "vault",
   ]);
+  assert.equal(output.schema_version, "1.0");
+  assert.equal(output.operation, "doctor");
+  assert.equal(typeof output.ok, "boolean");
   assert.equal(output.command, "doctor");
   assert.equal(output.scope, "project");
   assert.ok(output.checks && typeof output.checks === "object");
@@ -56,6 +63,7 @@ test("runDoctorCommand reports launch workspace cleanup guidance without legacy 
   assert.ok(output.paths && typeof output.paths === "object");
   assert.ok(output.vault && typeof output.vault === "object");
   assert.ok(output.launch_workspaces && typeof output.launch_workspaces === "object");
+  assert.ok(Array.isArray(output.recommended_actions));
   assert.equal("legacy_runtime" in output, false);
   assert.equal("legacy_runtime" in output.recommendations, false);
   assert.ok(Array.isArray(output.recommendations.setup));

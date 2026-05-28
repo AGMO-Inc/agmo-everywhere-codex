@@ -22,6 +22,8 @@ export type AgmoTeamTaskRecord = {
   claim?: {
     owner: string;
     claimed_at: string;
+    token?: string;
+    leased_until?: string;
   };
   claim_history?: Array<{
     owner: string;
