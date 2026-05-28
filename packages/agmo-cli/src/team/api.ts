@@ -48,6 +48,8 @@ export type TeamApiOperation =
   | "write-monitor-snapshot"
   | "write-shutdown-request"
   | "read-shutdown-ack"
+  | "read-idle-state"
+  | "read-stall-state"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -459,6 +461,185 @@ function buildTaskCounts(tasks: Array<{ status: AgmoTeamTaskStatus }>): Record<A
       tasks.filter((task) => task.status === status).length
     ])
   ) as Record<AgmoTeamTaskStatus, number>;
+}
+
+type TeamApiDerivedEvent = Record<string, unknown> & {
+  event_id?: string;
+  type?: string;
+  worker?: string;
+  task_id?: string;
+  created_at?: string;
+  reason?: string;
+  state?: string;
+  prev_state?: string;
+  source_type?: string;
+  worker_count?: number;
+};
+
+function summarizeDerivedEvent(event: TeamApiDerivedEvent | null): Record<string, unknown> | null {
+  if (!event) {
+    return null;
+  }
+
+  return {
+    event_id: event.event_id ?? null,
+    type: event.type ?? null,
+    worker: event.worker ?? null,
+    task_id: event.task_id ?? null,
+    created_at: event.created_at ?? null,
+    reason: event.reason ?? null,
+    intent:
+      typeof event.intent === "string"
+        ? event.intent
+        : typeof event.orchestration_intent === "string"
+          ? event.orchestration_intent
+          : null,
+    state: event.state ?? null,
+    prev_state: event.prev_state ?? null,
+    source_type: event.source_type ?? null,
+    worker_count: event.worker_count ?? null
+  };
+}
+
+function findLatestDerivedEvent(
+  events: TeamApiDerivedEvent[],
+  predicate: (event: TeamApiDerivedEvent) => boolean
+): TeamApiDerivedEvent | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event && predicate(event)) {
+      return event;
+    }
+  }
+  return null;
+}
+
+function buildIdleStateData(
+  teamName: string,
+  status: NonNullable<Awaited<ReturnType<typeof readTeamStatus>>>,
+  events: TeamApiDerivedEvent[],
+  snapshotAvailable: boolean
+): Record<string, unknown> {
+  const workerNames = status.workers.map((worker) => worker.identity.name);
+  const idleWorkers = status.workers
+    .filter((worker) => worker.status.state === "idle" || worker.status.state === "done")
+    .map((worker) => worker.identity.name);
+  const nonIdleWorkers = workerNames.filter((workerName) => !idleWorkers.includes(workerName));
+  const lastIdleTransitionByWorker = Object.fromEntries(
+    workerNames.map((workerName) => [
+      workerName,
+      summarizeDerivedEvent(
+        findLatestDerivedEvent(
+          events,
+          (event) =>
+            event.worker === workerName &&
+            event.type === "worker_state_changed" &&
+            event.state === "idle"
+        )
+      )
+    ])
+  );
+  const lastAllWorkersIdleEvent = findLatestDerivedEvent(
+    events,
+    (event) => event.type === "all_workers_idle"
+  );
+
+  return {
+    team_name: teamName,
+    worker_count: workerNames.length,
+    idle_worker_count: idleWorkers.length,
+    idle_workers: idleWorkers,
+    non_idle_workers: nonIdleWorkers,
+    all_workers_idle: workerNames.length > 0 && idleWorkers.length === workerNames.length,
+    last_idle_transition_by_worker: lastIdleTransitionByWorker,
+    last_all_workers_idle_event: summarizeDerivedEvent(lastAllWorkersIdleEvent),
+    source: {
+      summary_available: true,
+      snapshot_available: snapshotAvailable,
+      recent_event_count: events.length
+    }
+  };
+}
+
+function buildStallStateData(
+  teamName: string,
+  status: NonNullable<Awaited<ReturnType<typeof readTeamStatus>>>,
+  idleState: Record<string, unknown>,
+  events: TeamApiDerivedEvent[],
+  snapshotAvailable: boolean
+): Record<string, unknown> {
+  const taskCounts = buildTaskCounts(status.tasks);
+  const pendingTaskCount = taskCounts.pending + taskCounts.blocked + taskCounts.in_progress;
+  const deadWorkers = status.workers
+    .filter((worker) => worker.heartbeat.alive === false)
+    .map((worker) => worker.identity.name)
+    .sort();
+  const liveWorkers = status.workers
+    .filter((worker) => worker.heartbeat.alive !== false)
+    .map((worker) => worker.identity.name)
+    .sort();
+  const pendingLeaderDispatchCount = status.dispatch_requests.filter(
+    (request) =>
+      request.to_worker === "leader-fixed" &&
+      (request.status === "pending" || request.status === "notified")
+  ).length;
+  const allWorkersIdle = idleState.all_workers_idle === true;
+  const leaderDecisionState =
+    pendingTaskCount === 0 && allWorkersIdle && liveWorkers.length > 0
+      ? "done_waiting_on_leader"
+      : taskCounts.blocked > 0 &&
+          taskCounts.pending === 0 &&
+          taskCounts.in_progress === 0 &&
+          allWorkersIdle
+        ? "stuck_waiting_on_leader"
+        : "still_actionable";
+  const leaderAttentionPending = pendingLeaderDispatchCount > 0;
+  const teamStalled =
+    leaderAttentionPending ||
+    (deadWorkers.length > 0 && pendingTaskCount > 0);
+  const reasons: string[] = [];
+  if (deadWorkers.length > 0 && pendingTaskCount > 0) {
+    reasons.push(`dead_workers_with_pending_work:${deadWorkers.join(",")}`);
+  }
+  if (leaderDecisionState !== "still_actionable") {
+    reasons.push(`leader_decision_pending:${leaderDecisionState}`);
+  }
+  if (pendingLeaderDispatchCount > 0) {
+    reasons.push("leader_attention_pending:leader_dispatch_pending");
+  }
+
+  return {
+    team_name: teamName,
+    team_stalled: teamStalled,
+    leader_stale: false,
+    leader_attention_pending: leaderAttentionPending,
+    leader_decision_state: leaderDecisionState,
+    stalled_workers: [],
+    dead_workers: deadWorkers,
+    live_workers: liveWorkers,
+    pending_task_count: pendingTaskCount,
+    unread_leader_message_count: 0,
+    pending_leader_dispatch_count: pendingLeaderDispatchCount,
+    all_workers_idle: allWorkersIdle,
+    idle_workers: idleState.idle_workers ?? [],
+    reasons,
+    leader_attention_state: null,
+    last_all_workers_idle_event: summarizeDerivedEvent(
+      findLatestDerivedEvent(events, (event) => event.type === "all_workers_idle")
+    ),
+    last_team_leader_nudge_event: summarizeDerivedEvent(
+      findLatestDerivedEvent(events, (event) => event.type === "team_leader_nudge")
+    ),
+    last_leader_notification_deferred_event: summarizeDerivedEvent(
+      findLatestDerivedEvent(events, (event) => event.type === "leader_notification_deferred")
+    ),
+    source: {
+      summary_available: true,
+      snapshot_available: snapshotAvailable,
+      phase_available: true,
+      recent_event_count: events.length
+    }
+  };
 }
 
 function workerExists(
@@ -938,6 +1119,41 @@ export async function executeTeamApiOperation(
           },
           cwd
         )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "read-idle-state" || operation === "read-stall-state") {
+    try {
+      const [eventsResult, monitorResult] = await Promise.all([
+        readTeamApiEvents(
+          teamName,
+          {
+            wakeableEventTypes: [...TEAM_API_WAKEABLE_EVENT_TYPES]
+          },
+          cwd
+        ),
+        readTeamApiMonitorSnapshot(teamName, cwd)
+      ]);
+      const events = Array.isArray(eventsResult.events)
+        ? (eventsResult.events as TeamApiDerivedEvent[])
+        : [];
+      const snapshotAvailable =
+        Boolean(
+          monitorResult &&
+            typeof monitorResult === "object" &&
+            "found" in monitorResult &&
+            monitorResult.found === true
+        );
+      const idleState = buildIdleStateData(teamName, status, events, snapshotAvailable);
+      return dataEnvelope(
+        operation,
+        operation === "read-idle-state"
+          ? idleState
+          : buildStallStateData(teamName, status, idleState, events, snapshotAvailable)
       );
     } catch (error) {
       const mapped = mapRuntimeError(error);

@@ -153,6 +153,8 @@ const TEAM_API_OPERATION_NAMES = [
   "write-monitor-snapshot",
   "write-shutdown-request",
   "read-shutdown-ack",
+  "read-idle-state",
+  "read-stall-state",
   "read-task",
   "list-tasks",
   "get-summary",

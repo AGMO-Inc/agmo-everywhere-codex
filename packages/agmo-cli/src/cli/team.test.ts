@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import os from "node:os";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { appendTeamApiEvent, shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
 import {
   resolveTeamDir,
+  resolveTeamDispatchPath,
   resolveTeamEventsPath,
   resolveTeamManifestPath,
   resolveTeamMonitorSnapshotPath,
@@ -1416,6 +1417,181 @@ test("runTeamCommand team api rejects invalid shutdown handshake input", async (
     code: "worker_not_found",
     message: "worker not found: worker-404",
   });
+});
+
+test("runTeamCommand team api reads idle state from durable worker status and events", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-idle-state-"));
+  const teamName = "cli-api-idle-state-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Expose idle state API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        type: "worker_idle",
+        worker: "worker-1",
+        prev_state: "working",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        type: "all_workers_idle",
+        worker: "leader-fixed",
+        worker_count: 2,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  await captureTeamCommand(["report", teamName, "worker-2", "working"], tempRoot);
+
+  const result = await captureTeamCommand(
+    ["api", "read-idle-state", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+
+  assertMachineEnvelope(result, "read-idle-state");
+  const data = result.data as {
+    worker_count?: number;
+    idle_worker_count?: number;
+    idle_workers?: string[];
+    non_idle_workers?: string[];
+    all_workers_idle?: boolean;
+    last_idle_transition_by_worker?: Record<string, { type?: string; source_type?: string; state?: string } | null>;
+    last_all_workers_idle_event?: { type?: string; worker_count?: number } | null;
+    source?: { summary_available?: boolean; snapshot_available?: boolean; recent_event_count?: number };
+  };
+  assert.equal(data.worker_count, 2);
+  assert.equal(data.idle_worker_count, 1);
+  assert.deepEqual(data.idle_workers, ["worker-1"]);
+  assert.deepEqual(data.non_idle_workers, ["worker-2"]);
+  assert.equal(data.all_workers_idle, false);
+  assert.equal(data.last_idle_transition_by_worker?.["worker-1"]?.type, "worker_state_changed");
+  assert.equal(data.last_idle_transition_by_worker?.["worker-1"]?.source_type, "worker_idle");
+  assert.equal(data.last_idle_transition_by_worker?.["worker-1"]?.state, "idle");
+  assert.equal(data.last_idle_transition_by_worker?.["worker-2"], null);
+  assert.equal(data.last_all_workers_idle_event?.type, "all_workers_idle");
+  assert.equal(data.last_all_workers_idle_event?.worker_count, 2);
+  assert.equal(data.source?.summary_available, true);
+  assert.equal(data.source?.snapshot_available, false);
+  assert.ok((data.source?.recent_event_count ?? 0) >= 2);
+});
+
+test("runTeamCommand team api reads stall state from durable heartbeats and dispatch", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-stall-state-"));
+  const teamName = "cli-api-stall-state-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose stall state API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  await captureTeamCommand(
+    [
+      "api",
+      "update-worker-heartbeat",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        turn_count: 1,
+        alive: false,
+        last_turn_at: "2026-05-28T00:00:00.000Z",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  await writeFile(
+    resolveTeamDispatchPath(teamName, tempRoot),
+    `${JSON.stringify(
+      [
+        {
+          request_id: "req-leader-1",
+          kind: "inbox",
+          to_worker: "leader-fixed",
+          status: "pending",
+          created_at: "2026-05-28T00:00:00.000Z",
+        },
+      ],
+      null,
+      2,
+    )}\n`,
+    "utf-8",
+  );
+  await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        type: "team_leader_nudge",
+        worker: "leader-fixed",
+        reason: "pending decision",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+
+  const result = await captureTeamCommand(
+    ["api", "read-stall-state", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+
+  assertMachineEnvelope(result, "read-stall-state");
+  const data = result.data as {
+    team_stalled?: boolean;
+    leader_attention_pending?: boolean;
+    leader_decision_state?: string;
+    dead_workers?: string[];
+    live_workers?: string[];
+    pending_task_count?: number;
+    pending_leader_dispatch_count?: number;
+    reasons?: string[];
+    last_team_leader_nudge_event?: { type?: string; reason?: string } | null;
+    source?: { summary_available?: boolean; phase_available?: boolean; recent_event_count?: number };
+  };
+  assert.equal(data.team_stalled, true);
+  assert.equal(data.leader_attention_pending, true);
+  assert.equal(data.leader_decision_state, "still_actionable");
+  assert.deepEqual(data.dead_workers, ["worker-1"]);
+  assert.deepEqual(data.live_workers, []);
+  assert.ok((data.pending_task_count ?? 0) > 0);
+  assert.equal(data.pending_leader_dispatch_count, 1);
+  assert.ok(data.reasons?.includes("dead_workers_with_pending_work:worker-1"));
+  assert.ok(data.reasons?.includes("leader_attention_pending:leader_dispatch_pending"));
+  assert.equal(data.last_team_leader_nudge_event?.type, "team_leader_nudge");
+  assert.equal(data.last_team_leader_nudge_event?.reason, "pending decision");
+  assert.equal(data.source?.summary_available, true);
+  assert.equal(data.source?.phase_available, true);
+  assert.ok((data.source?.recent_event_count ?? 0) >= 1);
 });
 
 test("runTeamCommand team api sends, lists, and marks mailbox messages delivered", async () => {
