@@ -2872,6 +2872,46 @@ test("runTeamCommand hud accepts sidecar preset and rejects invalid presets", as
   );
 });
 
+test("runTeamCommand hud sidecar includes durable event and topology context", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-sidecar-events-"));
+  const teamName = "cli-hud-sidecar-events-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Render HUD sidecar with durable events",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+  await appendTeamApiEvent(
+    teamName,
+    { type: "task_completed", worker: "worker-1", taskId: "1", reason: "verified" },
+    tempRoot,
+  );
+  await appendTeamApiEvent(
+    teamName,
+    { type: "worker_state_changed", worker: "worker-2", taskId: "2", state: "idle" },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommandText(
+    ["hud", teamName, "--preset", "sidecar", "--width", "160", "--max-lines", "8", "--no-color"],
+    tempRoot,
+  );
+
+  assert.match(output, /AGMO sidecar/);
+  assert.match(output, /topology leader->worker-1/);
+  assert.match(output, /leader->worker-2/);
+  assert.match(output, /events worker-2:worker_state_changed state=idle t=2/);
+  assert.match(output, /worker-1:task_completed t=1 verified/);
+  assert.doesNotMatch(output, /\x1b\[/);
+  for (const line of output.trimEnd().split("\n")) {
+    assert.ok(line.length <= 160, line);
+  }
+});
+
 test("runTeamCommand hud json emits a machine envelope with rendered text", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-json-"));
   const teamName = "cli-hud-json-team";

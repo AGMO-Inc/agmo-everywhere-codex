@@ -2,6 +2,7 @@ import type { AgmoTeamStatusSnapshot } from "./state/index.js";
 import type { AgmoTeamMonitorSnapshot } from "./state/monitor.js";
 import {
   colorize,
+  ellipsize,
   fitLines,
   resolveColorEnabled,
   sanitizeTerminalText,
@@ -32,6 +33,17 @@ export type TeamHudSuggestedAction = {
   mutating?: boolean;
 };
 
+export type TeamHudRecentEvent = {
+  eventId?: string;
+  type: string;
+  sourceType?: string;
+  worker?: string;
+  taskId?: string;
+  state?: string;
+  reason?: string;
+  createdAt?: string;
+};
+
 type TeamHudHighlight = {
   severity: TeamHudActionSeverity;
   target: string;
@@ -49,6 +61,7 @@ export type TeamHudRenderContext = {
   openLoadDelta: number;
   topActions: string[];
   suggestedActions?: TeamHudSuggestedAction[];
+  recentEvents?: TeamHudRecentEvent[];
 };
 
 export type TeamHudRenderOptions = {
@@ -181,6 +194,7 @@ export function buildTeamHudRenderContext(
     openLoadDelta: number;
     topActions: string[];
     suggestedActions?: TeamHudSuggestedAction[];
+    recentEvents?: TeamHudRecentEvent[];
   }
 ): TeamHudRenderContext {
   return {
@@ -193,7 +207,8 @@ export function buildTeamHudRenderContext(
     openLoads: Object.fromEntries(values.openLoads.entries()),
     openLoadDelta: values.openLoadDelta,
     topActions: [...values.topActions],
-    suggestedActions: values.suggestedActions ? [...values.suggestedActions] : undefined
+    suggestedActions: values.suggestedActions ? [...values.suggestedActions] : undefined,
+    recentEvents: values.recentEvents ? [...values.recentEvents] : undefined
   };
 }
 
@@ -289,8 +304,17 @@ function formatActionLine(
   return `- ${action.key} [${action.severity}] ${clean(action.label)}: ${clean(action.reason)}${commandSuffix}`;
 }
 
-function formatSidecarActionLine(action: TeamHudSuggestedAction): string {
-  return `${action.key}:${action.severity}(${clean(action.reason)})`;
+function compactSidecarCommand(command: string): string {
+  return clean(command).replace(/^agmo team /, "");
+}
+
+function formatSidecarActionLine(action: TeamHudSuggestedAction, teamName: string): string {
+  const safeCommand = resolveActionCommand(action, "focused", teamName);
+  const command = safeCommand ?? resolveActionCommand(action, "full", teamName);
+  const commandHint = command
+    ? `${command.mutating ? "manual" : "cmd"}=${compactSidecarCommand(command.command)}`
+    : `next=${clean(action.label)}`;
+  return `${clean(action.key)}:${action.severity} ${commandHint} (${clean(action.reason)})`;
 }
 
 function isUnavailablePane(health: unknown): boolean {
@@ -419,6 +443,86 @@ function formatSidecarWorkerStrip(context: TeamHudRenderContext): string {
   return `workers ${workerTokens.join(" ; ")}`;
 }
 
+function compactWorkerRole(role: string): string {
+  return clean(role.replace(/^agmo-/, ""));
+}
+
+function resolveWorkerPaneHealth(
+  context: TeamHudRenderContext,
+  workerName: string
+): string | undefined {
+  const workerPane = context.snapshot.worker_panes?.find((pane) => pane.worker_name === workerName);
+  return workerPane?.health ?? context.snapshot.tmux_health?.workers[workerName];
+}
+
+function formatSidecarTopologyLine(context: TeamHudRenderContext): string | null {
+  const workers = [...context.snapshot.workers].sort((left, right) =>
+    left.worker_name.localeCompare(right.worker_name, undefined, { numeric: true })
+  );
+  if (workers.length <= 1) {
+    return null;
+  }
+
+  const entries = workers.slice(0, 4).map((worker) => {
+    const task = worker.current_task_id ? ` t=${clean(worker.current_task_id)}` : "";
+    const paneHealth = resolveWorkerPaneHealth(context, worker.worker_name);
+    const pane =
+      paneHealth && paneHealth !== "live" && paneHealth !== "not_configured"
+        ? ` pane=${clean(paneHealth)}`
+        : "";
+    return `leader->${clean(worker.worker_name)}(${compactWorkerRole(worker.role)}):${clean(worker.status_state)}${task}${pane}`;
+  });
+  const more = workers.length > entries.length ? ` +${workers.length - entries.length}` : "";
+  return `topology ${entries.join(" ; ")}${more}`;
+}
+
+function formatEventAge(event: TeamHudRecentEvent, checkedAt: string): string | null {
+  if (!event.createdAt) {
+    return null;
+  }
+  const eventMs = Date.parse(event.createdAt);
+  const checkedMs = Date.parse(checkedAt);
+  if (!Number.isFinite(eventMs) || !Number.isFinite(checkedMs) || checkedMs < eventMs) {
+    return null;
+  }
+  return `${formatDurationMs(checkedMs - eventMs)} ago`;
+}
+
+function formatSidecarEventToken(
+  event: TeamHudRecentEvent,
+  context: TeamHudRenderContext,
+  includeAge: boolean
+): string {
+  const worker = event.worker ? clean(event.worker) : "leader";
+  const eventType =
+    event.sourceType && event.sourceType !== event.type
+      ? `${clean(event.type)}/${clean(event.sourceType)}`
+      : clean(event.type);
+  const state = event.state ? ` state=${clean(event.state)}` : "";
+  const task = event.taskId ? ` t=${clean(event.taskId)}` : "";
+  const reason = event.reason ? ` ${clean(event.reason)}` : "";
+  const age = includeAge ? formatEventAge(event, context.snapshot.checked_at) : null;
+  return `${worker}:${eventType}${state}${task}${reason}${age ? ` ${age}` : ""}`;
+}
+
+function formatSidecarEventsLine(context: TeamHudRenderContext): string | null {
+  const events = context.recentEvents ?? [];
+  if (events.length === 0) {
+    return null;
+  }
+
+  const entries = events
+    .slice(0, 3)
+    .map((event) => formatSidecarEventToken(event, context, true));
+  const more = events.length > entries.length ? ` +${events.length - entries.length}` : "";
+  return `events ${entries.join(" | ")}${more}`;
+}
+
+function formatSidecarLastEvent(context: TeamHudRenderContext): string | null {
+  const latest = context.recentEvents?.[0];
+  return latest ? `last ${formatSidecarEventToken(latest, context, false)}` : null;
+}
+
 function formatSidecarTaskSignal(context: TeamHudRenderContext): string | null {
   const currentTasks = context.status.tasks
     .filter((task) => ["in_progress", "blocked", "pending"].includes(task.status))
@@ -435,7 +539,8 @@ function formatSidecarTaskSignal(context: TeamHudRenderContext): string | null {
     return null;
   }
   const owner = task.owner ? clean(task.owner) : "unassigned";
-  return `task ${clean(task.id)}:${clean(task.status)} owner=${owner} ${clean(task.subject)}`;
+  const latestEvent = formatSidecarLastEvent(context);
+  return `task ${clean(task.id)}:${clean(task.status)} owner=${owner} ${clean(task.subject)}${latestEvent ? ` | ${latestEvent}` : ""}`;
 }
 
 export function renderTeamHud(
@@ -479,6 +584,7 @@ export function renderTeamHud(
   }
 
   if (preset === "sidecar") {
+    const sidecarMaxLines = options.maxLines ?? 6;
     const sidecarLines = [
       `${c("AGMO sidecar", "bold")} team=${clean(context.teamName)} checked=${clean(snapshot.checked_at)}`,
       `health workers h/s/d=${snapshot.healthy_workers}/${snapshot.stale_workers}/${snapshot.dead_workers} active=${snapshot.active_workers} | tasks p/w/b/c/f=${taskCounts.pending}/${taskCounts.in_progress}/${taskCounts.blocked}/${taskCounts.completed}/${taskCounts.failed}`,
@@ -489,18 +595,37 @@ export function renderTeamHud(
     if (highlightSummary) {
       sidecarLines.push(highlightSummary);
     }
+    const topologySummary = formatSidecarTopologyLine(context);
+    const eventSummary = formatSidecarEventsLine(context);
     const taskSignal = formatSidecarTaskSignal(context);
+    const actionLineCount = suggestedActions.length > 0 ? 1 : 0;
+    const taskLineCount = taskSignal ? 1 : 0;
+    const reservedLineCount = actionLineCount + taskLineCount;
+    if (
+      topologySummary &&
+      sidecarMaxLines > 6 &&
+      sidecarLines.length + reservedLineCount < sidecarMaxLines
+    ) {
+      sidecarLines.push(topologySummary);
+    }
+    if (
+      eventSummary &&
+      sidecarMaxLines > 6 &&
+      sidecarLines.length + reservedLineCount < sidecarMaxLines
+    ) {
+      sidecarLines.push(eventSummary);
+    }
     if (taskSignal) {
       sidecarLines.push(taskSignal);
     }
     if (suggestedActions.length > 0) {
       const actionSummary = suggestedActions
         .slice(0, 3)
-        .map(formatSidecarActionLine)
+        .map((action) => formatSidecarActionLine(action, context.teamName))
         .join(" | ");
-      sidecarLines.push(`${c("actions", "cyan")} ${actionSummary}`);
+      sidecarLines.push(ellipsize(`${c("actions", "cyan")} ${actionSummary}`, width, false));
     }
-    return `${fitLines(sidecarLines, width, options.maxLines ?? 6).join("\n")}\n`;
+    return `${fitLines(sidecarLines, width, sidecarMaxLines).join("\n")}\n`;
   }
 
   const actionLimit = preset === "full" ? 5 : 3;

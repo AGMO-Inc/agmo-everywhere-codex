@@ -29,6 +29,7 @@ import {
   buildTeamHudRenderContext,
   renderTeamHud,
   type AgmoTeamHudPreset,
+  type TeamHudRecentEvent,
   type TeamHudSuggestedAction
 } from "./hud-renderer.js";
 import type { AgmoColorMode } from "./terminal-format.js";
@@ -2923,6 +2924,57 @@ export async function buildLeaderMonitorView(
   };
 }
 
+function normalizeHudRecentEvent(raw: unknown): TeamHudRecentEvent | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const value = raw as Record<string, unknown>;
+  const type = cleanString(value.type);
+  if (!type) {
+    return null;
+  }
+
+  const eventId = cleanString(value.event_id);
+  const sourceType = cleanString(value.source_type);
+  const worker = cleanString(value.worker) ?? cleanString(value.worker_name);
+  const taskId = cleanString(value.task_id);
+  const state = cleanString(value.state);
+  const reason = cleanString(value.reason);
+  const createdAt = cleanString(value.created_at) ?? cleanString(value.timestamp);
+
+  return {
+    ...(eventId !== undefined ? { eventId } : {}),
+    type,
+    ...(sourceType !== undefined ? { sourceType } : {}),
+    ...(worker !== undefined ? { worker } : {}),
+    ...(taskId !== undefined ? { taskId } : {}),
+    ...(state !== undefined ? { state } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {})
+  };
+}
+
+function isHudRecentEventDisplayable(event: TeamHudRecentEvent): boolean {
+  if (event.type === "team_monitor_snapshot" || event.type === "team_started") {
+    return false;
+  }
+  if (event.worker && event.worker !== "leader" && event.worker !== "leader-fixed") {
+    return true;
+  }
+  return /^(task|worker|dispatch|mailbox|claim|shutdown|alert)_/.test(event.type);
+}
+
+function buildHudRecentEvents(result: Record<string, unknown>, limit = 3): TeamHudRecentEvent[] {
+  const events = Array.isArray(result.events) ? result.events : [];
+  return events
+    .map(normalizeHudRecentEvent)
+    .filter((event): event is TeamHudRecentEvent => event !== null)
+    .filter(isHudRecentEventDisplayable)
+    .slice(-Math.max(0, limit))
+    .reverse();
+}
+
 export async function buildLeaderHudView(
   teamName: string,
   options: {
@@ -3046,6 +3098,10 @@ export async function buildLeaderHudView(
     });
   }
   const topActions = suggestedActions.map((action) => action.key);
+  const recentEvents =
+    options.preset === "sidecar"
+      ? buildHudRecentEvents(await readTeamApiEvents(normalizedTeamName, {}, cwd))
+      : [];
 
   const text = renderTeamHud(
     buildTeamHudRenderContext(normalizedTeamName, snapshot, status, {
@@ -3055,7 +3111,8 @@ export async function buildLeaderHudView(
       openLoads,
       openLoadDelta,
       topActions,
-      suggestedActions
+      suggestedActions,
+      recentEvents
     }),
     {
       preset: options.preset,
