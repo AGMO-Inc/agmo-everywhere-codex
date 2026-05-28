@@ -141,6 +141,81 @@ test("renderTeamHud sidecar is compact, sanitized, and action-oriented", () => {
   }
 });
 
+test("renderTeamHud sidecar surfaces compact highlights before actions", () => {
+  const testContext = context();
+  testContext.snapshot.active_workers = 2;
+  testContext.snapshot.healthy_workers = 1;
+  testContext.snapshot.dead_workers = 1;
+  testContext.snapshot.leader = {
+    role: "leader",
+    pane_id: "%1",
+    session_id: "$1",
+    health: "missing",
+    reasons: ["pane_not_found"]
+  };
+  testContext.snapshot.workers = [
+    ...testContext.snapshot.workers,
+    {
+      worker_name: "worker-2",
+      role: "agmo-verifier",
+      status_state: "blocked",
+      current_task_id: "task-2",
+      heartbeat_at: "2026-05-27T00:00:00.000Z",
+      ms_since_heartbeat: 620000,
+      pid_alive: false,
+      heartbeat_alive_flag: false,
+      turn_count: 0,
+      health: "dead",
+      pending_dispatch_count: 0,
+      mailbox_message_count: 1,
+      pane_id: "%4",
+      claim_at_risk: true,
+      reasons: ["heartbeat_timeout"]
+    }
+  ];
+  testContext.status.tasks = [
+    ...testContext.status.tasks,
+    {
+      id: "task-2",
+      subject: "blocked review\u0007step",
+      description: "",
+      owner: "worker-2",
+      status: "blocked",
+      version: 1,
+      created_at: "2026-05-27T00:00:00.000Z",
+      updated_at: "2026-05-27T00:00:00.000Z"
+    },
+    {
+      id: "task-3",
+      subject: "failed task",
+      description: "",
+      owner: "worker-2",
+      status: "failed",
+      error: "verification failed",
+      version: 1,
+      created_at: "2026-05-27T00:00:00.000Z",
+      updated_at: "2026-05-27T00:00:00.000Z"
+    }
+  ];
+  testContext.taskCounts = { pending: 0, in_progress: 1, blocked: 1, completed: 0, failed: 1 };
+  testContext.openLoads = { ...testContext.openLoads, "worker-2": 1 };
+
+  const rendered = renderTeamHud(testContext, {
+    preset: "sidecar",
+    maxWidth: 160,
+    maxLines: 8,
+    color: "never"
+  });
+
+  assert.match(rendered, /highlights .*!! leader-pane:pane_not_found/);
+  assert.match(rendered, /!! worker-2:heartbeat_timeout/);
+  assert.match(rendered, /!! worker-2:task claim is at risk/);
+  assert.match(rendered, /\+[0-9]+/);
+  assert.match(rendered, /task task-2:blocked owner=worker-2 blocked review\?step/);
+  assert.ok(rendered.indexOf("highlights") < rendered.indexOf("actions"));
+  assert.doesNotMatch(rendered, /\x1b\[/);
+});
+
 test("renderTeamHud sorts structured actions and limits focused commands to safe actions", () => {
   const testContext = context();
   testContext.suggestedActions = [

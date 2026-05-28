@@ -32,6 +32,12 @@ export type TeamHudSuggestedAction = {
   mutating?: boolean;
 };
 
+type TeamHudHighlight = {
+  severity: TeamHudActionSeverity;
+  target: string;
+  message: string;
+};
+
 export type TeamHudRenderContext = {
   teamName: string;
   snapshot: AgmoTeamMonitorSnapshot;
@@ -198,6 +204,10 @@ function actionPriority(action: TeamHudSuggestedAction): number {
   );
 }
 
+function highlightPriority(highlight: TeamHudHighlight): number {
+  return ACTION_SEVERITY_PRIORITY.indexOf(highlight.severity);
+}
+
 function normalizeAction(action: TeamHudSuggestedAction): TeamHudSuggestedAction {
   const fallback = DEFAULT_ACTIONS[action.key];
   return {
@@ -281,6 +291,113 @@ function formatActionLine(
 
 function formatSidecarActionLine(action: TeamHudSuggestedAction): string {
   return `${action.key}:${action.severity}(${clean(action.reason)})`;
+}
+
+function isUnavailablePane(health: unknown): boolean {
+  return health === "missing" || health === "orphaned" || health === "unknown";
+}
+
+function pushUniqueHighlight(highlights: TeamHudHighlight[], highlight: TeamHudHighlight): void {
+  if (
+    highlights.some(
+      (entry) =>
+        entry.severity === highlight.severity &&
+        entry.target === highlight.target &&
+        entry.message === highlight.message
+    )
+  ) {
+    return;
+  }
+  highlights.push(highlight);
+}
+
+function resolveSidecarHighlights(context: TeamHudRenderContext): TeamHudHighlight[] {
+  const highlights: TeamHudHighlight[] = [];
+  const { snapshot } = context;
+
+  if (snapshot.leader && isUnavailablePane(snapshot.leader.health)) {
+    pushUniqueHighlight(highlights, {
+      severity: "critical",
+      target: "leader-pane",
+      message: snapshot.leader.reasons[0] ?? `leader pane is ${snapshot.leader.health}`
+    });
+  }
+  if (snapshot.hud && isUnavailablePane(snapshot.hud.health)) {
+    pushUniqueHighlight(highlights, {
+      severity: "critical",
+      target: "hud-pane",
+      message: snapshot.hud.reasons[0] ?? `HUD pane is ${snapshot.hud.health}`
+    });
+  }
+  if (snapshot.layout_health === "repairable" || snapshot.tmux_health?.layout === "repairable") {
+    pushUniqueHighlight(highlights, {
+      severity: "critical",
+      target: "layout",
+      message: "tmux layout is repairable"
+    });
+  } else if (snapshot.layout_health === "degraded" || snapshot.tmux_health?.layout === "degraded") {
+    pushUniqueHighlight(highlights, {
+      severity: "warning",
+      target: "layout",
+      message: "tmux layout is degraded"
+    });
+  }
+
+  for (const worker of snapshot.workers) {
+    if (worker.health === "dead" || worker.health === "stale") {
+      pushUniqueHighlight(highlights, {
+        severity: worker.health === "dead" ? "critical" : "warning",
+        target: worker.worker_name,
+        message: worker.reasons[0] ?? `heartbeat ${formatDurationMs(worker.ms_since_heartbeat)} ago`
+      });
+    }
+    if (worker.status_state === "blocked") {
+      pushUniqueHighlight(highlights, {
+        severity: "warning",
+        target: worker.worker_name,
+        message: "worker is blocked"
+      });
+    }
+    if (worker.claim_at_risk) {
+      pushUniqueHighlight(highlights, {
+        severity: "critical",
+        target: worker.worker_name,
+        message: "task claim is at risk"
+      });
+    }
+  }
+
+  for (const task of context.status.tasks) {
+    if (task.status === "failed") {
+      pushUniqueHighlight(highlights, {
+        severity: "critical",
+        target: `task ${task.id}`,
+        message: task.error ?? task.subject
+      });
+    }
+    if (task.status === "blocked") {
+      pushUniqueHighlight(highlights, {
+        severity: "warning",
+        target: `task ${task.id}`,
+        message: task.subject
+      });
+    }
+  }
+
+  return highlights.sort((left, right) => highlightPriority(left) - highlightPriority(right));
+}
+
+function formatSidecarHighlightLine(context: TeamHudRenderContext): string | null {
+  const highlights = resolveSidecarHighlights(context);
+  if (highlights.length === 0) {
+    return null;
+  }
+  const entries = highlights.slice(0, 3).map((highlight) => {
+    const marker = highlight.severity === "critical" ? "!!" : highlight.severity === "warning" ? "!" : ".";
+    return `${marker} ${clean(highlight.target)}:${clean(highlight.message)}`;
+  });
+  const more = highlights.length > entries.length ? ` +${highlights.length - entries.length}` : "";
+  return `highlights ${entries.join(" | ")}${more}`;
 }
 
 function formatSidecarWorkerStrip(context: TeamHudRenderContext): string {
@@ -368,6 +485,10 @@ export function renderTeamHud(
       `tmux leader=${snapshot.leader?.health ?? "n/a"} hud=${snapshot.hud?.health ?? "n/a"} layout=${layoutHealth}${retryCounts} | dispatch=${context.pendingDispatch} | delta=${context.openLoadDelta}`,
       formatSidecarWorkerStrip(context)
     ];
+    const highlightSummary = formatSidecarHighlightLine(context);
+    if (highlightSummary) {
+      sidecarLines.push(highlightSummary);
+    }
     const taskSignal = formatSidecarTaskSignal(context);
     if (taskSignal) {
       sidecarLines.push(taskSignal);
