@@ -80,6 +80,16 @@ function captureWrite(chunks: string[]): Pick<NodeJS.WriteStream, "write"> {
   };
 }
 
+function assertMachineEnvelope(
+  output: Record<string, unknown>,
+  operation: string,
+  ok = true,
+): void {
+  assert.equal(output.schema_version, "1.0");
+  assert.equal(output.operation, operation);
+  assert.equal(output.ok, ok);
+}
+
 test("runTeamCommand status prints additive machine JSON envelope for an existing team", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-status-"));
   const teamName = "cli-status-team";
@@ -96,9 +106,7 @@ test("runTeamCommand status prints additive machine JSON envelope for an existin
 
   const output = await captureTeamCommand(["status", teamName], tempRoot);
 
-  assert.equal(output.schema_version, "1.0");
-  assert.equal(output.operation, "team.status");
-  assert.equal(output.ok, true);
+  assertMachineEnvelope(output, "team.status");
   assert.equal(output.command, "team status");
   assert.equal(output.team_name, teamName);
   assert.equal(output.found, true);
@@ -132,9 +140,7 @@ test("runTeamCommand status reports a missing team as a machine-readable miss", 
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-status-missing-"));
   const output = await captureTeamCommand(["status", "missing-status-team"], tempRoot);
 
-  assert.equal(output.schema_version, "1.0");
-  assert.equal(output.operation, "team.status");
-  assert.equal(output.ok, false);
+  assertMachineEnvelope(output, "team.status", false);
   assert.equal(output.command, "team status");
   assert.equal(output.team_name, "missing-status-team");
   assert.equal(output.found, false);
@@ -149,9 +155,7 @@ test("runTeamCommand cleanup-stale prints additive machine JSON envelope", async
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-cleanup-stale-"));
   const output = await captureTeamCommand(["cleanup-stale", "--dry-run"], tempRoot);
 
-  assert.equal(output.schema_version, "1.0");
-  assert.equal(output.operation, "team.cleanup-stale");
-  assert.equal(output.ok, true);
+  assertMachineEnvelope(output, "team.cleanup-stale");
   assert.equal(output.command, "team cleanup-stale");
   assert.deepEqual(output.recommended_actions, []);
   assert.equal(output.team_count, 0);
@@ -188,6 +192,7 @@ test("runTeamCommand shutdown-ack prints current ad hoc JSON shape after shutdow
     tempRoot,
   );
 
+  assertMachineEnvelope(output, "team.shutdown-ack");
   assert.equal(output.command, "team shutdown-ack");
   assert.equal(output.team_name, teamName);
   assert.equal(output.worker_name, "worker-1");
@@ -278,6 +283,7 @@ test("runTeamCommand delete refuses active teams without force", async () => {
 
   const output = await captureTeamCommand(["delete", teamName], tempRoot);
 
+  assertMachineEnvelope(output, "team.delete");
   assert.equal(output.command, "team delete");
   assert.equal(output.team_name, teamName);
   assert.equal(output.status, "refused_active");
@@ -302,6 +308,7 @@ test("runTeamCommand delete dry-run reports intended deletion without removing s
 
   const output = await captureTeamCommand(["delete", teamName, "--dry-run"], tempRoot);
 
+  assertMachineEnvelope(output, "team.delete");
   assert.equal(output.command, "team delete");
   assert.equal(output.status, "would_delete");
   assert.equal((output.state_removal as { status?: string }).status, "would_remove");
@@ -326,6 +333,7 @@ test("runTeamCommand delete force shuts down active teams and removes state safe
 
   const output = await captureTeamCommand(["delete", teamName, "--force"], tempRoot);
 
+  assertMachineEnvelope(output, "team.delete");
   assert.equal(output.command, "team delete");
   assert.equal(output.status, "deleted");
   assert.ok(output.shutdown && typeof output.shutdown === "object");
@@ -351,6 +359,7 @@ test("runTeamCommand delete keep-worktrees removes state but preserves owned wor
 
   const output = await captureTeamCommand(["delete", teamName, "--keep-worktrees"], tempRoot);
 
+  assertMachineEnvelope(output, "team.delete");
   assert.equal(output.command, "team delete");
   assert.equal(output.status, "deleted");
   assert.equal((output.worktree_cleanup as { status?: string }).status, "skipped");
@@ -689,6 +698,7 @@ test("runTeamCommand layout commands print stable JSON contracts for non-tmux te
   );
 
   const status = await captureTeamCommand(["layout", "status", teamName], tempRoot);
+  assertMachineEnvelope(status, "team.layout.status");
   assert.equal(status.command, "team layout status");
   assert.equal(status.team_name, teamName);
   assert.equal(status.transport, "none");
@@ -702,6 +712,7 @@ test("runTeamCommand layout commands print stable JSON contracts for non-tmux te
     ["layout", "repair", teamName, "--dry-run"],
     tempRoot,
   );
+  assertMachineEnvelope(repair, "team.layout.repair");
   assert.equal(repair.command, "team layout repair");
   assert.equal(repair.team_name, teamName);
   assert.equal(repair.dry_run, true);
@@ -714,6 +725,7 @@ test("runTeamCommand layout commands print stable JSON contracts for non-tmux te
     ["layout", "rebalance", teamName, "--layout", "auto", "--dry-run"],
     tempRoot,
   );
+  assertMachineEnvelope(rebalance, "team.layout.rebalance");
   assert.equal(rebalance.command, "team layout rebalance");
   assert.equal(rebalance.team_name, teamName);
   assert.equal(rebalance.dry_run, true);

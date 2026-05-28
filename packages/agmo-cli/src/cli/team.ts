@@ -208,6 +208,40 @@ function buildTeamStatusRecommendedActions(
   ]);
 }
 
+function teamCommandOperation(command: string): string {
+  return command.replace(/^team\s+/, "team.").replace(/\s+/g, ".");
+}
+
+function printTeamMachineJson(
+  command: string,
+  payload: Record<string, unknown>,
+  options: { ok?: boolean } = {}
+): void {
+  console.log(
+    JSON.stringify(
+      machineJsonEnvelope(teamCommandOperation(command), options.ok ?? true, {
+        command,
+        ...payload
+      }),
+      null,
+      2
+    )
+  );
+}
+
+function printTeamMachineJsonPayload(
+  payload: Record<string, unknown> & { command: string },
+  options: { ok?: boolean } = {}
+): void {
+  console.log(
+    JSON.stringify(
+      machineJsonEnvelope(teamCommandOperation(payload.command), options.ok ?? true, payload),
+      null,
+      2
+    )
+  );
+}
+
 function boundedWatchErrorLine(error: unknown, width = 200): string {
   const sanitized = errorMessage(error).replace(/\s+/g, " ").trim();
   return ellipsize(`watch render error: ${sanitized}`, width);
@@ -404,13 +438,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             : undefined,
         roleOverrides
       }, cwd);
-      console.log(
-        JSON.stringify(
-          { command: "team start", ...result },
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team start", result);
       return;
     }
     case "status": {
@@ -421,19 +449,16 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const status = await readTeamStatus(teamName, cwd);
       const tmuxHealth = status ? await readTeamTmuxHealthSummary(teamName, cwd) : null;
       const recommendedActions = buildTeamStatusRecommendedActions(teamName, status, tmuxHealth);
-      console.log(
-        JSON.stringify(
-          machineJsonEnvelope("team.status", Boolean(status) && recommendedActions.length === 0, {
-            command: "team status",
-            team_name: teamName,
-            found: Boolean(status),
-            recommended_actions: recommendedActions,
-            tmux_health: tmuxHealth,
-            status
-          }),
-          null,
-          2
-        )
+      printTeamMachineJson(
+        "team status",
+        {
+          team_name: teamName,
+          found: Boolean(status),
+          recommended_actions: recommendedActions,
+          tmux_health: tmuxHealth,
+          status
+        },
+        { ok: Boolean(status) && recommendedActions.length === 0 }
       );
       return;
     }
@@ -457,7 +482,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team shutdown-ack", ...result }, null, 2));
+      printTeamMachineJson("team shutdown-ack", result);
       return;
     }
     case "shutdown": {
@@ -470,13 +495,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("--grace-ms must be at least 0");
       }
       const result = await shutdownTeamRuntime(teamName, { graceMs }, cwd);
-      console.log(
-        JSON.stringify(
-          { command: "team shutdown", ...result },
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team shutdown", result);
       return;
     }
     case "delete": {
@@ -500,13 +519,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(
-        JSON.stringify(
-          { command: "team delete", ...result },
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team delete", result);
       return;
     }
     case "cleanup-stale": {
@@ -537,17 +550,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(
-        JSON.stringify(
-          machineJsonEnvelope("team.cleanup-stale", true, {
-            command: "team cleanup-stale",
-            recommended_actions: [],
-            ...result
-          }),
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team cleanup-stale", {
+        recommended_actions: [],
+        ...result
+      });
       return;
     }
     case "send": {
@@ -557,7 +563,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team send <team> <worker> \"<message>\"");
       }
       const result = await sendWorkerMessage(teamName, workerName, message, cwd);
-      console.log(JSON.stringify({ command: "team send", ...result }, null, 2));
+      printTeamMachineJson("team send", result);
       return;
     }
     case "claim": {
@@ -574,7 +580,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team claim", ...result }, null, 2));
+      printTeamMachineJson("team claim", result);
       return;
     }
     case "complete": {
@@ -650,17 +656,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             cwd
           )
         : null;
-      console.log(
-        JSON.stringify(
-          {
-            command: "team complete",
-            ...result,
-            ...(integration ? { integration } : {})
-          },
-          null,
-          2
-        )
-      );
+      printTeamMachineJson("team complete", {
+        ...result,
+        ...(integration ? { integration } : {})
+      });
       return;
     }
     case "fail": {
@@ -675,7 +674,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         errorParts.join(" ").trim() || undefined,
         cwd
       );
-      console.log(JSON.stringify({ command: "team fail", ...result }, null, 2));
+      printTeamMachineJson("team fail", result);
       return;
     }
     case "heartbeat": {
@@ -684,7 +683,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team heartbeat <team> <worker>");
       }
       const result = await heartbeatWorker(teamName, workerName, cwd);
-      console.log(JSON.stringify({ command: "team heartbeat", ...result }, null, 2));
+      printTeamMachineJson("team heartbeat", result);
       return;
     }
     case "report": {
@@ -706,7 +705,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         { taskId, note },
         cwd
       );
-      console.log(JSON.stringify({ command: "team report", ...result }, null, 2));
+      printTeamMachineJson("team report", result);
       return;
     }
     case "monitor": {
@@ -887,24 +886,17 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         );
         process.stdout.write(`${leaderMonitor.markdown}\n`);
       } else {
-        console.log(
-          JSON.stringify(
-            {
-              command: "team monitor",
-              policy: effectivePolicy,
-              snapshot: finalSnapshot,
-              ...(leaderAlerts ? { leader_alerts: leaderAlerts.alerts } : {}),
-              ...(leaderAlertDelivery
-                ? { leader_alert_delivery: leaderAlertDelivery }
-                : {}),
-              ...(autoNudges ? { auto_nudges: autoNudges.nudges } : {}),
-              ...(autoRecovery ? { auto_recovery: autoRecovery.reclaimed } : {}),
-              ...(hudRepair ? { hud_repair: hudRepair } : {})
-            },
-            null,
-            2
-          )
-        );
+        printTeamMachineJson("team monitor", {
+          policy: effectivePolicy,
+          snapshot: finalSnapshot,
+          ...(leaderAlerts ? { leader_alerts: leaderAlerts.alerts } : {}),
+          ...(leaderAlertDelivery
+            ? { leader_alert_delivery: leaderAlertDelivery }
+            : {}),
+          ...(autoNudges ? { auto_nudges: autoNudges.nudges } : {}),
+          ...(autoRecovery ? { auto_recovery: autoRecovery.reclaimed } : {}),
+          ...(hudRepair ? { hud_repair: hudRepair } : {})
+        });
       }
       return;
     }
@@ -919,9 +911,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
 
       if (action === "show") {
         const result = await showLeaderAlertDeliveryConfig(teamName, cwd);
-        console.log(
-          JSON.stringify({ command: "team alert-delivery show", ...result }, null, 2)
-        );
+        printTeamMachineJson("team alert-delivery show", result);
         return;
       }
 
@@ -955,9 +945,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           },
           cwd
         );
-        console.log(
-          JSON.stringify({ command: "team alert-delivery set", ...result }, null, 2)
-        );
+        printTeamMachineJson("team alert-delivery set", result);
         return;
       }
 
@@ -1038,7 +1026,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           throw new Error("usage: agmo team layout status <team>");
         }
         const result = await readTeamLayoutStatus(teamName, cwd);
-        console.log(JSON.stringify(result, null, 2));
+        printTeamMachineJsonPayload(result);
         return;
       }
       if (layoutCommand === "repair") {
@@ -1054,7 +1042,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           },
           cwd
         );
-        console.log(JSON.stringify(result, null, 2));
+        printTeamMachineJsonPayload(result);
         return;
       }
       if (layoutCommand === "rebalance") {
@@ -1074,7 +1062,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
           },
           cwd
         );
-        console.log(JSON.stringify(result, null, 2));
+        printTeamMachineJsonPayload(result);
         return;
       }
       throw new Error(
@@ -1087,7 +1075,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team dispatch-ack <team> <request-id>");
       }
       const result = await acknowledgeDispatchRequest(teamName, requestId, cwd);
-      console.log(JSON.stringify({ command: "team dispatch-ack", ...result }, null, 2));
+      printTeamMachineJson("team dispatch-ack", result);
       return;
     }
     case "dispatch-retry": {
@@ -1096,7 +1084,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         throw new Error("usage: agmo team dispatch-retry <team> [worker]");
       }
       const result = await retryDispatchRequests(teamName, workerName, cwd);
-      console.log(JSON.stringify({ command: "team dispatch-retry", ...result }, null, 2));
+      printTeamMachineJson("team dispatch-retry", result);
       return;
     }
     case "reclaim": {
@@ -1127,7 +1115,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team reclaim", ...result }, null, 2));
+      printTeamMachineJson("team reclaim", result);
       return;
     }
     case "rebalance": {
@@ -1165,7 +1153,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team rebalance", ...result }, null, 2));
+      printTeamMachineJson("team rebalance", result);
       return;
     }
     case "integrate": {
@@ -1220,7 +1208,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team integrate", ...result }, null, 2));
+      printTeamMachineJson("team integrate", result);
       return;
     }
     case "integrate-assist": {

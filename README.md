@@ -307,8 +307,8 @@ agmo team integrate-assist <team-name>
 ```
 
 Machine-oriented JSON commands keep existing `command` fields and add a stable envelope:
-`schema_version`, `operation`, `ok`, and `recommended_actions` when actionable guidance is available.
-Current envelope-backed surfaces include `agmo doctor`, `agmo team status`, and `agmo team cleanup-stale`.
+`schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
+Current envelope-backed surfaces include `agmo doctor` and JSON-producing `agmo team` commands.
 
 ### Operational features
 
