@@ -99,6 +99,7 @@ test("renderTeamHud supports presets, clipping, and no-color output", () => {
     color: "never"
   });
   assert.match(minimal, /AGMO HUD/);
+  assert.match(minimal, /layout=ok/);
   assert.doesNotMatch(minimal, /\x1b\[/);
   assert.doesNotMatch(minimal, /Workers/);
 
@@ -113,6 +114,101 @@ test("renderTeamHud supports presets, clipping, and no-color output", () => {
   for (const line of full.trimEnd().split("\n")) {
     assert.ok(visibleLength(line) <= 42, line);
   }
+});
+
+test("renderTeamHud sorts structured actions and limits focused commands to safe actions", () => {
+  const testContext = context();
+  testContext.suggestedActions = [
+    {
+      key: "alert",
+      label: "Review alerts",
+      reason: "1 active alert",
+      severity: "info"
+    },
+    {
+      key: "reclaim",
+      label: "Reclaim claims",
+      reason: "claim is at risk",
+      severity: "critical"
+    },
+    {
+      key: "layout-repair",
+      label: "Repair layout",
+      reason: "layout is repairable",
+      severity: "critical"
+    },
+    {
+      key: "nudge",
+      label: "Nudge workers",
+      reason: "worker is stale",
+      severity: "warning",
+      command: "agmo team monitor demo --auto-nudge",
+      mutating: false
+    }
+  ];
+
+  const focused = renderTeamHud(testContext, {
+    preset: "focused",
+    maxWidth: 160,
+    color: "never"
+  });
+
+  assert.match(focused, /Actions/);
+  assert.match(focused, /layout-repair \[critical\].*cmd: agmo team layout repair demo\?team --dry-run/);
+  assert.match(focused, /reclaim \[critical\]/);
+  assert.match(focused, /nudge \[warning\]/);
+  assert.doesNotMatch(focused, /alert \[info\]/);
+  assert.doesNotMatch(focused, /manual:/);
+  assert.doesNotMatch(focused, /--auto-nudge/);
+  assert.doesNotMatch(focused, /--reassign/);
+  assert.ok(focused.indexOf("layout-repair") < focused.indexOf("reclaim"));
+});
+
+test("renderTeamHud maps legacy rebalance to task-rebalance and gates mutating commands to full", () => {
+  const testContext = context();
+  testContext.topActions = ["rebalance", "retry-dispatch"];
+
+  const minimal = renderTeamHud(testContext, {
+    preset: "minimal",
+    maxWidth: 100,
+    color: "never"
+  });
+  assert.match(minimal, /actions=retry-dispatch,task-rebalance/);
+  assert.doesNotMatch(minimal, /Actions/);
+
+  const full = renderTeamHud(testContext, {
+    preset: "full",
+    maxWidth: 160,
+    color: "never"
+  });
+  assert.match(full, /retry-dispatch \[warning\].*manual: agmo team dispatch-retry demo\?team/);
+  assert.match(full, /task-rebalance \[warning\].*manual: agmo team rebalance demo\?team/);
+  assert.doesNotMatch(full, /layout rebalance/);
+});
+
+test("renderTeamHud shows compact legend only when requested", () => {
+  const withoutLegend = renderTeamHud(context(), {
+    preset: "focused",
+    maxWidth: 140,
+    color: "never"
+  });
+  assert.doesNotMatch(withoutLegend, /Legend:/);
+
+  const withLegend = renderTeamHud(context(), {
+    preset: "focused",
+    maxWidth: 140,
+    color: "never",
+    showLegend: true
+  });
+  assert.match(withLegend, /Legend: h=healthy s=stale d=dead/);
+
+  const minimalLegend = renderTeamHud(context(), {
+    preset: "minimal",
+    maxWidth: 140,
+    color: "never",
+    showLegend: true
+  });
+  assert.match(minimalLegend, /Legend: h=healthy s=stale d=dead/);
 });
 
 test("renderTeamHud can force color", () => {

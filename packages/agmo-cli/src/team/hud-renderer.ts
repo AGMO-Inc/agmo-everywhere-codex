@@ -10,6 +10,28 @@ import {
 
 export type AgmoTeamHudPreset = "minimal" | "focused" | "full";
 
+export type TeamHudActionKey =
+  | "leader-orphan"
+  | "repair-hud"
+  | "layout-repair"
+  | "layout-rebalance"
+  | "nudge"
+  | "reclaim"
+  | "task-rebalance"
+  | "retry-dispatch"
+  | "alert";
+
+export type TeamHudActionSeverity = "critical" | "warning" | "info";
+
+export type TeamHudSuggestedAction = {
+  key: TeamHudActionKey;
+  label: string;
+  reason: string;
+  severity: TeamHudActionSeverity;
+  command?: string;
+  mutating?: boolean;
+};
+
 export type TeamHudRenderContext = {
   teamName: string;
   snapshot: AgmoTeamMonitorSnapshot;
@@ -20,6 +42,7 @@ export type TeamHudRenderContext = {
   openLoads: Record<string, number>;
   openLoadDelta: number;
   topActions: string[];
+  suggestedActions?: TeamHudSuggestedAction[];
 };
 
 export type TeamHudRenderOptions = {
@@ -27,7 +50,95 @@ export type TeamHudRenderOptions = {
   maxWidth?: number;
   maxLines?: number;
   color?: AgmoColorMode;
+  showLegend?: boolean;
 };
+
+const ACTION_KEY_PRIORITY: TeamHudActionKey[] = [
+  "leader-orphan",
+  "repair-hud",
+  "layout-repair",
+  "reclaim",
+  "nudge",
+  "retry-dispatch",
+  "layout-rebalance",
+  "task-rebalance",
+  "alert"
+];
+
+const ACTION_SEVERITY_PRIORITY: TeamHudActionSeverity[] = ["critical", "warning", "info"];
+
+const LEGACY_ACTION_KEY_MAP: Record<string, TeamHudActionKey> = {
+  "leader-orphan": "leader-orphan",
+  "repair-hud": "repair-hud",
+  "layout-repair": "layout-repair",
+  "layout-rebalance": "layout-rebalance",
+  nudge: "nudge",
+  reclaim: "reclaim",
+  rebalance: "task-rebalance",
+  "task-rebalance": "task-rebalance",
+  "retry-dispatch": "retry-dispatch",
+  alert: "alert"
+};
+
+const DEFAULT_ACTIONS: Record<TeamHudActionKey, TeamHudSuggestedAction> = {
+  "leader-orphan": {
+    key: "leader-orphan",
+    label: "Leader pane orphaned",
+    reason: "leader tmux pane is unavailable",
+    severity: "critical"
+  },
+  "repair-hud": {
+    key: "repair-hud",
+    label: "Repair HUD pane",
+    reason: "HUD tmux pane is unavailable",
+    severity: "critical"
+  },
+  "layout-repair": {
+    key: "layout-repair",
+    label: "Repair layout",
+    reason: "tmux layout is repairable",
+    severity: "critical"
+  },
+  "layout-rebalance": {
+    key: "layout-rebalance",
+    label: "Rebalance layout",
+    reason: "tmux layout is degraded",
+    severity: "warning"
+  },
+  nudge: {
+    key: "nudge",
+    label: "Nudge workers",
+    reason: "workers are stale or dead",
+    severity: "warning"
+  },
+  reclaim: {
+    key: "reclaim",
+    label: "Reclaim task claims",
+    reason: "task claims are at risk",
+    severity: "critical"
+  },
+  "task-rebalance": {
+    key: "task-rebalance",
+    label: "Rebalance tasks",
+    reason: "open task load is uneven",
+    severity: "warning"
+  },
+  "retry-dispatch": {
+    key: "retry-dispatch",
+    label: "Retry dispatch",
+    reason: "dispatch requests are pending",
+    severity: "warning"
+  },
+  alert: {
+    key: "alert",
+    label: "Review alerts",
+    reason: "leader alerts are active",
+    severity: "info"
+  }
+};
+
+const LEGEND_LINE =
+  "Legend: h=healthy s=stale d=dead p=pending w=working b=blocked c=completed f=failed t=task d=dispatch !=claim-risk";
 
 function formatDurationMs(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) {
@@ -63,6 +174,7 @@ export function buildTeamHudRenderContext(
     openLoads: Map<string, number>;
     openLoadDelta: number;
     topActions: string[];
+    suggestedActions?: TeamHudSuggestedAction[];
   }
 ): TeamHudRenderContext {
   return {
@@ -74,8 +186,97 @@ export function buildTeamHudRenderContext(
     activeLeaderAlerts: values.activeLeaderAlerts,
     openLoads: Object.fromEntries(values.openLoads.entries()),
     openLoadDelta: values.openLoadDelta,
-    topActions: [...values.topActions]
+    topActions: [...values.topActions],
+    suggestedActions: values.suggestedActions ? [...values.suggestedActions] : undefined
   };
+}
+
+function actionPriority(action: TeamHudSuggestedAction): number {
+  return (
+    ACTION_SEVERITY_PRIORITY.indexOf(action.severity) * ACTION_KEY_PRIORITY.length +
+    ACTION_KEY_PRIORITY.indexOf(action.key)
+  );
+}
+
+function normalizeAction(action: TeamHudSuggestedAction): TeamHudSuggestedAction {
+  const fallback = DEFAULT_ACTIONS[action.key];
+  return {
+    ...fallback,
+    ...action,
+    label: action.label || fallback.label,
+    reason: action.reason || fallback.reason,
+    severity: action.severity || fallback.severity
+  };
+}
+
+function legacyActionToSuggestedAction(action: string): TeamHudSuggestedAction | null {
+  const key = LEGACY_ACTION_KEY_MAP[action];
+  return key ? DEFAULT_ACTIONS[key] : null;
+}
+
+function resolveSuggestedActions(context: TeamHudRenderContext): TeamHudSuggestedAction[] {
+  const rawActions =
+    context.suggestedActions && context.suggestedActions.length > 0
+      ? context.suggestedActions.map(normalizeAction)
+      : context.topActions.map(legacyActionToSuggestedAction).filter((action) => action !== null);
+  const byKey = new Map<TeamHudActionKey, TeamHudSuggestedAction>();
+  for (const action of rawActions) {
+    const existing = byKey.get(action.key);
+    if (!existing || actionPriority(action) < actionPriority(existing)) {
+      byKey.set(action.key, action);
+    }
+  }
+  return [...byKey.values()].sort((left, right) => actionPriority(left) - actionPriority(right));
+}
+
+function resolveActionCommand(
+  action: TeamHudSuggestedAction,
+  preset: "focused" | "full",
+  teamName: string
+): { command: string; mutating: boolean } | null {
+  const safeCommands: Partial<Record<TeamHudActionKey, string>> = {
+    "leader-orphan": "agmo team cleanup-stale --sweep-tmux --dry-run",
+    "repair-hud": `agmo team layout repair ${teamName} --dry-run`,
+    "layout-repair": `agmo team layout repair ${teamName} --dry-run`,
+    "layout-rebalance": `agmo team layout rebalance ${teamName} --dry-run`,
+    alert: `agmo team alert-delivery show ${teamName}`
+  };
+  const fullCommands: Partial<Record<TeamHudActionKey, { command: string; mutating: boolean }>> = {
+    "leader-orphan": {
+      command: "agmo team cleanup-stale --sweep-tmux --dry-run",
+      mutating: false
+    },
+    "repair-hud": { command: `agmo team layout repair ${teamName}`, mutating: true },
+    "layout-repair": { command: `agmo team layout repair ${teamName}`, mutating: true },
+    "layout-rebalance": { command: `agmo team layout rebalance ${teamName}`, mutating: true },
+    reclaim: { command: `agmo team reclaim ${teamName} --reassign`, mutating: true },
+    nudge: { command: `agmo team monitor ${teamName} --auto-nudge`, mutating: true },
+    "retry-dispatch": { command: `agmo team dispatch-retry ${teamName}`, mutating: true },
+    "task-rebalance": { command: `agmo team rebalance ${teamName}`, mutating: true },
+    alert: { command: `agmo team alert-delivery show ${teamName}`, mutating: false }
+  };
+
+  if (preset === "focused") {
+    const command = safeCommands[action.key];
+    return command ? { command, mutating: false } : null;
+  }
+
+  return (
+    fullCommands[action.key] ??
+    (action.command ? { command: action.command, mutating: Boolean(action.mutating) } : null)
+  );
+}
+
+function formatActionLine(
+  action: TeamHudSuggestedAction,
+  preset: "focused" | "full",
+  teamName: string
+): string {
+  const command = resolveActionCommand(action, preset, teamName);
+  const commandSuffix = command
+    ? ` | ${command.mutating ? "manual:" : "cmd:"} ${clean(command.command)}`
+    : "";
+  return `- ${action.key} [${action.severity}] ${clean(action.label)}: ${clean(action.reason)}${commandSuffix}`;
 }
 
 export function renderTeamHud(
@@ -88,15 +289,43 @@ export function renderTeamHud(
   const c = (value: string, tone: "bold" | "dim" | "green" | "yellow" | "red" | "cyan") =>
     colorize(value, tone, color);
   const { snapshot, taskCounts } = context;
-  const actions = context.topActions.length > 0 ? context.topActions.join(",") : "none";
+  const suggestedActions = resolveSuggestedActions(context);
+  const actions =
+    suggestedActions.length > 0 ? suggestedActions.map((action) => action.key).join(",") : "none";
+  const layoutHealth = snapshot.layout_health ?? snapshot.tmux_health?.layout ?? "unknown";
+  const retryParts =
+    snapshot.tmux_health === undefined
+      ? []
+      : [
+          snapshot.tmux_health.retry_pending > 0
+            ? `retry_pending=${snapshot.tmux_health.retry_pending}`
+            : null,
+          snapshot.tmux_health.retry_manual_required > 0
+            ? `retry_manual=${snapshot.tmux_health.retry_manual_required}`
+            : null
+        ].filter((part): part is string => part !== null);
+  const retryCounts = retryParts.length > 0 ? ` | ${retryParts.join(" ")}` : "";
   const lines: string[] = [
     `${c("AGMO HUD", "bold")} | team=${clean(context.teamName)} | checked=${clean(snapshot.checked_at)}`,
     `workers h=${snapshot.healthy_workers} s=${snapshot.stale_workers} d=${snapshot.dead_workers} active=${snapshot.active_workers} | tasks p=${taskCounts.pending} w=${taskCounts.in_progress} b=${taskCounts.blocked} c=${taskCounts.completed} f=${taskCounts.failed}`,
-    `tmux leader=${snapshot.leader?.health ?? "n/a"} hud=${snapshot.hud?.health ?? "n/a"} | dispatch_pending=${context.pendingDispatch} | open_load_delta=${context.openLoadDelta} | actions=${actions}`
+    `tmux leader=${snapshot.leader?.health ?? "n/a"} hud=${snapshot.hud?.health ?? "n/a"} layout=${layoutHealth}${retryCounts} | dispatch_pending=${context.pendingDispatch} | open_load_delta=${context.openLoadDelta} | actions=${actions}`
   ];
+
+  if (options.showLegend) {
+    lines.push(LEGEND_LINE);
+  }
 
   if (preset === "minimal") {
     return `${fitLines(lines, width, options.maxLines).join("\n")}\n`;
+  }
+
+  const actionLimit = preset === "full" ? 5 : 3;
+  if (suggestedActions.length > 0) {
+    lines.push("");
+    lines.push(c("Actions", "cyan"));
+    for (const action of suggestedActions.slice(0, actionLimit)) {
+      lines.push(formatActionLine(action, preset, context.teamName));
+    }
   }
 
   const workers = [...snapshot.workers].sort((left, right) =>

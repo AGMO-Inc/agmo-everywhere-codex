@@ -35,6 +35,7 @@ import { resolveTeamMonitorPolicyPath } from "../team/state/index.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
+import { ellipsize } from "../team/terminal-format.js";
 
 function parseWorkerCount(value: string | undefined): number {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -56,6 +57,17 @@ function parseIntegerOption(args: string[], optionName: string): number | undefi
   }
 
   return parsed;
+}
+
+function parseStrictIntegerOption(args: string[], optionName: string): number | undefined {
+  const raw = parseOption(args, optionName);
+  if (!raw) {
+    return undefined;
+  }
+  if (!/^-?\d+$/.test(raw)) {
+    throw new Error(`${optionName} must be an integer`);
+  }
+  return Number.parseInt(raw, 10);
 }
 
 function parseBooleanFlag(
@@ -773,20 +785,21 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--color|--no-color]"
+          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
         );
       }
       const staleRaw = parseOption(args.slice(2), "--stale-ms");
       const deadRaw = parseOption(args.slice(2), "--dead-ms");
       const refreshMs = parseIntegerOption(args.slice(2), "--refresh-ms");
       const iterations = parseIntegerOption(args.slice(2), "--iterations");
-      const width = parseIntegerOption(args.slice(2), "--width");
+      const width = parseStrictIntegerOption(args.slice(2), "--width");
       const maxLines = parseIntegerOption(args.slice(2), "--max-lines");
       const preset = parseHudPreset(parseOption(args.slice(2), "--preset"));
       const color = parseColorMode(args.slice(2));
       const clearScreen = parseBooleanFlag(args.slice(2), "--clear", "--no-clear") ?? true;
       const watch = args.slice(2).includes("--watch");
       const repair = args.slice(2).includes("--repair");
+      const showLegend = args.slice(2).includes("--legend");
       const staleAfterMs = staleRaw ? Number.parseInt(staleRaw, 10) : undefined;
       const deadAfterMs = deadRaw ? Number.parseInt(deadRaw, 10) : undefined;
       if (staleRaw && !Number.isFinite(staleAfterMs)) {
@@ -809,31 +822,46 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       }
       let previousText: string | null = null;
       let previousHeight = 0;
+      const intervalMs = refreshMs ?? 2000;
       const runHudOnce = async (): Promise<void> => {
         if (repair) {
           await repairTeamHudPane(teamName, cwd);
         }
+        const renderWidth =
+          width ??
+          (watch && process.stdout.isTTY && Number.isFinite(process.stdout.columns)
+            ? process.stdout.columns
+            : undefined);
         const hud = await buildLeaderHudView(
           teamName,
-          { staleAfterMs, deadAfterMs, preset, width, maxLines, color },
+          { staleAfterMs, deadAfterMs, preset, width: renderWidth, maxLines, color, showLegend },
           cwd
         );
-        if (watch && clearScreen && hud.text === previousText) {
+        const footer =
+          watch
+            ? `watch refresh=${intervalMs}ms checked=${new Date().toISOString()}`
+            : null;
+        const outputText =
+          footer && renderWidth
+            ? `${hud.text}\n${ellipsize(footer, renderWidth)}`
+            : footer
+              ? `${hud.text}\n${footer}`
+              : hud.text;
+        if (watch && clearScreen && outputText === previousText) {
           return;
         }
         if (watch && clearScreen) {
-          const nextHeight = hud.text.split("\n").length;
+          const nextHeight = outputText.split("\n").length;
           process.stdout.write("\x1b[H\x1b[2J");
           if (previousHeight > nextHeight) {
             process.stdout.write("\x1b[J");
           }
           previousHeight = nextHeight;
         }
-        previousText = hud.text;
-        process.stdout.write(`${hud.text}\n`);
+        previousText = outputText;
+        process.stdout.write(`${outputText}\n`);
       };
       if (watch) {
-        const intervalMs = refreshMs ?? 2000;
         const maxIterations = iterations ?? Number.POSITIVE_INFINITY;
         for (let index = 0; index < maxIterations; index += 1) {
           await runHudOnce();
@@ -1105,7 +1133,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--slack-username <name>] [--slack-icon-emoji <emoji>] [--email|--no-email] [--email-to <a,b>] [--email-from <addr>] [--email-sendmail-path <path>] [--email-subject-prefix <prefix>]
-  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--color|--no-color]
+  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
   agmo team layout status <team>
   agmo team layout repair <team> [--dry-run] [--force]
   agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]
