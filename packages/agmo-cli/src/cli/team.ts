@@ -147,6 +147,8 @@ const TEAM_API_OPERATION_NAMES = [
   "write-worker-inbox",
   "write-worker-identity",
   "append-event",
+  "read-events",
+  "await-event",
   "read-task",
   "list-tasks",
   "get-summary",

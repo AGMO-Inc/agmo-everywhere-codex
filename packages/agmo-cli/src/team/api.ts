@@ -15,6 +15,8 @@ import {
   writeWorkerIdentityState,
   writeWorkerInboxContent,
   appendTeamApiEvent,
+  readTeamApiEvents,
+  awaitTeamApiEvent,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
@@ -36,6 +38,8 @@ export type TeamApiOperation =
   | "write-worker-inbox"
   | "write-worker-identity"
   | "append-event"
+  | "read-events"
+  | "await-event"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -160,6 +164,29 @@ const TEAM_API_EVENT_TYPES = [
   "task_integration_failed"
 ] as const;
 type TeamApiEventType = (typeof TEAM_API_EVENT_TYPES)[number];
+const TEAM_API_WAKEABLE_EVENT_TYPES = new Set<TeamApiEventType>([
+  "worker_state_changed",
+  "task_completed",
+  "task_failed",
+  "worker_stopped",
+  "message_received",
+  "leader_notification_deferred",
+  "all_workers_idle",
+  "team_leader_nudge",
+  "worker_integration_failed",
+  "worker_integration_attempt_requested",
+  "worker_merge_conflict",
+  "worker_cherry_pick_conflict",
+  "worker_rebase_conflict",
+  "worker_cross_rebase_conflict",
+  "worker_stale_diff",
+  "worker_stale_heartbeat",
+  "worker_stale_stdout",
+  "team_shutdown",
+  "shutdown_acknowledged",
+  "task_integration_conflict",
+  "task_integration_failed"
+]);
 
 export function buildTeamApiErrorEnvelope(
   operation: TeamApiOperation,
@@ -372,6 +399,20 @@ function requiredTaskStatus(input: TeamApiInput, fieldName: string): AgmoTeamTas
 function requiredEventType(input: TeamApiInput, fieldName: string): TeamApiEventType | TeamApiError {
   const value = requiredString(input, fieldName);
   if (isTeamApiError(value)) {
+    return value;
+  }
+  if (!TEAM_API_EVENT_TYPES.includes(value as TeamApiEventType)) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be one of: ${TEAM_API_EVENT_TYPES.join(", ")}`
+    };
+  }
+  return value as TeamApiEventType;
+}
+
+function optionalEventType(input: TeamApiInput, fieldName: string): TeamApiEventType | TeamApiError | undefined {
+  const value = optionalString(input, fieldName);
+  if (value === undefined || isTeamApiError(value)) {
     return value;
   }
   if (!TEAM_API_EVENT_TYPES.includes(value as TeamApiEventType)) {
@@ -697,6 +738,98 @@ export async function executeTeamApiOperation(
           cwd
         )
       );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "read-events") {
+    const afterEventId = optionalString(input, "after_event_id");
+    const wakeableOnly = optionalBoolean(input, "wakeable_only");
+    const type = optionalEventType(input, "type");
+    const worker = optionalString(input, "worker");
+    const taskId = optionalString(input, "task_id");
+    if (isTeamApiError(afterEventId)) {
+      return buildTeamApiErrorEnvelope(operation, afterEventId.code, afterEventId.message);
+    }
+    if (isTeamApiError(wakeableOnly)) {
+      return buildTeamApiErrorEnvelope(operation, wakeableOnly.code, wakeableOnly.message);
+    }
+    if (isTeamApiError(type)) {
+      return buildTeamApiErrorEnvelope(operation, type.code, type.message);
+    }
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    try {
+      const result = await readTeamApiEvents(
+        teamName,
+        {
+          ...(afterEventId !== undefined ? { afterEventId } : {}),
+          wakeableOnly: wakeableOnly ?? false,
+          ...(type !== undefined ? { type } : {}),
+          ...(worker !== undefined ? { worker } : {}),
+          ...(taskId !== undefined ? { taskId } : {}),
+          wakeableEventTypes: [...TEAM_API_WAKEABLE_EVENT_TYPES]
+        },
+        cwd
+      );
+      return dataEnvelope(operation, result);
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "await-event") {
+    const afterEventId = optionalString(input, "after_event_id");
+    const timeoutMs = optionalNonNegativeInteger(input, "timeout_ms");
+    const pollMs = optionalNonNegativeInteger(input, "poll_ms");
+    const wakeableOnly = optionalBoolean(input, "wakeable_only");
+    const type = optionalEventType(input, "type");
+    const worker = optionalString(input, "worker");
+    const taskId = optionalString(input, "task_id");
+    if (isTeamApiError(afterEventId)) {
+      return buildTeamApiErrorEnvelope(operation, afterEventId.code, afterEventId.message);
+    }
+    if (isTeamApiError(timeoutMs)) {
+      return buildTeamApiErrorEnvelope(operation, timeoutMs.code, timeoutMs.message);
+    }
+    if (isTeamApiError(pollMs)) {
+      return buildTeamApiErrorEnvelope(operation, pollMs.code, pollMs.message);
+    }
+    if (isTeamApiError(wakeableOnly)) {
+      return buildTeamApiErrorEnvelope(operation, wakeableOnly.code, wakeableOnly.message);
+    }
+    if (isTeamApiError(type)) {
+      return buildTeamApiErrorEnvelope(operation, type.code, type.message);
+    }
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    try {
+      const result = await awaitTeamApiEvent(
+        teamName,
+        {
+          ...(afterEventId !== undefined ? { afterEventId } : {}),
+          timeoutMs: timeoutMs ?? 30_000,
+          ...(pollMs !== undefined ? { pollMs } : {}),
+          wakeableOnly: wakeableOnly ?? false,
+          ...(type !== undefined ? { type } : {}),
+          ...(worker !== undefined ? { worker } : {}),
+          ...(taskId !== undefined ? { taskId } : {}),
+          wakeableEventTypes: [...TEAM_API_WAKEABLE_EVENT_TYPES]
+        },
+        cwd
+      );
+      return dataEnvelope(operation, result);
     } catch (error) {
       const mapped = mapRuntimeError(error);
       return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);

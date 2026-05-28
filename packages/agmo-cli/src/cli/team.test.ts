@@ -4,7 +4,7 @@ import os from "node:os";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
+import { appendTeamApiEvent, shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
 import {
   resolveTeamDir,
   resolveTeamEventsPath,
@@ -799,6 +799,232 @@ test("runTeamCommand team api rejects invalid append-event input", async () => {
   assert.deepEqual(invalidMetadata.error, {
     code: "invalid_input",
     message: "metadata must be an object when provided",
+  });
+});
+
+test("runTeamCommand team api reads canonical filtered team events", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-read-events-"));
+  const teamName = "cli-api-read-events-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Read event API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const first = await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, type: "task_completed", worker: "worker-2", task_id: "2" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const firstEventId = ((first.data as { event?: { event_id?: string } }).event?.event_id) ?? "";
+
+  const second = await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        type: "worker_idle",
+        worker: "worker-1",
+        task_id: "1",
+        prev_state: "working",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const secondEventId = ((second.data as { event?: { event_id?: string } }).event?.event_id) ?? "";
+
+  await captureTeamCommand(
+    [
+      "api",
+      "append-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, type: "task_failed", worker: "worker-1", task_id: "1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+
+  const result = await captureTeamCommand(
+    [
+      "api",
+      "read-events",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        after_event_id: firstEventId,
+        worker: "worker-1",
+        task_id: "1",
+        type: "worker_idle",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+
+  assertMachineEnvelope(result, "read-events");
+  const data = result.data as {
+    count?: number;
+    cursor?: string;
+    events?: Array<{ event_id?: string; type?: string; source_type?: string; worker?: string; task_id?: string; state?: string }>;
+  };
+  assert.equal(data.count, 1);
+  assert.equal(data.cursor, secondEventId);
+  assert.equal(data.events?.length, 1);
+  assert.equal(data.events?.[0]?.event_id, secondEventId);
+  assert.equal(data.events?.[0]?.type, "worker_state_changed");
+  assert.equal(data.events?.[0]?.source_type, "worker_idle");
+  assert.equal(data.events?.[0]?.worker, "worker-1");
+  assert.equal(data.events?.[0]?.task_id, "1");
+  assert.equal(data.events?.[0]?.state, "idle");
+});
+
+test("runTeamCommand team api awaits the next matching event", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-await-event-"));
+  const teamName = "cli-api-await-event-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Await event API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const oldMatching = await appendTeamApiEvent(
+    teamName,
+    { type: "task_completed", worker: "worker-1", taskId: "1" },
+    tempRoot,
+  );
+  const oldEventId = ((oldMatching.event as { event_id?: string } | undefined)?.event_id) ?? "";
+
+  const waitPromise = captureTeamCommand(
+    [
+      "api",
+      "await-event",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        task_id: "1",
+        type: "task_completed",
+        timeout_ms: 500,
+        poll_ms: 25,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+
+  setTimeout(() => {
+    void appendTeamApiEvent(
+      teamName,
+      { type: "worker_state_changed", worker: "worker-2", taskId: "2", state: "working" },
+      tempRoot,
+    );
+  }, 25);
+  setTimeout(() => {
+    void appendTeamApiEvent(
+      teamName,
+      { type: "task_completed", worker: "worker-1", taskId: "1" },
+      tempRoot,
+    );
+  }, 60);
+
+  const result = await waitPromise;
+
+  assertMachineEnvelope(result, "await-event");
+  const data = result.data as {
+    status?: string;
+    cursor?: string;
+    event?: { event_id?: string; type?: string; worker?: string; task_id?: string } | null;
+  };
+  assert.equal(data.status, "event");
+  assert.match(data.cursor ?? "", /^evt-/);
+  assert.notEqual(data.event?.event_id, oldEventId);
+  assert.equal(data.event?.type, "task_completed");
+  assert.equal(data.event?.worker, "worker-1");
+  assert.equal(data.event?.task_id, "1");
+});
+
+test("runTeamCommand team api rejects invalid event read filters", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-read-events-invalid-"));
+  const teamName = "cli-api-read-events-invalid-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject invalid event read filters",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const readResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "read-events",
+      "--input",
+      JSON.stringify({ team_name: teamName, type: "not_an_event" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const readOutput = JSON.parse(readResult.stdout) as Record<string, unknown>;
+  assert.equal(readResult.exitCode, 1);
+  assertMachineEnvelope(readOutput, "read-events", false);
+  assert.equal((readOutput.error as { code?: string }).code, "invalid_input");
+  assert.match((readOutput.error as { message?: string }).message ?? "", /type must be one of:/);
+
+  const awaitResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "await-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, timeout_ms: -1 }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const awaitOutput = JSON.parse(awaitResult.stdout) as Record<string, unknown>;
+  assert.equal(awaitResult.exitCode, 1);
+  assertMachineEnvelope(awaitOutput, "await-event", false);
+  assert.deepEqual(awaitOutput.error, {
+    code: "invalid_input",
+    message: "timeout_ms must be a non-negative integer when provided",
+  });
+
+  const pollResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "await-event",
+      "--input",
+      JSON.stringify({ team_name: teamName, poll_ms: -1 }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const pollOutput = JSON.parse(pollResult.stdout) as Record<string, unknown>;
+  assert.equal(pollResult.exitCode, 1);
+  assertMachineEnvelope(pollOutput, "await-event", false);
+  assert.deepEqual(pollOutput.error, {
+    code: "invalid_input",
+    message: "poll_ms must be a non-negative integer when provided",
   });
 });
 

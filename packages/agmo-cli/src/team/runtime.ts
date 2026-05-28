@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, readdir, realpath, rm } from "node:fs/promises";
+import { appendFile, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { buildHookCommand, mergeManagedHooksConfig } from "../hooks/codex-hooks.js";
 import { agmoCliDistEntryPath } from "../utils/paths.js";
@@ -6035,6 +6035,215 @@ export async function appendTeamApiEvent(
     },
     cwd
   );
+}
+
+type TeamApiEventRecord = Record<string, unknown> & {
+  event_id: string;
+  team: string;
+  team_name: string;
+  type: string;
+  worker: string;
+  worker_name: string;
+  created_at: string;
+  timestamp: string;
+};
+
+type TeamApiEventReadOptions = {
+  afterEventId?: string;
+  wakeableOnly?: boolean;
+  type?: string;
+  worker?: string;
+  taskId?: string;
+  wakeableEventTypes?: string[];
+};
+
+function cleanString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeTeamApiEvent(
+  raw: unknown,
+  teamName: string,
+  lineNumber: number
+): TeamApiEventRecord | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const value = raw as Record<string, unknown>;
+  const type = cleanString(value.type);
+  const createdAt = cleanString(value.created_at) ?? cleanString(value.timestamp);
+  if (!type || !createdAt) {
+    return null;
+  }
+
+  const eventId = cleanString(value.event_id) ?? `line-${lineNumber}`;
+  const team = cleanString(value.team) ?? cleanString(value.team_name) ?? teamName;
+  const worker = cleanString(value.worker) ?? cleanString(value.worker_name) ?? "leader-fixed";
+  const normalizedType = type === "worker_idle" ? "worker_state_changed" : type;
+  const sourceType = type === "worker_idle"
+    ? "worker_idle"
+    : cleanString(value.source_type);
+
+  return {
+    ...value,
+    event_id: eventId,
+    team,
+    team_name: cleanString(value.team_name) ?? team,
+    type: normalizedType,
+    worker,
+    worker_name: cleanString(value.worker_name) ?? worker,
+    ...(sourceType !== undefined ? { source_type: sourceType } : {}),
+    ...(type === "worker_idle" ? { state: "idle" } : {}),
+    created_at: createdAt,
+    timestamp: cleanString(value.timestamp) ?? createdAt
+  };
+}
+
+function eventMatchesTeamApiQuery(
+  event: TeamApiEventRecord,
+  options: TeamApiEventReadOptions
+): boolean {
+  if (options.type) {
+    const sourceType = cleanString(event.source_type);
+    if (event.type !== options.type && !(options.type === "worker_idle" && sourceType === "worker_idle")) {
+      return false;
+    }
+  }
+  if (options.worker && event.worker !== options.worker && event.worker_name !== options.worker) {
+    return false;
+  }
+  if (options.taskId && event.task_id !== options.taskId) {
+    return false;
+  }
+  if (options.wakeableOnly) {
+    const wakeable = new Set(options.wakeableEventTypes ?? []);
+    if (!wakeable.has(event.type)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function readTeamApiEvents(
+  teamName: string,
+  options: TeamApiEventReadOptions = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+
+  const path = resolveTeamEventsPath(normalizedTeamName, cwd);
+  if (!existsSync(path)) {
+    return {
+      team_name: normalizedTeamName,
+      count: 0,
+      cursor: options.afterEventId ?? "",
+      events: []
+    };
+  }
+
+  const raw = await readFile(path, "utf-8").catch(() => "");
+  const events: TeamApiEventRecord[] = [];
+  let started = !options.afterEventId;
+  let lastCursor = options.afterEventId ?? "";
+
+  raw.split("\n").forEach((line, index) => {
+    if (!line.trim()) {
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const event = normalizeTeamApiEvent(parsed, normalizedTeamName, index + 1);
+    if (!event) {
+      return;
+    }
+    if (!started) {
+      if (event.event_id === options.afterEventId) {
+        started = true;
+        lastCursor = event.event_id;
+      }
+      return;
+    }
+    if (!eventMatchesTeamApiQuery(event, options)) {
+      return;
+    }
+    lastCursor = event.event_id;
+    events.push(event);
+  });
+
+  return {
+    team_name: normalizedTeamName,
+    count: events.length,
+    cursor: events.at(-1)?.event_id ?? lastCursor,
+    events
+  };
+}
+
+export async function awaitTeamApiEvent(
+  teamName: string,
+  options: TeamApiEventReadOptions & {
+    timeoutMs: number;
+    pollMs?: number;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const deadline = Date.now() + Math.max(0, options.timeoutMs);
+  const pollMs = Math.max(25, options.pollMs ?? 100);
+
+  let cursor = options.afterEventId;
+  if (!cursor) {
+    const baseline = await readTeamApiEvents(
+      normalizedTeamName,
+      {
+        wakeableEventTypes: options.wakeableEventTypes
+      },
+      cwd
+    );
+    cursor = typeof baseline.cursor === "string" ? baseline.cursor : "";
+  }
+
+  while (Date.now() <= deadline) {
+    const result = await readTeamApiEvents(
+      normalizedTeamName,
+      {
+        ...options,
+        afterEventId: cursor
+      },
+      cwd
+    );
+    const events = Array.isArray(result.events) ? result.events as TeamApiEventRecord[] : [];
+    if (events.length > 0) {
+      const event = events[0];
+      return {
+        team_name: normalizedTeamName,
+        status: "event",
+        cursor: event.event_id,
+        event
+      };
+    }
+    if (typeof result.cursor === "string" && result.cursor) {
+      cursor = result.cursor;
+    }
+    if (Date.now() > deadline) {
+      break;
+    }
+    await sleepMs(pollMs);
+  }
+
+  return {
+    team_name: normalizedTeamName,
+    status: "timeout",
+    cursor: cursor ?? "",
+    event: null
+  };
 }
 
 export async function reportWorkerStatus(
