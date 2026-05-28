@@ -300,6 +300,7 @@ When one execution lane is no longer enough, Agmo can move into a durable team r
 
 ```bash
 agmo team start 3 "Ship the scoped feature with verification"
+agmo team api get-summary --input '{"team_name":"<team-name>"}' --json
 agmo team status <team-name>
 agmo team monitor <team-name> --preset balanced --leader-view
 agmo team integrate <team-name> --strategy squash --target-ref @base
@@ -308,7 +309,11 @@ agmo team integrate-assist <team-name>
 
 Machine-oriented JSON commands keep existing `command` fields and add a stable envelope:
 `schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
-Current envelope-backed surfaces include `agmo doctor` and JSON-producing `agmo team` commands.
+Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo team` commands,
+and JSON-producing `agmo vault` commands.
+For machine interop, `agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json`
+returns an OMC-style envelope with either `data` or `error`; lifecycle mutation is limited to claim-safe
+`in_progress -> completed|failed` terminal transitions.
 
 ### Operational features
 

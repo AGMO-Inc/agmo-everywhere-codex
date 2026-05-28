@@ -1,4 +1,5 @@
 import { parseScopeFlag } from "../utils/args.js";
+import { machineJsonEnvelope } from "../utils/machine-json.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import {
   createVaultNote,
@@ -64,6 +65,10 @@ function parseKeyValueOptions(args: string[], optionName: string): Record<string
   return Object.keys(output).length > 0 ? output : undefined;
 }
 
+function printVaultJson(operation: string, payload: Record<string, unknown>): void {
+  console.log(JSON.stringify(machineJsonEnvelope(operation, true, payload), null, 2));
+}
+
 function parseScaffoldInput(args: string[]): VaultScaffoldInput {
   const type = parseOption(args, "--type");
   const project = parseOption(args, "--project");
@@ -105,7 +110,7 @@ export async function runVaultCommand(args: string[]): Promise<void> {
       const action = args[1];
       if (action === "show") {
         const result = await resolveVaultRoot(cwd);
-        console.log(JSON.stringify({ command: "vault config show", ...result }, null, 2));
+        printVaultJson("vault.config.show", { command: "vault config show", ...result });
         return;
       }
 
@@ -116,7 +121,10 @@ export async function runVaultCommand(args: string[]): Promise<void> {
         }
         const scope = parseScopeFlag(args.slice(3));
         const result = await setVaultRoot(path, scope, cwd);
-        console.log(JSON.stringify({ command: "vault config set-root", ...result }, null, 2));
+        printVaultJson("vault.config.set-root", {
+          command: "vault config set-root",
+          ...result
+        });
         return;
       }
 
@@ -147,7 +155,7 @@ export async function runVaultCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "vault save", ...result }, null, 2));
+      printVaultJson("vault.save", { command: "vault save", ...result });
       return;
     }
     case "scaffold": {
@@ -156,17 +164,11 @@ export async function runVaultCommand(args: string[]): Promise<void> {
       if (output) {
         const { writeTextFile } = await import("../utils/fs.js");
         const result = await writeTextFile(output, scaffold.content);
-        console.log(
-          JSON.stringify(
-            {
-              command: "vault scaffold",
-              title: scaffold.title,
-              output: result
-            },
-            null,
-            2
-          )
-        );
+        printVaultJson("vault.scaffold", {
+          command: "vault scaffold",
+          title: scaffold.title,
+          output: result
+        });
       } else {
         process.stdout.write(scaffold.content);
       }
@@ -182,17 +184,11 @@ export async function runVaultCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(
-        JSON.stringify(
-          {
-            command: "vault create",
-            ...result.vault,
-            scaffold_title: result.scaffold.title
-          },
-          null,
-          2
-        )
-      );
+      printVaultJson("vault.create", {
+        command: "vault create",
+        ...result.vault,
+        scaffold_title: result.scaffold.title
+      });
       return;
     }
     default:

@@ -26,13 +26,15 @@ async function captureTeamCommandText(
 async function captureTeamCommandOutput(
   args: string[],
   cwd: string,
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ stdout: string; stderr: string; exitCode: string | number | null | undefined }> {
   const originalCwd = process.cwd();
   const originalProjectRoot = process.env.AGMO_PROJECT_ROOT;
+  const originalExitCode = process.exitCode;
   const originalWrite = process.stdout.write.bind(process.stdout);
   const originalStderrWrite = process.stderr.write.bind(process.stderr);
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
+  let exitCode: string | number | null | undefined;
 
   process.env.AGMO_PROJECT_ROOT = cwd;
   process.chdir(cwd);
@@ -51,6 +53,7 @@ async function captureTeamCommandOutput(
 
   try {
     await runTeamCommand(args);
+    exitCode = process.exitCode;
   } catch (error) {
     Object.assign(error as object, {
       stdout: stdoutChunks.join(""),
@@ -66,9 +69,10 @@ async function captureTeamCommandOutput(
     } else {
       process.env.AGMO_PROJECT_ROOT = originalProjectRoot;
     }
+    process.exitCode = originalExitCode;
   }
 
-  return { stdout: stdoutChunks.join(""), stderr: stderrChunks.join("") };
+  return { stdout: stdoutChunks.join(""), stderr: stderrChunks.join(""), exitCode };
 }
 
 function captureWrite(chunks: string[]): Pick<NodeJS.WriteStream, "write"> {
@@ -149,6 +153,248 @@ test("runTeamCommand status reports a missing team as a machine-readable miss", 
   ]);
   assert.equal(output.tmux_health, null);
   assert.equal(output.status, null);
+});
+
+test("runTeamCommand team api supports read-only success operations", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-success-"));
+  const teamName = "cli-api-success-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Expose read-only team API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const listTasks = await captureTeamCommand(
+    ["api", "list-tasks", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  assertMachineEnvelope(listTasks, "list-tasks");
+  assert.equal(listTasks.command, "team api list-tasks");
+  assert.ok(listTasks.data && typeof listTasks.data === "object");
+  const listData = listTasks.data as { team_name?: string; tasks?: Array<{ id: string }> };
+  assert.equal(listData.team_name, teamName);
+  assert.equal(listData.tasks?.length, 2);
+
+  const readTask = await captureTeamCommand(
+    [
+      "api",
+      "read-task",
+      `--input=${JSON.stringify({ team_name: teamName, task_id: "1" })}`,
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(readTask, "read-task");
+  assert.equal(readTask.command, "team api read-task");
+  assert.ok(readTask.data && typeof readTask.data === "object");
+  const readData = readTask.data as { team_name?: string; task?: { id?: string } };
+  assert.equal(readData.team_name, teamName);
+  assert.equal(readData.task?.id, "1");
+
+  const summary = await captureTeamCommand(
+    ["api", "get-summary", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  assertMachineEnvelope(summary, "get-summary");
+  assert.equal(summary.command, "team api get-summary");
+  assert.ok(summary.data && typeof summary.data === "object");
+  const summaryData = summary.data as {
+    team_name?: string;
+    active?: boolean;
+    phase?: string;
+    worker_count?: number;
+    task_counts?: Record<string, number>;
+    workers?: Array<{ worker_name?: string; state?: string }>;
+  };
+  assert.equal(summaryData.team_name, teamName);
+  assert.equal(summaryData.active, true);
+  assert.equal(summaryData.phase, "active");
+  assert.equal(summaryData.worker_count, 2);
+  assert.deepEqual(summaryData.task_counts, {
+    pending: 1,
+    blocked: 1,
+    in_progress: 0,
+    completed: 0,
+    failed: 0,
+  });
+  assert.deepEqual(
+    summaryData.workers?.map((worker) => ({
+      worker_name: worker.worker_name,
+      state: worker.state,
+    })),
+    [
+      { worker_name: "worker-1", state: "idle" },
+      { worker_name: "worker-2", state: "idle" },
+    ],
+  );
+});
+
+test("runTeamCommand team api supports claim-safe terminal transitions", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-transition-"));
+  const teamName = "cli-api-transition-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose claim-safe lifecycle API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const claim = await captureTeamCommand(
+    [
+      "api",
+      "claim-task",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        worker: "worker-1",
+        expected_version: 1,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(claim, "claim-task");
+  assert.equal(claim.command, "team api claim-task");
+  assert.ok(claim.data && typeof claim.data === "object");
+  const claimData = claim.data as {
+    claimToken?: string;
+    claim_token?: string;
+    task?: { status?: string; claim?: { token?: string } };
+  };
+  assert.equal(typeof claimData.claimToken, "string");
+  assert.equal(claimData.claim_token, claimData.claimToken);
+  assert.equal(claimData.task?.status, "in_progress");
+  assert.equal(claimData.task?.claim?.token, claimData.claimToken);
+
+  const badTransitionResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "transition-task-status",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        from: "in_progress",
+        to: "completed",
+        claim_token: "not-the-claim-token",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const badTransition = JSON.parse(badTransitionResult.stdout) as Record<string, unknown>;
+  assert.equal(badTransitionResult.exitCode, 1);
+  assertMachineEnvelope(badTransition, "transition-task-status", false);
+  assert.deepEqual(badTransition.error, {
+    code: "claim_conflict",
+    message: "claim token mismatch for task 1",
+  });
+
+  const transition = await captureTeamCommand(
+    [
+      "api",
+      "transition-task-status",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        from: "in_progress",
+        to: "completed",
+        claim_token: claimData.claimToken,
+        result: "lifecycle complete",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(transition, "transition-task-status");
+  assert.equal(transition.command, "team api transition-task-status");
+  assert.ok(transition.data && typeof transition.data === "object");
+  const transitionData = transition.data as {
+    task?: { status?: string; result?: string; claim?: unknown };
+    auto_shutdown?: { triggered?: boolean };
+  };
+  assert.equal(transitionData.task?.status, "completed");
+  assert.equal(transitionData.task?.result, "lifecycle complete");
+  assert.equal(transitionData.task?.claim, undefined);
+  assert.equal(transitionData.auto_shutdown?.triggered, true);
+});
+
+test("runTeamCommand team api returns ok false envelope for missing team", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-missing-"));
+  const result = await captureTeamCommandOutput(
+    ["api", "get-summary", "--input", JSON.stringify({ team_name: "missing-api-team" }), "--json"],
+    tempRoot,
+  );
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+  assert.equal(result.exitCode, 1);
+  assertMachineEnvelope(output, "get-summary", false);
+  assert.equal(output.command, "team api get-summary");
+  assert.deepEqual(output.error, {
+    code: "team_not_found",
+    message: "team not found: missing-api-team",
+  });
+  assert.equal("data" in output, false);
+});
+
+test("runTeamCommand team api returns ok false envelopes for invalid input and missing task", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-errors-"));
+  const teamName = "cli-api-error-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose API errors",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const invalidInputResult = await captureTeamCommandOutput(
+    ["api", "list-tasks", "--json"],
+    tempRoot,
+  );
+  const invalidInput = JSON.parse(invalidInputResult.stdout) as Record<string, unknown>;
+
+  assert.equal(invalidInputResult.exitCode, 1);
+  assertMachineEnvelope(invalidInput, "list-tasks", false);
+  assert.equal(invalidInput.command, "team api list-tasks");
+  assert.deepEqual(invalidInput.error, {
+    code: "invalid_input",
+    message: "--input is required",
+  });
+
+  const missingTaskResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "read-task",
+      "--input",
+      JSON.stringify({ team_name: teamName, task_id: "missing-task" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingTask = JSON.parse(missingTaskResult.stdout) as Record<string, unknown>;
+
+  assert.equal(missingTaskResult.exitCode, 1);
+  assertMachineEnvelope(missingTask, "read-task", false);
+  assert.equal(missingTask.command, "team api read-task");
+  assert.deepEqual(missingTask.error, {
+    code: "task_not_found",
+    message: "task not found: missing-task",
+  });
 });
 
 test("runTeamCommand cleanup-stale prints additive machine JSON envelope", async () => {

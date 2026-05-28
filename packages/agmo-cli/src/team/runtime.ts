@@ -688,6 +688,45 @@ function assertWorkerOwnsTask(task: AgmoTeamTaskRecord, workerName: string): voi
   }
 }
 
+function buildTaskClaim(workerName: string, claimedAt: string): NonNullable<AgmoTeamTaskRecord["claim"]> {
+  return {
+    owner: workerName,
+    claimed_at: claimedAt,
+    token: randomUUID(),
+    leased_until: new Date(Date.now() + DEFAULT_TASK_CLAIM_LEASE_MS).toISOString()
+  };
+}
+
+function assertTaskMutationGuard(
+  task: AgmoTeamTaskRecord,
+  workerName: string,
+  options: {
+    expectedStatus?: AgmoTeamTaskStatus;
+    claimToken?: string;
+  }
+): void {
+  if (options.expectedStatus && task.status !== options.expectedStatus) {
+    throw new Error(
+      `invalid transition: expected ${options.expectedStatus}, found ${task.status}`
+    );
+  }
+
+  if (!options.claimToken) {
+    return;
+  }
+
+  if (!task.claim || task.claim.owner !== workerName || task.claim.token !== options.claimToken) {
+    throw new Error(`claim token mismatch for task ${task.id}`);
+  }
+
+  if (task.claim.leased_until) {
+    const leasedUntilMs = Date.parse(task.claim.leased_until);
+    if (Number.isFinite(leasedUntilMs) && leasedUntilMs <= Date.now()) {
+      throw new Error(`claim lease expired for task ${task.id}`);
+    }
+  }
+}
+
 function computeTaskDependencyBlockers(
   task: AgmoTeamTaskRecord,
   tasksById: Map<string, AgmoTeamTaskRecord>
@@ -4906,6 +4945,7 @@ export async function claimTaskForWorker(
   workerName: string,
   options: {
     ignoreDependencies?: boolean;
+    expectedVersion?: number;
   } = {},
   cwd = process.cwd()
 ): Promise<Record<string, unknown>> {
@@ -4917,6 +4957,11 @@ export async function claimTaskForWorker(
     async () => {
       const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
       assertWorkerOwnsTask(task, workerName);
+      if (options.expectedVersion !== undefined && task.version !== options.expectedVersion) {
+        throw new Error(
+          `claim conflict: expected task version ${options.expectedVersion}, found ${task.version}`
+        );
+      }
       const status = await readTeamStatus(normalizedTeamName, cwd);
       if (!status) {
         throw new Error(`team not found: ${normalizedTeamName}`);
@@ -4958,15 +5003,13 @@ export async function claimTaskForWorker(
       }
 
       const timestamp = nowIso();
+      const claim = buildTaskClaim(workerName, timestamp);
       const nextTask: AgmoTeamTaskRecord = {
         ...task,
         owner: workerName,
         status: "in_progress",
         blocked_by_dependencies: undefined,
-        claim: {
-          owner: workerName,
-          claimed_at: timestamp
-        },
+        claim,
         error: undefined,
         version: task.version + 1,
         updated_at: timestamp
@@ -5008,6 +5051,8 @@ export async function claimTaskForWorker(
         team_name: normalizedTeamName,
         worker_name: workerName,
         ignored_dependencies: options.ignoreDependencies ?? false,
+        claim_token: claim.token,
+        claimToken: claim.token,
         task: nextTask
       };
     },
@@ -5020,7 +5065,11 @@ export async function completeTaskForWorker(
   taskId: string,
   workerName: string,
   result: string | undefined,
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  options: {
+    expectedStatus?: AgmoTeamTaskStatus;
+    claimToken?: string;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
   const completed = await withTeamStateLock(
@@ -5030,6 +5079,7 @@ export async function completeTaskForWorker(
     async () => {
       const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
       assertWorkerOwnsTask(task, workerName);
+      assertTaskMutationGuard(task, workerName, options);
 
       const timestamp = nowIso();
       const nextTask: AgmoTeamTaskRecord = {
@@ -5108,7 +5158,11 @@ export async function failTaskForWorker(
   taskId: string,
   workerName: string,
   error: string | undefined,
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  options: {
+    expectedStatus?: AgmoTeamTaskStatus;
+    claimToken?: string;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
   const failed = await withTeamStateLock(
@@ -5118,6 +5172,7 @@ export async function failTaskForWorker(
     async () => {
       const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
       assertWorkerOwnsTask(task, workerName);
+      assertTaskMutationGuard(task, workerName, options);
 
       const timestamp = nowIso();
       const nextTask: AgmoTeamTaskRecord = {

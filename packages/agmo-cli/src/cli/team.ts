@@ -40,6 +40,11 @@ import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
 import { machineJsonEnvelope, uniqueRecommendedActions } from "../utils/machine-json.js";
+import {
+  buildTeamApiErrorEnvelope,
+  executeTeamApiOperation,
+  type TeamApiOperation
+} from "../team/api.js";
 import { ellipsize, fitLines } from "../team/terminal-format.js";
 
 function parseWorkerCount(value: string | undefined): number {
@@ -123,6 +128,35 @@ function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined
     return "never";
   }
   return undefined;
+}
+
+function parseTeamApiOperation(value: string | undefined): TeamApiOperation {
+  if (
+    value === "read-task" ||
+    value === "list-tasks" ||
+    value === "get-summary" ||
+    value === "claim-task" ||
+    value === "transition-task-status"
+  ) {
+    return value;
+  }
+  throw new Error(
+    "usage: agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json"
+  );
+}
+
+function parseTeamApiInput(args: string[]): { input?: string; error?: string } {
+  let input: string | undefined;
+  try {
+    input = parseOption(args, "--input");
+  } catch (error) {
+    return { error: errorMessage(error) };
+  }
+  const remaining = removeOption(args, "--input").filter((arg) => arg !== "--json");
+  if (remaining.length > 0) {
+    return { error: `unknown team api option: ${remaining[0]}` };
+  }
+  return { input };
 }
 
 function parseRoleMapOption(value: string | undefined): Record<string, string> | undefined {
@@ -380,6 +414,18 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   const cwd = resolveRuntimeRoot();
 
   switch (subcommand) {
+    case "api": {
+      const operation = parseTeamApiOperation(args[1]);
+      const parsedInput = parseTeamApiInput(args.slice(2));
+      const envelope = parsedInput.error
+        ? buildTeamApiErrorEnvelope(operation, "invalid_input", parsedInput.error)
+        : await executeTeamApiOperation(operation, parsedInput.input, cwd);
+      console.log(JSON.stringify(envelope, null, 2));
+      if (!envelope.ok) {
+        process.exitCode = 1;
+      }
+      return;
+    }
     case "start": {
       parseScopeFlag(args.slice(1));
       const workers = parseWorkerCount(args[1]);
@@ -1230,6 +1276,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
     default:
       console.log(`Usage:
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
+  agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
   agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]
