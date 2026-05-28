@@ -308,6 +308,38 @@ agmo team integrate <team-name> --strategy squash --target-ref @base
 agmo team integrate-assist <team-name>
 ```
 
+### Team Runtime HUD and layout
+
+Use durable team state first when operating a team: `agmo team status <team-name>` and the JSON
+`agmo team api ...` surfaces read `.agmo/state/team/<team-name>/...` without depending on tmux pane output.
+For teams using tmux, `agmo team hud <team-name>` renders a leader HUD from the same durable state.
+
+Practical HUD presets:
+
+- `agmo team hud <team-name> --preset sidecar` is the compact tmux-friendly HUD; team-created HUD panes use this
+  preset with a bounded height.
+- `agmo team hud <team-name> --preset focused` is the default CLI HUD view for operator triage. It expands worker
+  diagnostics and limits command hints to read-only or dry-run-safe actions.
+- `agmo team hud <team-name> --preset full` adds deeper diagnostics, including open task rows and manual/mutating
+  action hints for an operator to review before running.
+
+Use `--watch` for a live terminal view, with `--refresh-ms <ms>` and `--iterations <n>` when you need a bounded
+refresh loop. `--json` is for machine reads and cannot be combined with `--watch`.
+
+The sidecar HUD may show `inspect=` hints when worker, task, or layout state needs attention. Treat those as
+read-only next checks, such as worker/task status review or `agmo team layout status <team-name>`, before running a
+repair or rebalance command. Layout operations are:
+
+```bash
+agmo team layout status <team-name>
+agmo team layout repair <team-name> --dry-run
+agmo team layout rebalance <team-name> --dry-run
+```
+
+`layout status` reports tmux layout health when the team uses tmux and returns a skipped/not-configured result for
+non-tmux teams. Prefer `repair --dry-run` or `rebalance --dry-run` before applying repair/rebalance; repair targets
+missing or dead HUD panes, while rebalance applies an `auto`, `main-vertical`, or `tiled` tmux layout plan.
+
 Machine-oriented JSON commands keep existing `command` fields and add a stable envelope:
 `schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
 Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo team` commands,

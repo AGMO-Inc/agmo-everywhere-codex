@@ -37,6 +37,28 @@ The leader should:
 5. prefer reclaim/rebalance/cleanup over ad hoc worker intervention when lanes stall
 6. own final integration, verification, and completion reporting
 
+## HUD and layout operations
+
+Default to durable state before pane UI: `agmo team status <team>` and `.agmo/state/team/<team>/...` are the control plane.
+
+Use `agmo team hud <team> --preset sidecar` when a live tmux sidecar is useful. The HUD also supports:
+
+- `--preset focused` for operator triage with worker diagnostics and read-only/dry-run-safe command hints
+- `--preset full` for deeper worker/task diagnostics and manual action review
+- `--watch` for a refreshing terminal view; use `--refresh-ms` and `--iterations` for bounded watch loops
+
+If the sidecar prints `inspect=...`, treat it as a read-only hint first. Check worker/task state or run
+`agmo team layout status <team>` before attempting layout changes.
+
+For layout work, inspect before mutating:
+
+1. `agmo team layout status <team>`
+2. `agmo team layout repair <team> --dry-run`
+3. `agmo team layout rebalance <team> --dry-run`
+
+Only run repair or rebalance without `--dry-run` after the status/dry-run output justifies it. Non-tmux teams may
+return skipped/not-configured layout results; do not infer that a live tmux session is required for durable team state.
+
 ## Runtime artifacts to trust
 
 Useful runtime artifacts live under `.agmo/state/team/<team>/`, including config, phase, tasks, worker status, heartbeat, inbox, mailbox, and dispatch state.
