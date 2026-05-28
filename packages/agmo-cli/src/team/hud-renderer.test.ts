@@ -141,6 +141,82 @@ test("renderTeamHud sidecar is compact, sanitized, and action-oriented", () => {
   }
 });
 
+test("renderTeamHud sidecar summarizes topology and recent durable events", () => {
+  const testContext = context();
+  testContext.snapshot.active_workers = 2;
+  testContext.snapshot.healthy_workers = 2;
+  testContext.snapshot.workers = [
+    ...testContext.snapshot.workers,
+    {
+      worker_name: "worker-2",
+      role: "agmo-verifier",
+      status_state: "idle",
+      heartbeat_at: "2026-05-27T00:00:00.000Z",
+      ms_since_heartbeat: 1500,
+      pid_alive: true,
+      heartbeat_alive_flag: true,
+      turn_count: 1,
+      health: "healthy",
+      pending_dispatch_count: 0,
+      mailbox_message_count: 0,
+      pane_id: "%4",
+      claim_at_risk: false,
+      reasons: []
+    }
+  ];
+  testContext.snapshot.tmux_health = {
+    transport: "tmux",
+    leader: "live",
+    hud: "live",
+    workers: {
+      "worker-1": "live",
+      "worker-2": "live"
+    },
+    layout: "ok",
+    retry_pending: 0,
+    retry_manual_required: 0,
+    orphan_warnings: []
+  };
+  testContext.recentEvents = [
+    {
+      eventId: "evt-2",
+      type: "worker_state_changed",
+      sourceType: "worker_idle",
+      worker: "worker-2",
+      taskId: "task-2",
+      state: "idle",
+      createdAt: "2026-05-26T23:59:30.000Z"
+    },
+    {
+      eventId: "evt-1",
+      type: "task_completed",
+      worker: "worker-1",
+      taskId: "task-1",
+      reason: "verified\u0007done",
+      createdAt: "2026-05-26T23:59:00.000Z"
+    }
+  ];
+
+  const rendered = renderTeamHud(testContext, {
+    preset: "sidecar",
+    maxWidth: 160,
+    maxLines: 8,
+    color: "never"
+  });
+  const lines = rendered.trimEnd().split("\n");
+
+  assert.ok(lines.length <= 8);
+  assert.match(rendered, /topology leader->worker-1\(executor\):working t=task-1/);
+  assert.match(rendered, /leader->worker-2\(verifier\):idle/);
+  assert.match(rendered, /events worker-2:worker_state_changed\/worker_idle state=idle t=task-2 30s ago/);
+  assert.match(rendered, /worker-1:task_completed t=task-1 verified\?done 1m ago/);
+  assert.match(rendered, /task task-1:in_progress owner=worker-1 finish renderer \| last worker-2:worker_state_changed\/worker_idle state=idle t=task-2/);
+  assert.match(rendered, /actions retry-dispatch:warning/);
+  for (const line of lines) {
+    assert.ok(visibleLength(line) <= 160, line);
+  }
+});
+
 test("renderTeamHud sidecar surfaces compact highlights before actions", () => {
   const testContext = context();
   testContext.snapshot.active_workers = 2;
