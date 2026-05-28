@@ -80,7 +80,7 @@ function captureWrite(chunks: string[]): Pick<NodeJS.WriteStream, "write"> {
   };
 }
 
-test("runTeamCommand status prints current ad hoc JSON shape for an existing team", async () => {
+test("runTeamCommand status prints additive machine JSON envelope for an existing team", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-status-"));
   const teamName = "cli-status-team";
 
@@ -96,9 +96,13 @@ test("runTeamCommand status prints current ad hoc JSON shape for an existing tea
 
   const output = await captureTeamCommand(["status", teamName], tempRoot);
 
+  assert.equal(output.schema_version, "1.0");
+  assert.equal(output.operation, "team.status");
+  assert.equal(output.ok, true);
   assert.equal(output.command, "team status");
   assert.equal(output.team_name, teamName);
   assert.equal(output.found, true);
+  assert.deepEqual(output.recommended_actions, []);
   assert.ok("tmux_health" in output);
   assert.ok(output.status && typeof output.status === "object");
   const status = output.status as Record<string, unknown>;
@@ -122,6 +126,37 @@ test("runTeamCommand status prints current ad hoc JSON shape for an existing tea
   assert.equal((status.phase as { current_phase?: string }).current_phase, "active");
   assert.equal(Array.isArray(status.tasks), true);
   assert.equal(Array.isArray(status.workers), true);
+});
+
+test("runTeamCommand status reports a missing team as a machine-readable miss", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-status-missing-"));
+  const output = await captureTeamCommand(["status", "missing-status-team"], tempRoot);
+
+  assert.equal(output.schema_version, "1.0");
+  assert.equal(output.operation, "team.status");
+  assert.equal(output.ok, false);
+  assert.equal(output.command, "team status");
+  assert.equal(output.team_name, "missing-status-team");
+  assert.equal(output.found, false);
+  assert.deepEqual(output.recommended_actions, [
+    'team start <workers> "<task>" --name missing-status-team',
+  ]);
+  assert.equal(output.tmux_health, null);
+  assert.equal(output.status, null);
+});
+
+test("runTeamCommand cleanup-stale prints additive machine JSON envelope", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-cleanup-stale-"));
+  const output = await captureTeamCommand(["cleanup-stale", "--dry-run"], tempRoot);
+
+  assert.equal(output.schema_version, "1.0");
+  assert.equal(output.operation, "team.cleanup-stale");
+  assert.equal(output.ok, true);
+  assert.equal(output.command, "team cleanup-stale");
+  assert.deepEqual(output.recommended_actions, []);
+  assert.equal(output.team_count, 0);
+  assert.equal(output.active_team_count, 0);
+  assert.ok(Array.isArray(output.cleaned));
 });
 
 test("runTeamCommand shutdown-ack prints current ad hoc JSON shape after shutdown request", async () => {

@@ -39,6 +39,7 @@ import {
 import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
+import { machineJsonEnvelope, uniqueRecommendedActions } from "../utils/machine-json.js";
 import { ellipsize, fitLines } from "../team/terminal-format.js";
 
 function parseWorkerCount(value: string | undefined): number {
@@ -177,6 +178,34 @@ function errorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+type TeamStatusSnapshot = NonNullable<Awaited<ReturnType<typeof readTeamStatus>>>;
+type TeamTmuxHealthSummary = NonNullable<
+  Awaited<ReturnType<typeof readTeamTmuxHealthSummary>>
+>;
+
+function buildTeamStatusRecommendedActions(
+  teamName: string,
+  status: TeamStatusSnapshot | null,
+  tmuxHealth: TeamTmuxHealthSummary | null
+): string[] {
+  if (!status) {
+    return [`team start <workers> "<task>" --name ${teamName}`];
+  }
+
+  return uniqueRecommendedActions([
+    !status.config.active || !status.phase.active
+      ? `team delete ${teamName} --dry-run`
+      : undefined,
+    tmuxHealth?.layout === "repairable" ? `team layout repair ${teamName}` : undefined,
+    tmuxHealth?.layout === "degraded" ? `team layout rebalance ${teamName} --dry-run` : undefined,
+    (tmuxHealth?.retry_pending ?? 0) > 0 ||
+    (tmuxHealth?.retry_manual_required ?? 0) > 0 ||
+    (tmuxHealth?.orphan_warnings.length ?? 0) > 0
+      ? "team cleanup-stale --retry-pane-closes --sweep-tmux"
+      : undefined
+  ]);
 }
 
 function boundedWatchErrorLine(error: unknown, width = 200): string {
@@ -391,15 +420,17 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       }
       const status = await readTeamStatus(teamName, cwd);
       const tmuxHealth = status ? await readTeamTmuxHealthSummary(teamName, cwd) : null;
+      const recommendedActions = buildTeamStatusRecommendedActions(teamName, status, tmuxHealth);
       console.log(
         JSON.stringify(
-          {
+          machineJsonEnvelope("team.status", Boolean(status) && recommendedActions.length === 0, {
             command: "team status",
             team_name: teamName,
             found: Boolean(status),
+            recommended_actions: recommendedActions,
             tmux_health: tmuxHealth,
             status
-          },
+          }),
           null,
           2
         )
@@ -506,7 +537,17 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         },
         cwd
       );
-      console.log(JSON.stringify({ command: "team cleanup-stale", ...result }, null, 2));
+      console.log(
+        JSON.stringify(
+          machineJsonEnvelope("team.cleanup-stale", true, {
+            command: "team cleanup-stale",
+            recommended_actions: [],
+            ...result
+          }),
+          null,
+          2
+        )
+      );
       return;
     }
     case "send": {
