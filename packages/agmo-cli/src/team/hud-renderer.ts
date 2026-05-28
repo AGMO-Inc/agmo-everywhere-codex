@@ -2,6 +2,7 @@ import type { AgmoTeamStatusSnapshot } from "./state/index.js";
 import type { AgmoTeamMonitorSnapshot } from "./state/monitor.js";
 import {
   colorize,
+  ellipsize,
   fitLines,
   resolveColorEnabled,
   sanitizeTerminalText,
@@ -303,8 +304,17 @@ function formatActionLine(
   return `- ${action.key} [${action.severity}] ${clean(action.label)}: ${clean(action.reason)}${commandSuffix}`;
 }
 
-function formatSidecarActionLine(action: TeamHudSuggestedAction): string {
-  return `${action.key}:${action.severity}(${clean(action.reason)})`;
+function compactSidecarCommand(command: string): string {
+  return clean(command).replace(/^agmo team /, "");
+}
+
+function formatSidecarActionLine(action: TeamHudSuggestedAction, teamName: string): string {
+  const safeCommand = resolveActionCommand(action, "focused", teamName);
+  const command = safeCommand ?? resolveActionCommand(action, "full", teamName);
+  const commandHint = command
+    ? `${command.mutating ? "manual" : "cmd"}=${compactSidecarCommand(command.command)}`
+    : `next=${clean(action.label)}`;
+  return `${clean(action.key)}:${action.severity} ${commandHint} (${clean(action.reason)})`;
 }
 
 function isUnavailablePane(health: unknown): boolean {
@@ -611,9 +621,9 @@ export function renderTeamHud(
     if (suggestedActions.length > 0) {
       const actionSummary = suggestedActions
         .slice(0, 3)
-        .map(formatSidecarActionLine)
+        .map((action) => formatSidecarActionLine(action, context.teamName))
         .join(" | ");
-      sidecarLines.push(`${c("actions", "cyan")} ${actionSummary}`);
+      sidecarLines.push(ellipsize(`${c("actions", "cyan")} ${actionSummary}`, width, false));
     }
     return `${fitLines(sidecarLines, width, sidecarMaxLines).join("\n")}\n`;
   }

@@ -141,6 +141,84 @@ test("renderTeamHud sidecar is compact, sanitized, and action-oriented", () => {
   }
 });
 
+test("renderTeamHud sidecar shows compact command hints for top actions", () => {
+  const testContext = context();
+  testContext.suggestedActions = [
+    {
+      key: "alert",
+      label: "Review alerts",
+      reason: "1 active alert",
+      severity: "info"
+    },
+    {
+      key: "retry-dispatch",
+      label: "Retry dispatch",
+      reason: "pending\u0007notifications",
+      severity: "warning"
+    },
+    {
+      key: "layout-repair",
+      label: "Repair layout",
+      reason: "layout is repairable",
+      severity: "critical"
+    },
+    {
+      key: "task-rebalance",
+      label: "Rebalance tasks",
+      reason: "open task load is uneven",
+      severity: "warning"
+    }
+  ];
+
+  const rendered = renderTeamHud(testContext, {
+    preset: "sidecar",
+    maxWidth: 260,
+    color: "never"
+  });
+  const lines = rendered.trimEnd().split("\n");
+
+  assert.ok(lines.length <= 6);
+  assert.match(rendered, /actions layout-repair:critical cmd=layout repair demo\?team --dry-run \(layout is repairable\)/);
+  assert.match(rendered, /retry-dispatch:warning manual=dispatch-retry demo\?team \(pending\?notifications\)/);
+  assert.match(rendered, /task-rebalance:warning manual=rebalance demo\?team \(open task load is uneven\)/);
+  assert.doesNotMatch(rendered, /alert:info/);
+  assert.doesNotMatch(rendered, /agmo team/);
+  for (const line of lines) {
+    assert.ok(visibleLength(line) <= 260, line);
+  }
+});
+
+test("renderTeamHud sidecar preserves action hints within narrow width limits", () => {
+  const testContext = context();
+  testContext.suggestedActions = [
+    {
+      key: "layout-repair",
+      label: "Repair layout",
+      reason: "layout is repairable",
+      severity: "critical"
+    },
+    {
+      key: "retry-dispatch",
+      label: "Retry dispatch",
+      reason: "pending notifications",
+      severity: "warning"
+    }
+  ];
+
+  const rendered = renderTeamHud(testContext, {
+    preset: "sidecar",
+    maxWidth: 72,
+    color: "never"
+  });
+  const lines = rendered.trimEnd().split("\n");
+
+  assert.ok(lines.length <= 6);
+  assert.match(rendered, /actions layout-repair:critical cmd=layout repair/);
+  for (const line of lines) {
+    assert.ok(visibleLength(line) <= 72, line);
+  }
+});
+
 test("renderTeamHud sidecar summarizes topology and recent durable events", () => {
   const testContext = context();
   testContext.snapshot.active_workers = 2;
