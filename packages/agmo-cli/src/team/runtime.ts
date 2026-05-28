@@ -6370,6 +6370,121 @@ export async function writeTeamApiMonitorSnapshot(
   );
 }
 
+export async function writeTeamApiShutdownRequest(
+  teamName: string,
+  workerName: string,
+  requestedBy: string,
+  options: {
+    graceMs?: number;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `write shutdown request for ${workerName}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      if (!status.workers.some((worker) => worker.identity.name === workerName)) {
+        throw new Error(`worker not found: ${workerName}`);
+      }
+
+      const previous = await readShutdownState(normalizedTeamName, cwd);
+      const timestamp = nowIso();
+      const graceMs = Math.max(options.graceMs ?? DEFAULT_SHUTDOWN_GRACE_MS, 0);
+      const acknowledgements = previous?.acknowledgements ?? [];
+      const shutdownState: AgmoTeamShutdownState = {
+        requested: true,
+        request_id: `shutdown-${randomUUID()}`,
+        requested_at: timestamp,
+        requested_by: requestedBy,
+        requested_worker: workerName,
+        grace_ms: graceMs,
+        hard_kill_after_at: new Date(Date.parse(timestamp) + graceMs).toISOString(),
+        message: `Shutdown requested by ${requestedBy}. Finish current note, report idle, and exit worker ${workerName}.`,
+        acknowledgements,
+        aggregate: buildShutdownAckAggregate(acknowledgements)
+      };
+
+      await Promise.all([
+        writeShutdownState(normalizedTeamName, shutdownState, cwd),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "shutdown_gate",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            requested_by: requestedBy,
+            shutdown_request_id: shutdownState.request_id,
+            grace_ms: graceMs
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        worker: workerName,
+        shutdown_request: shutdownState
+      };
+    },
+    cwd
+  );
+}
+
+export async function readTeamApiShutdownAck(
+  teamName: string,
+  workerName: string,
+  options: {
+    minUpdatedAt?: string;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.workers.some((worker) => worker.identity.name === workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const shutdown = await readShutdownState(normalizedTeamName, cwd);
+  const ack = shutdown?.acknowledgements.find((entry) => entry.worker_name === workerName) ?? null;
+  const minUpdatedAt = cleanString(options.minUpdatedAt);
+  const freshAck =
+    ack && minUpdatedAt
+      ? (() => {
+          const minTs = Date.parse(minUpdatedAt);
+          const ackTs = Date.parse(ack.acked_at);
+          return Number.isFinite(minTs) && Number.isFinite(ackTs) && ackTs >= minTs
+            ? ack
+            : null;
+        })()
+      : ack;
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    ack: freshAck,
+    shutdown_request: shutdown
+      ? {
+          request_id: shutdown.request_id,
+          requested: shutdown.requested,
+          requested_at: shutdown.requested_at,
+          requested_by: shutdown.requested_by,
+          requested_worker: shutdown.requested_worker,
+          aggregate: shutdown.aggregate ?? buildShutdownAckAggregate(shutdown.acknowledgements)
+        }
+      : null
+  };
+}
+
 export async function reportWorkerStatus(
   teamName: string,
   workerName: string,

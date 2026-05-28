@@ -10,6 +10,7 @@ import {
   resolveTeamEventsPath,
   resolveTeamManifestPath,
   resolveTeamMonitorSnapshotPath,
+  resolveTeamShutdownPath,
   resolveWorkerHeartbeatPath,
   resolveWorkerIdentityPath,
   resolveWorkerInboxPath,
@@ -1191,6 +1192,229 @@ test("runTeamCommand team api rejects invalid monitor snapshot writes", async ()
   assert.deepEqual(mismatch.error, {
     code: "runtime_error",
     message: `snapshot team_name must match team_name: ${teamName}`,
+  });
+});
+
+test("runTeamCommand team api writes shutdown requests and reads acknowledgements", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-shutdown-handshake-"));
+  const teamName = "cli-api-shutdown-handshake-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose shutdown handshake API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const initialAck = await captureTeamCommand(
+    [
+      "api",
+      "read-shutdown-ack",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(initialAck, "read-shutdown-ack");
+  assert.equal((initialAck.data as { ack?: unknown }).ack, null);
+  assert.equal((initialAck.data as { shutdown_request?: unknown }).shutdown_request, null);
+
+  const request = await captureTeamCommand(
+    [
+      "api",
+      "write-shutdown-request",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        requested_by: "leader-fixed",
+        grace_ms: 250,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(request, "write-shutdown-request");
+  const requestData = request.data as {
+    worker?: string;
+    shutdown_request?: {
+      requested?: boolean;
+      requested_by?: string;
+      requested_worker?: string;
+      grace_ms?: number;
+      aggregate?: Record<string, number>;
+    };
+  };
+  assert.equal(requestData.worker, "worker-1");
+  assert.equal(requestData.shutdown_request?.requested, true);
+  assert.equal(requestData.shutdown_request?.requested_by, "leader-fixed");
+  assert.equal(requestData.shutdown_request?.requested_worker, "worker-1");
+  assert.equal(requestData.shutdown_request?.grace_ms, 250);
+  assert.deepEqual(requestData.shutdown_request?.aggregate, {
+    accepted: 0,
+    busy: 0,
+    rejected: 0,
+    total: 0,
+  });
+
+  const statusAfterRequest = await captureTeamCommand(["status", teamName], tempRoot);
+  const statusData = statusAfterRequest.status as { config?: { active?: boolean }; phase?: { current_phase?: string } };
+  assert.equal(statusData.config?.active, true);
+  assert.equal(statusData.phase?.current_phase, "active");
+
+  const persistedRequest = JSON.parse(
+    await readFile(resolveTeamShutdownPath(teamName, tempRoot), "utf-8"),
+  ) as Record<string, unknown>;
+  assert.equal(persistedRequest.requested, true);
+  assert.equal(persistedRequest.requested_by, "leader-fixed");
+  assert.equal(persistedRequest.requested_worker, "worker-1");
+
+  const ackOutput = await captureTeamCommand(
+    [
+      "shutdown-ack",
+      teamName,
+      "worker-1",
+      "accepted",
+      "--reason",
+      "api handshake accepted",
+      "--task",
+      "1",
+    ],
+    tempRoot,
+  );
+  const ackedAt = (ackOutput.acknowledgement as { acked_at?: string }).acked_at ?? "";
+  assert.match(ackedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  const readAck = await captureTeamCommand(
+    [
+      "api",
+      "read-shutdown-ack",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(readAck, "read-shutdown-ack");
+  const readAckData = readAck.data as {
+    ack?: { status?: string; source?: string; reason?: string; task_id?: string; acked_at?: string } | null;
+    shutdown_request?: { requested_by?: string; requested_worker?: string; aggregate?: Record<string, number> } | null;
+  };
+  assert.equal(readAckData.ack?.status, "accepted");
+  assert.equal(readAckData.ack?.source, "explicit");
+  assert.equal(readAckData.ack?.reason, "api handshake accepted");
+  assert.equal(readAckData.ack?.task_id, "1");
+  assert.equal(readAckData.ack?.acked_at, ackedAt);
+  assert.equal(readAckData.shutdown_request?.requested_by, "leader-fixed");
+  assert.equal(readAckData.shutdown_request?.requested_worker, "worker-1");
+  assert.deepEqual(readAckData.shutdown_request?.aggregate, {
+    accepted: 1,
+    busy: 0,
+    rejected: 0,
+    total: 1,
+  });
+
+  const staleRead = await captureTeamCommand(
+    [
+      "api",
+      "read-shutdown-ack",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        min_updated_at: "2999-01-01T00:00:00.000Z",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assert.equal((staleRead.data as { ack?: unknown }).ack, null);
+
+  const eventLines = (await readFile(resolveTeamEventsPath(teamName, tempRoot), "utf-8"))
+    .trim()
+    .split("\n");
+  const requestEvent = eventLines
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((event) => event.type === "shutdown_gate");
+  assert.equal(requestEvent?.worker_name, "worker-1");
+  assert.equal(requestEvent?.requested_by, "leader-fixed");
+});
+
+test("runTeamCommand team api rejects invalid shutdown handshake input", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-shutdown-invalid-"));
+  const teamName = "cli-api-shutdown-invalid-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject invalid shutdown handshake API input",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const missingRequestedByResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-shutdown-request",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingRequestedBy = JSON.parse(missingRequestedByResult.stdout) as Record<string, unknown>;
+  assert.equal(missingRequestedByResult.exitCode, 1);
+  assertMachineEnvelope(missingRequestedBy, "write-shutdown-request", false);
+  assert.deepEqual(missingRequestedBy.error, {
+    code: "invalid_input",
+    message: "requested_by is required",
+  });
+
+  const invalidGraceResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-shutdown-request",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        requested_by: "leader-fixed",
+        grace_ms: -1,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const invalidGrace = JSON.parse(invalidGraceResult.stdout) as Record<string, unknown>;
+  assert.equal(invalidGraceResult.exitCode, 1);
+  assertMachineEnvelope(invalidGrace, "write-shutdown-request", false);
+  assert.deepEqual(invalidGrace.error, {
+    code: "invalid_input",
+    message: "grace_ms must be a non-negative integer when provided",
+  });
+
+  const missingWorkerResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "read-shutdown-ack",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-404" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingWorker = JSON.parse(missingWorkerResult.stdout) as Record<string, unknown>;
+  assert.equal(missingWorkerResult.exitCode, 1);
+  assertMachineEnvelope(missingWorker, "read-shutdown-ack", false);
+  assert.deepEqual(missingWorker.error, {
+    code: "worker_not_found",
+    message: "worker not found: worker-404",
   });
 });
 

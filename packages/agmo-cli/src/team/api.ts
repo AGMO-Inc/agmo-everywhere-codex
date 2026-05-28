@@ -19,6 +19,8 @@ import {
   awaitTeamApiEvent,
   readTeamApiMonitorSnapshot,
   writeTeamApiMonitorSnapshot,
+  readTeamApiShutdownAck,
+  writeTeamApiShutdownRequest,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
@@ -44,6 +46,8 @@ export type TeamApiOperation =
   | "await-event"
   | "read-monitor-snapshot"
   | "write-monitor-snapshot"
+  | "write-shutdown-request"
+  | "read-shutdown-ack"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -869,6 +873,71 @@ export async function executeTeamApiOperation(
       return dataEnvelope(
         operation,
         await writeTeamApiMonitorSnapshot(teamName, snapshot, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "write-shutdown-request") {
+    const worker = requiredString(input, "worker");
+    const requestedBy = requiredString(input, "requested_by");
+    const graceMs = optionalNonNegativeInteger(input, "grace_ms");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(requestedBy)) {
+      return buildTeamApiErrorEnvelope(operation, requestedBy.code, requestedBy.message);
+    }
+    if (isTeamApiError(graceMs)) {
+      return buildTeamApiErrorEnvelope(operation, graceMs.code, graceMs.message);
+    }
+    if (!workerExists(status, worker)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await writeTeamApiShutdownRequest(
+          teamName,
+          worker,
+          requestedBy,
+          {
+            ...(graceMs !== undefined ? { graceMs } : {})
+          },
+          cwd
+        )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "read-shutdown-ack") {
+    const worker = requiredString(input, "worker");
+    const minUpdatedAt = optionalString(input, "min_updated_at");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(minUpdatedAt)) {
+      return buildTeamApiErrorEnvelope(operation, minUpdatedAt.code, minUpdatedAt.message);
+    }
+    if (!workerExists(status, worker)) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await readTeamApiShutdownAck(
+          teamName,
+          worker,
+          {
+            ...(minUpdatedAt !== undefined ? { minUpdatedAt } : {})
+          },
+          cwd
+        )
       );
     } catch (error) {
       const mapped = mapRuntimeError(error);

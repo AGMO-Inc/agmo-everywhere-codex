@@ -117,6 +117,8 @@ export type AgmoTeamShutdownState = {
   requested: boolean;
   request_id: string;
   requested_at: string;
+  requested_by?: string;
+  requested_worker?: string;
   grace_ms: number;
   hard_kill_after_at: string;
   message: string;
