@@ -23,7 +23,9 @@ import {
   writeTeamApiShutdownRequest,
   readTeamTaskApprovalState,
   writeTeamTaskApprovalState,
-  readTeamStatus
+  readTeamStatus,
+  shutdownTeamRuntime,
+  cleanupStaleTeamRuntimes
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
 
@@ -57,6 +59,8 @@ export type TeamApiOperation =
   | "read-task"
   | "list-tasks"
   | "get-summary"
+  | "cleanup"
+  | "orphan-cleanup"
   | "claim-task"
   | "transition-task-status";
 
@@ -662,6 +666,29 @@ function buildStallStateData(
   };
 }
 
+type TeamApiCleanupStaleResult = Awaited<ReturnType<typeof cleanupStaleTeamRuntimes>>;
+
+function filterCleanupStaleResultForTeam(
+  result: TeamApiCleanupStaleResult,
+  teamName: string,
+  status: Awaited<ReturnType<typeof readTeamStatus>>
+): TeamApiCleanupStaleResult {
+  return {
+    ...result,
+    team_count: status ? 1 : 0,
+    active_team_count: status?.config.active && status.phase.active ? 1 : 0,
+    cleaned: result.cleaned.filter((entry) => entry.team_name === teamName),
+    tmux_sweep: {
+      retry_queues: result.tmux_sweep.retry_queues.filter(
+        (entry) => entry.team_name === teamName
+      ),
+      stale_panes: result.tmux_sweep.stale_panes.filter(
+        (entry) => entry.team_name === teamName
+      )
+    }
+  };
+}
+
 function workerExists(
   status: Awaited<ReturnType<typeof readTeamStatus>>,
   worker: string
@@ -1175,6 +1202,158 @@ export async function executeTeamApiOperation(
           ? idleState
           : buildStallStateData(teamName, status, idleState, events, snapshotAvailable)
       );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "cleanup") {
+    const confirmCleanup = optionalBoolean(input, "confirm_cleanup");
+    const force = optionalBoolean(input, "force");
+    const dryRun = optionalBoolean(input, "dry_run");
+    const graceMs = optionalNonNegativeInteger(input, "grace_ms");
+    if (isTeamApiError(confirmCleanup)) {
+      return buildTeamApiErrorEnvelope(operation, confirmCleanup.code, confirmCleanup.message);
+    }
+    if (isTeamApiError(force)) {
+      return buildTeamApiErrorEnvelope(operation, force.code, force.message);
+    }
+    if (isTeamApiError(dryRun)) {
+      return buildTeamApiErrorEnvelope(operation, dryRun.code, dryRun.message);
+    }
+    if (isTeamApiError(graceMs)) {
+      return buildTeamApiErrorEnvelope(operation, graceMs.code, graceMs.message);
+    }
+
+    const confirmed = confirmCleanup === true || force === true;
+    const effectiveDryRun = dryRun ?? !confirmed;
+    if (!confirmed || effectiveDryRun) {
+      return dataEnvelope(operation, {
+        team_name: teamName,
+        cleanup_mode: "shutdown",
+        dry_run: true,
+        confirmed,
+        force: force ?? false,
+        requires_confirmation: !confirmed,
+        status: confirmed ? "would_shutdown" : "confirmation_required",
+        active: status.config.active,
+        phase: status.phase.current_phase,
+        grace_ms: graceMs ?? 0,
+        recommended_actions: [
+          `team api cleanup --input '{"team_name":"${teamName}","confirm_cleanup":true}' --json`
+        ]
+      });
+    }
+
+    try {
+      return dataEnvelope(operation, {
+        team_name: teamName,
+        cleanup_mode: "shutdown",
+        dry_run: false,
+        confirmed: true,
+        force: force ?? false,
+        shutdown: await shutdownTeamRuntime(
+          teamName,
+          { graceMs: graceMs ?? 0 },
+          cwd
+        )
+      });
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "orphan-cleanup") {
+    const confirmCleanup = optionalBoolean(input, "confirm_cleanup");
+    const force = optionalBoolean(input, "force");
+    const dryRun = optionalBoolean(input, "dry_run");
+    const staleAfterMs = optionalNonNegativeInteger(input, "stale_ms");
+    const deadAfterMs = optionalNonNegativeInteger(input, "dead_ms");
+    const includeStale = optionalBoolean(input, "include_stale");
+    const retryPaneCloses = optionalBoolean(input, "retry_pane_closes");
+    const sweepTmux = optionalBoolean(input, "sweep_tmux");
+    if (isTeamApiError(confirmCleanup)) {
+      return buildTeamApiErrorEnvelope(operation, confirmCleanup.code, confirmCleanup.message);
+    }
+    if (isTeamApiError(force)) {
+      return buildTeamApiErrorEnvelope(operation, force.code, force.message);
+    }
+    if (isTeamApiError(dryRun)) {
+      return buildTeamApiErrorEnvelope(operation, dryRun.code, dryRun.message);
+    }
+    if (isTeamApiError(staleAfterMs)) {
+      return buildTeamApiErrorEnvelope(operation, staleAfterMs.code, staleAfterMs.message);
+    }
+    if (isTeamApiError(deadAfterMs)) {
+      return buildTeamApiErrorEnvelope(operation, deadAfterMs.code, deadAfterMs.message);
+    }
+    if (isTeamApiError(includeStale)) {
+      return buildTeamApiErrorEnvelope(operation, includeStale.code, includeStale.message);
+    }
+    if (isTeamApiError(retryPaneCloses)) {
+      return buildTeamApiErrorEnvelope(operation, retryPaneCloses.code, retryPaneCloses.message);
+    }
+    if (isTeamApiError(sweepTmux)) {
+      return buildTeamApiErrorEnvelope(operation, sweepTmux.code, sweepTmux.message);
+    }
+
+    const confirmed = confirmCleanup === true || force === true;
+    const effectiveDryRun = dryRun ?? !confirmed;
+    try {
+      const dryRunCleanup = filterCleanupStaleResultForTeam(
+        await cleanupStaleTeamRuntimes(
+          {
+            ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
+            ...(deadAfterMs !== undefined ? { deadAfterMs } : {}),
+            ...(includeStale !== undefined ? { includeStale } : {}),
+            dryRun: true,
+            ...(retryPaneCloses !== undefined ? { retryPaneCloses } : {}),
+            ...(sweepTmux !== undefined ? { sweepTmux } : {})
+          },
+          cwd
+        ),
+        teamName,
+        status
+      );
+
+      if (!confirmed || effectiveDryRun) {
+        return dataEnvelope(operation, {
+          team_name: teamName,
+          cleanup_mode: "orphan_cleanup",
+          dry_run: true,
+          confirmed,
+          force: force ?? false,
+          requires_confirmation: !confirmed,
+          cleanup: dryRunCleanup,
+          recommended_actions:
+            dryRunCleanup.cleaned.length > 0 || dryRunCleanup.tmux_sweep.stale_panes.length > 0
+              ? [
+                  `team api orphan-cleanup --input '{"team_name":"${teamName}","confirm_cleanup":true}' --json`
+                ]
+              : []
+        });
+      }
+
+      const matchingCleanup = dryRunCleanup.cleaned.find(
+        (entry) => entry.team_name === teamName
+      );
+      const shutdown = matchingCleanup
+        ? await shutdownTeamRuntime(teamName, { graceMs: 0 }, cwd)
+        : null;
+
+      return dataEnvelope(operation, {
+        team_name: teamName,
+        cleanup_mode: "orphan_cleanup",
+        dry_run: false,
+        confirmed: true,
+        force: force ?? false,
+        status: matchingCleanup ? "shutdown" : "no_orphan_cleanup_needed",
+        reason: matchingCleanup?.reason ?? null,
+        dry_run_cleanup: dryRunCleanup,
+        shutdown
+      });
     } catch (error) {
       const mapped = mapRuntimeError(error);
       return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);

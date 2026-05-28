@@ -160,6 +160,8 @@ const TEAM_API_OPERATION_NAMES = [
   "read-task",
   "list-tasks",
   "get-summary",
+  "cleanup",
+  "orphan-cleanup",
   "claim-task",
   "transition-task-status"
 ] as const satisfies readonly TeamApiOperation[];

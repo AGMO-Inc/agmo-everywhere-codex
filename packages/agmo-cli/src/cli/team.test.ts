@@ -4,7 +4,7 @@ import os from "node:os";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { appendTeamApiEvent, shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
+import { appendTeamApiEvent, readTeamStatus, shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
 import {
   resolveTeamDir,
   resolveTeamDispatchPath,
@@ -2420,6 +2420,158 @@ test("runTeamCommand team api returns ok false envelopes for invalid input and m
     code: "task_not_found",
     message: "task not found: missing-task",
   });
+});
+
+test("runTeamCommand team api cleanup reports missing team without deleting state", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-cleanup-missing-"));
+  const result = await captureTeamCommandOutput(
+    ["api", "cleanup", "--input", JSON.stringify({ team_name: "missing-cleanup-team" }), "--json"],
+    tempRoot,
+  );
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+  assert.equal(result.exitCode, 1);
+  assertMachineEnvelope(output, "cleanup", false);
+  assert.equal(output.command, "team api cleanup");
+  assert.deepEqual(output.error, {
+    code: "team_not_found",
+    message: "team not found: missing-cleanup-team",
+  });
+  assert.equal(existsSync(resolveTeamDir("missing-cleanup-team", tempRoot)), false);
+});
+
+test("runTeamCommand team api cleanup defaults to dry-run until confirmed", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-cleanup-dry-run-"));
+  const teamName = "cli-api-cleanup-dry-run-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Dry-run cleanup through API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommand(
+    ["api", "cleanup", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  assertMachineEnvelope(output, "cleanup");
+  assert.equal(output.command, "team api cleanup");
+  const data = output.data as {
+    team_name?: string;
+    cleanup_mode?: string;
+    dry_run?: boolean;
+    requires_confirmation?: boolean;
+    status?: string;
+    active?: boolean;
+    recommended_actions?: string[];
+  };
+  assert.equal(data.team_name, teamName);
+  assert.equal(data.cleanup_mode, "shutdown");
+  assert.equal(data.dry_run, true);
+  assert.equal(data.requires_confirmation, true);
+  assert.equal(data.status, "confirmation_required");
+  assert.equal(data.active, true);
+  assert.ok(data.recommended_actions?.some((action) => action.includes("confirm_cleanup")));
+
+  const status = await readTeamStatus(teamName, tempRoot);
+  assert.equal(status?.config.active, true);
+  assert.equal(status?.phase.current_phase, "active");
+});
+
+test("runTeamCommand team api cleanup shuts down only when explicitly confirmed", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-cleanup-confirmed-"));
+  const teamName = "cli-api-cleanup-confirmed-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Confirmed cleanup through API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommand(
+    [
+      "api",
+      "cleanup",
+      "--input",
+      JSON.stringify({ team_name: teamName, confirm_cleanup: true }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(output, "cleanup");
+  assert.equal(output.command, "team api cleanup");
+  const data = output.data as {
+    team_name?: string;
+    cleanup_mode?: string;
+    dry_run?: boolean;
+    confirmed?: boolean;
+    shutdown?: { current_phase?: string; preserved_state_root?: string };
+  };
+  assert.equal(data.team_name, teamName);
+  assert.equal(data.cleanup_mode, "shutdown");
+  assert.equal(data.dry_run, false);
+  assert.equal(data.confirmed, true);
+  assert.equal(data.shutdown?.current_phase, "shutdown");
+  assert.equal(data.shutdown?.preserved_state_root, resolveTeamDir(teamName, tempRoot));
+
+  const status = await readTeamStatus(teamName, tempRoot);
+  assert.equal(status?.config.active, false);
+  assert.equal(status?.phase.current_phase, "shutdown");
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), true);
+});
+
+test("runTeamCommand team api orphan-cleanup defaults to dry-run envelope", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-orphan-cleanup-"));
+  const teamName = "cli-api-orphan-cleanup-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Dry-run orphan cleanup through API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommand(
+    [
+      "api",
+      "orphan-cleanup",
+      "--input",
+      JSON.stringify({ team_name: teamName, dry_run: false }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(output, "orphan-cleanup");
+  assert.equal(output.command, "team api orphan-cleanup");
+  const data = output.data as {
+    team_name?: string;
+    cleanup_mode?: string;
+    dry_run?: boolean;
+    requires_confirmation?: boolean;
+    cleanup?: { checked_at?: string; cleaned?: unknown[]; tmux_sweep?: unknown };
+  };
+  assert.equal(data.team_name, teamName);
+  assert.equal(data.cleanup_mode, "orphan_cleanup");
+  assert.equal(data.dry_run, true);
+  assert.equal(data.requires_confirmation, true);
+  assert.equal(typeof data.cleanup?.checked_at, "string");
+  assert.ok(Array.isArray(data.cleanup?.cleaned));
+  assert.ok(data.cleanup?.tmux_sweep && typeof data.cleanup.tmux_sweep === "object");
+
+  const status = await readTeamStatus(teamName, tempRoot);
+  assert.equal(status?.config.active, true);
+  assert.equal(status?.phase.current_phase, "active");
 });
 
 test("runTeamCommand cleanup-stale prints additive machine JSON envelope", async () => {
