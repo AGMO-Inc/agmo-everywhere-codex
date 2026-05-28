@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import os from "node:os";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
-import { resolveTeamDir } from "../team/state/index.js";
+import { resolveTeamDir, resolveTeamManifestPath } from "../team/state/index.js";
 import { resolveTeamWorktreeRoot } from "../team/worktree.js";
 import { runTeamCommand, runTeamHudWatchLoop } from "./team.js";
 
@@ -232,6 +232,185 @@ test("runTeamCommand team api supports read-only success operations", async () =
       { worker_name: "worker-2", state: "idle" },
     ],
   );
+});
+
+test("runTeamCommand team api reads config and manifest snapshots", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-read-state-"));
+  const teamName = "cli-api-read-state-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Read config and manifest API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const config = await captureTeamCommand(
+    ["api", "read-config", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  assertMachineEnvelope(config, "read-config");
+  assert.equal(config.command, "team api read-config");
+  assert.ok(config.data && typeof config.data === "object");
+  const configData = config.data as { config?: { name?: string; worker_names?: string[] } };
+  assert.equal(configData.config?.name, teamName);
+  assert.deepEqual(configData.config?.worker_names, ["worker-1", "worker-2"]);
+
+  const manifest = await captureTeamCommand(
+    ["api", "read-manifest", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  assertMachineEnvelope(manifest, "read-manifest");
+  assert.equal(manifest.command, "team api read-manifest");
+  assert.ok(manifest.data && typeof manifest.data === "object");
+  const manifestData = manifest.data as { manifest?: { team_name?: string; worker_names?: string[] } };
+  assert.equal(manifestData.manifest?.team_name, teamName);
+  assert.deepEqual(manifestData.manifest?.worker_names, ["worker-1", "worker-2"]);
+});
+
+test("runTeamCommand team api returns manifest_not_found for missing manifest", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-manifest-missing-"));
+  const teamName = "cli-api-manifest-missing-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Read missing manifest API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+  await rm(resolveTeamManifestPath(teamName, tempRoot));
+
+  const result = await captureTeamCommandOutput(
+    ["api", "read-manifest", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+  assert.equal(result.exitCode, 1);
+  assertMachineEnvelope(output, "read-manifest", false);
+  assert.equal(output.command, "team api read-manifest");
+  assert.deepEqual(output.error, {
+    code: "manifest_not_found",
+    message: "manifest not found: cli-api-manifest-missing-team",
+  });
+  assert.equal("data" in output, false);
+});
+
+test("runTeamCommand team api reads worker status and heartbeat snapshots", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-read-worker-"));
+  const teamName = "cli-api-read-worker-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Read worker API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const status = await captureTeamCommand(
+    [
+      "api",
+      "read-worker-status",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(status, "read-worker-status");
+  assert.equal(status.command, "team api read-worker-status");
+  assert.ok(status.data && typeof status.data === "object");
+  const statusData = status.data as { worker?: string; status?: { state?: string } };
+  assert.equal(statusData.worker, "worker-1");
+  assert.equal(statusData.status?.state, "idle");
+
+  const heartbeat = await captureTeamCommand(
+    [
+      "api",
+      "read-worker-heartbeat",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(heartbeat, "read-worker-heartbeat");
+  assert.equal(heartbeat.command, "team api read-worker-heartbeat");
+  assert.ok(heartbeat.data && typeof heartbeat.data === "object");
+  const heartbeatData = heartbeat.data as {
+    worker?: string;
+    heartbeat?: { alive?: boolean; turn_count?: number; last_turn_at?: string };
+  };
+  assert.equal(heartbeatData.worker, "worker-1");
+  assert.equal(typeof heartbeatData.heartbeat?.alive, "boolean");
+  assert.equal(heartbeatData.heartbeat?.turn_count, 0);
+  assert.equal(typeof heartbeatData.heartbeat?.last_turn_at, "string");
+});
+
+test("runTeamCommand team api returns worker_not_found for missing read-only worker", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-read-worker-missing-"));
+  const teamName = "cli-api-read-worker-missing-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Read missing worker API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const result = await captureTeamCommandOutput(
+    [
+      "api",
+      "read-worker-status",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-404" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+  assert.equal(result.exitCode, 1);
+  assertMachineEnvelope(output, "read-worker-status", false);
+  assert.equal(output.command, "team api read-worker-status");
+  assert.deepEqual(output.error, {
+    code: "worker_not_found",
+    message: "worker not found: worker-404",
+  });
+  assert.equal("data" in output, false);
+
+  const heartbeatResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "read-worker-heartbeat",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-404" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const heartbeatOutput = JSON.parse(heartbeatResult.stdout) as Record<string, unknown>;
+
+  assert.equal(heartbeatResult.exitCode, 1);
+  assertMachineEnvelope(heartbeatOutput, "read-worker-heartbeat", false);
+  assert.equal(heartbeatOutput.command, "team api read-worker-heartbeat");
+  assert.deepEqual(heartbeatOutput.error, {
+    code: "worker_not_found",
+    message: "worker not found: worker-404",
+  });
+  assert.equal("data" in heartbeatOutput, false);
 });
 
 test("runTeamCommand team api sends, lists, and marks mailbox messages delivered", async () => {

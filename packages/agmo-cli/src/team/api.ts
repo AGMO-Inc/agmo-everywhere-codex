@@ -24,6 +24,10 @@ export type TeamApiOperation =
   | "create-task"
   | "update-task"
   | "release-task-claim"
+  | "read-config"
+  | "read-manifest"
+  | "read-worker-status"
+  | "read-worker-heartbeat"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -35,6 +39,7 @@ type TeamApiInput = Record<string, unknown>;
 export type TeamApiErrorCode =
   | "invalid_input"
   | "team_not_found"
+  | "manifest_not_found"
   | "task_not_found"
   | "claim_conflict"
   | "invalid_transition"
@@ -276,9 +281,53 @@ export async function executeTeamApiOperation(
     return buildTeamApiErrorEnvelope(operation, teamName.code, teamName.message);
   }
 
-  const status = await readTeamStatus(teamName, cwd);
+  let status: Awaited<ReturnType<typeof readTeamStatus>>;
+  try {
+    status = await readTeamStatus(teamName, cwd);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (operation === "read-manifest" && /team state incomplete/i.test(message)) {
+      return buildTeamApiErrorEnvelope(operation, "manifest_not_found", `manifest not found: ${teamName}`);
+    }
+    return buildTeamApiErrorEnvelope(operation, "runtime_error", message);
+  }
   if (!status) {
     return buildTeamApiErrorEnvelope(operation, "team_not_found", `team not found: ${teamName}`);
+  }
+
+  if (operation === "read-config") {
+    return dataEnvelope(operation, { config: status.config });
+  }
+
+  if (operation === "read-manifest") {
+    if (!status.manifest) {
+      return buildTeamApiErrorEnvelope(operation, "manifest_not_found", `manifest not found: ${teamName}`);
+    }
+    return dataEnvelope(operation, { manifest: status.manifest });
+  }
+
+  if (operation === "read-worker-status") {
+    const worker = requiredString(input, "worker");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    const workerState = status.workers.find((candidate) => candidate.identity.name === worker);
+    if (!workerState) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    return dataEnvelope(operation, { worker, status: workerState.status });
+  }
+
+  if (operation === "read-worker-heartbeat") {
+    const worker = requiredString(input, "worker");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    const workerState = status.workers.find((candidate) => candidate.identity.name === worker);
+    if (!workerState) {
+      return buildTeamApiErrorEnvelope(operation, "worker_not_found", `worker not found: ${worker}`);
+    }
+    return dataEnvelope(operation, { worker, heartbeat: workerState.heartbeat });
   }
 
   if (operation === "send-message") {
