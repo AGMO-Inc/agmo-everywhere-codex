@@ -1035,7 +1035,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
+          "usage: agmo team hud <team> [--json] [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
         );
       }
       const staleAfterMs = parseIntegerOption(args.slice(2), "--stale-ms");
@@ -1050,6 +1050,10 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const watch = args.slice(2).includes("--watch");
       const repair = args.slice(2).includes("--repair");
       const showLegend = args.slice(2).includes("--legend");
+      const json = args.slice(2).includes("--json");
+      if (json && watch) {
+        throw new Error("--json cannot be used with --watch");
+      }
       assertMinimumOption(staleAfterMs, "--stale-ms", 0);
       assertMinimumOption(deadAfterMs, "--dead-ms", 0);
       assertMinimumOption(refreshMs, "--refresh-ms", 250);
@@ -1057,6 +1061,26 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       assertMinimumOption(width, "--width", 20);
       assertMinimumOption(maxLines, "--max-lines", 1);
       const intervalMs = refreshMs ?? 2000;
+      if (json) {
+        if (repair) {
+          await repairTeamHudPane(teamName, cwd);
+        }
+        const hud = await buildLeaderHudView(
+          teamName,
+          { staleAfterMs, deadAfterMs, preset, width, maxLines, color, showLegend },
+          cwd
+        );
+        printTeamMachineJson("team hud", {
+          team_name: hud.team_name,
+          path: hud.path,
+          text: hud.text,
+          preset: preset ?? "focused",
+          width: width ?? null,
+          max_lines: maxLines ?? null,
+          legend: showLegend
+        });
+        return;
+      }
       const renderHudFrame = async (): Promise<string> => {
         if (repair) {
           await repairTeamHudPane(teamName, cwd);
@@ -1323,7 +1347,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--slack-username <name>] [--slack-icon-emoji <emoji>] [--email|--no-email] [--email-to <a,b>] [--email-from <addr>] [--email-sendmail-path <path>] [--email-subject-prefix <prefix>]
-  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
+  agmo team hud <team> [--json] [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
   agmo team layout status <team>
   agmo team layout repair <team> [--dry-run] [--force]
   agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]

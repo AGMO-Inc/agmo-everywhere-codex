@@ -2872,6 +2872,55 @@ test("runTeamCommand hud accepts sidecar preset and rejects invalid presets", as
   );
 });
 
+test("runTeamCommand hud json emits a machine envelope with rendered text", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-json-"));
+  const teamName = "cli-hud-json-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Render HUD as JSON",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommand(
+    [
+      "hud",
+      teamName,
+      "--json",
+      "--preset",
+      "sidecar",
+      "--width",
+      "90",
+      "--max-lines",
+      "6",
+      "--no-color",
+    ],
+    tempRoot,
+  );
+
+  assertMachineEnvelope(output, "team.hud");
+  assert.equal(output.command, "team hud");
+  assert.equal(output.team_name, teamName);
+  assert.equal(output.preset, "sidecar");
+  assert.equal(output.width, 90);
+  assert.equal(output.max_lines, 6);
+  assert.equal(output.legend, false);
+  assert.equal(typeof output.path, "string");
+  assert.equal(typeof output.text, "string");
+  assert.match(output.text as string, /AGMO sidecar/);
+  assert.match(output.text as string, /workers worker-1:/);
+  assert.doesNotMatch(output.text as string, /\x1b\[/);
+
+  await assert.rejects(
+    () => runTeamCommand(["hud", teamName, "--json", "--watch"]),
+    /--json cannot be used with --watch/,
+  );
+});
+
 test("runTeamCommand hud supports legend flag without enabling it by default", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-legend-"));
   const teamName = "cli-hud-legend-team";
