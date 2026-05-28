@@ -176,6 +176,7 @@ type AgmoLeaderAlertDeliveryResult = {
 };
 
 const LEADER_ALERT_DELIVERY_HISTORY_LIMIT = 200;
+const TEAM_TASK_HIGH_WATERMARK_FILE = ".highwatermark";
 const DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail";
 const DEFAULT_EMAIL_FROM = "agmo@localhost";
 const DEFAULT_EMAIL_SUBJECT_PREFIX = "[AGMO Leader Alert]";
@@ -316,6 +317,52 @@ async function readTaskRecord(
   }
 
   return task;
+}
+
+async function readTaskRecords(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<AgmoTeamTaskRecord[]> {
+  const tasksDir = resolveTeamTasksDir(teamName, cwd);
+  let entries: string[];
+  try {
+    entries = await readdir(tasksDir);
+  } catch {
+    return [];
+  }
+
+  const taskIds = entries
+    .map((entry) => {
+      const match = /^task-(\d+)\.json$/.exec(entry);
+      return match ? Number.parseInt(match[1] ?? "", 10) : null;
+    })
+    .filter((entry): entry is number => entry !== null && Number.isInteger(entry))
+    .sort((left, right) => left - right);
+
+  const tasks = await Promise.all(
+    taskIds.map((taskId) => readJsonFile<AgmoTeamTaskRecord>(
+      resolveTeamTaskPath(teamName, String(taskId), cwd)
+    ))
+  );
+
+  return tasks.filter((entry): entry is AgmoTeamTaskRecord => entry !== null);
+}
+
+async function readTaskHighWatermark(tasksDir: string): Promise<number> {
+  const stored = await readTextFileIfExists(join(tasksDir, TEAM_TASK_HIGH_WATERMARK_FILE));
+  if (!stored?.trim()) {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(stored.trim(), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function maxNumericTaskId(tasks: AgmoTeamTaskRecord[]): number {
+  return tasks.reduce((max, task) => {
+    const parsed = Number.parseInt(task.id, 10);
+    return String(parsed) === task.id && parsed > max ? parsed : max;
+  }, 0);
 }
 
 function parseCsvList(value: string | undefined): string[] {
@@ -3987,13 +4034,7 @@ export async function readTeamStatus(
   const paneCloseRetry = await readPaneCloseRetryState(normalizedTeamName, cwd);
   const hudRepair = await readHudRepairState(normalizedTeamName, cwd);
 
-  const tasks = await Promise.all(
-    config.worker_names.map(async (_, index) => {
-      return await readJsonFile<AgmoTeamTaskRecord>(
-        resolveTeamTaskPath(normalizedTeamName, String(index + 1), cwd)
-      );
-    })
-  );
+  const tasks = await readTaskRecords(normalizedTeamName, cwd);
 
   const workers = await Promise.all(
     config.worker_names.map(async (workerName) => {
@@ -4044,7 +4085,7 @@ export async function readTeamStatus(
     config,
     manifest,
     phase,
-    tasks: tasks.filter((entry): entry is AgmoTeamTaskRecord => entry !== null),
+    tasks,
     workers,
     mailbox,
     dispatch_requests: dispatchRequests,
@@ -5054,6 +5095,271 @@ export async function claimTaskForWorker(
         claim_token: claim.token,
         claimToken: claim.token,
         task: nextTask
+      };
+    },
+    cwd
+  );
+}
+
+export async function createTeamTask(
+  teamName: string,
+  input: {
+    subject: string;
+    description: string;
+    owner?: string;
+    role?: string;
+    dependsOn?: string[];
+    requiresCodeChange?: boolean;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    "create task",
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      if (input.owner) {
+        await readWorkerIdentity(normalizedTeamName, input.owner, cwd);
+      }
+
+      const tasksDir = resolveTeamTasksDir(normalizedTeamName, cwd);
+      await ensureDir(tasksDir);
+      const currentTasks = status.tasks;
+      const currentHighWatermark = await readTaskHighWatermark(tasksDir);
+      const nextId = Math.max(currentHighWatermark, maxNumericTaskId(currentTasks)) + 1;
+      const taskId = String(nextId);
+      const timestamp = nowIso();
+      const draftTask: AgmoTeamTaskRecord = {
+        id: taskId,
+        subject: input.subject,
+        description: input.description,
+        ...(input.owner ? { owner: input.owner } : {}),
+        ...(input.role
+          ? { role: input.role }
+          : input.owner
+            ? { role: status.workers.find((worker) => worker.identity.name === input.owner)?.identity.role }
+            : {}),
+        status: "pending",
+        ...(input.dependsOn && input.dependsOn.length > 0 ? { depends_on: input.dependsOn } : {}),
+        requires_code_change: input.requiresCodeChange ?? true,
+        ...(input.owner
+          ? {
+              assignment_history: [
+                {
+                  owner: input.owner,
+                  assigned_at: timestamp,
+                  reason: "api_create_task"
+                }
+              ]
+            }
+          : {}),
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp
+      };
+      const blockers = computeTaskDependencyBlockers(
+        draftTask,
+        new Map(currentTasks.map((task) => [task.id, task]))
+      );
+      const task: AgmoTeamTaskRecord = {
+        ...draftTask,
+        status: blockers.length > 0 ? "blocked" : "pending",
+        ...(blockers.length > 0 ? { blocked_by_dependencies: blockers } : {})
+      };
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, task, cwd),
+        writeTextFile(join(tasksDir, TEAM_TASK_HIGH_WATERMARK_FILE), `${nextId}\n`),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_created",
+            team_name: normalizedTeamName,
+            task_id: task.id,
+            owner: task.owner ?? null,
+            status: task.status
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        task
+      };
+    },
+    cwd
+  );
+}
+
+export async function updateTeamTask(
+  teamName: string,
+  taskId: string,
+  updates: {
+    subject?: string;
+    description?: string;
+    dependsOn?: string[];
+    requiresCodeChange?: boolean;
+  },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `update task ${taskId}`,
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+      const task = status.tasks.find((candidate) => candidate.id === taskId);
+      if (!task) {
+        throw new Error(`task not found: ${taskId}`);
+      }
+
+      const timestamp = nowIso();
+      const nextTaskBase: AgmoTeamTaskRecord = {
+        ...task,
+        ...(updates.subject !== undefined ? { subject: updates.subject } : {}),
+        ...(updates.description !== undefined ? { description: updates.description } : {}),
+        ...(updates.dependsOn !== undefined
+          ? { depends_on: updates.dependsOn.length > 0 ? updates.dependsOn : undefined }
+          : {}),
+        ...(updates.requiresCodeChange !== undefined
+          ? { requires_code_change: updates.requiresCodeChange }
+          : {}),
+        version: task.version + 1,
+        updated_at: timestamp
+      };
+      const blockers = computeTaskDependencyBlockers(
+        nextTaskBase,
+        new Map(status.tasks.map((entry) => [entry.id, entry]))
+      );
+      const nextTask: AgmoTeamTaskRecord =
+        task.status === "pending" || task.status === "blocked"
+          ? {
+              ...nextTaskBase,
+              status: blockers.length > 0 ? "blocked" : "pending",
+              blocked_by_dependencies: blockers.length > 0 ? blockers : undefined
+            }
+          : nextTaskBase;
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_updated",
+            team_name: normalizedTeamName,
+            task_id: taskId,
+            updated_fields: Object.keys(updates)
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        task: nextTask
+      };
+    },
+    cwd
+  );
+}
+
+export async function releaseTaskClaimForWorker(
+  teamName: string,
+  taskId: string,
+  workerName: string,
+  claimToken: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    `release task ${taskId}`,
+    async () => {
+      const task = await readTaskRecord(normalizedTeamName, taskId, cwd);
+      assertWorkerOwnsTask(task, workerName);
+      assertTaskMutationGuard(task, workerName, {
+        expectedStatus: "in_progress",
+        claimToken
+      });
+      if (!task.claim) {
+        throw new Error(`task ${taskId} has no active claim`);
+      }
+
+      const timestamp = nowIso();
+      const nextTask: AgmoTeamTaskRecord = {
+        ...task,
+        owner: undefined,
+        status: "pending",
+        blocked_by_dependencies: undefined,
+        claim_history: [
+          ...(task.claim_history ?? []),
+          {
+            owner: task.claim.owner,
+            claimed_at: task.claim.claimed_at,
+            released_at: timestamp,
+            release_reason: "released"
+          }
+        ],
+        claim: undefined,
+        version: task.version + 1,
+        updated_at: timestamp
+      };
+      const workerStatus = await readWorkerStatusRecord(normalizedTeamName, workerName, cwd);
+      const workerWasOnTask = workerStatus.current_task_id === taskId;
+
+      await Promise.all([
+        writeTaskRecord(normalizedTeamName, nextTask, cwd),
+        ...(workerWasOnTask
+          ? [
+              writeWorkerStatus(
+                normalizedTeamName,
+                workerName,
+                {
+                  state: "idle",
+                  updated_at: timestamp
+                },
+                cwd
+              ),
+              bumpWorkerHeartbeat(
+                normalizedTeamName,
+                workerName,
+                { pid: resolveReportedWorkerPid() },
+                cwd
+              )
+            ]
+          : []),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp,
+            type: "task_claim_released",
+            team_name: normalizedTeamName,
+            worker_name: workerName,
+            task_id: taskId,
+            worker_marked_idle: workerWasOnTask
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        task: nextTask,
+        worker_marked_idle: workerWasOnTask
       };
     },
     cwd

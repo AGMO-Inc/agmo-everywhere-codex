@@ -104,7 +104,7 @@ Usage:
   agmo hooks sync
   agmo internal hook
   agmo team start <workers> "<task>" [--allocation-intent <intent>] [--role-map worker-1=role,...] [--hud] [--hud-refresh-ms <ms>]
-  agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json
+  agmo team api <create-task|update-task|release-task-claim|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
   agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]

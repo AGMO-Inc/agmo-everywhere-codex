@@ -2,12 +2,18 @@ import { machineJsonEnvelope } from "../utils/machine-json.js";
 import {
   claimTaskForWorker,
   completeTaskForWorker,
+  createTeamTask,
   failTaskForWorker,
+  releaseTaskClaimForWorker,
+  updateTeamTask,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
 
 export type TeamApiOperation =
+  | "create-task"
+  | "update-task"
+  | "release-task-claim"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -45,6 +51,28 @@ const TASK_STATUSES: AgmoTeamTaskStatus[] = [
   "in_progress",
   "completed",
   "failed"
+];
+const UPDATE_TASK_MUTABLE_FIELDS = new Set([
+  "team_name",
+  "task_id",
+  "subject",
+  "description",
+  "blocked_by",
+  "depends_on",
+  "requires_code_change"
+]);
+const UPDATE_TASK_LIFECYCLE_FIELDS = [
+  "status",
+  "owner",
+  "role",
+  "claim",
+  "claim_history",
+  "assignment_history",
+  "result",
+  "error",
+  "version",
+  "created_at",
+  "updated_at"
 ];
 
 export function buildTeamApiErrorEnvelope(
@@ -111,6 +139,44 @@ function optionalString(input: TeamApiInput, fieldName: string): string | TeamAp
   return value;
 }
 
+function optionalBoolean(input: TeamApiInput, fieldName: string): boolean | TeamApiError | undefined {
+  const value = input[fieldName];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be a boolean when provided`
+    };
+  }
+  return value;
+}
+
+function optionalStringArray(input: TeamApiInput, fieldName: string): string[] | TeamApiError | undefined {
+  const value = input[fieldName];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} must be an array of strings when provided`
+    };
+  }
+  const output: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry.trim()) {
+      return {
+        code: "invalid_input",
+        message: `${fieldName} entries must be non-empty strings`
+      };
+    }
+    output.push(entry.trim());
+  }
+  return output;
+}
+
 function optionalPositiveInteger(input: TeamApiInput, fieldName: string): number | TeamApiError | undefined {
   const value = input[fieldName];
   if (value === undefined) {
@@ -159,7 +225,7 @@ function buildTaskCounts(tasks: Array<{ status: AgmoTeamTaskStatus }>): Record<A
 
 function mapRuntimeError(error: unknown): TeamApiError {
   const message = error instanceof Error ? error.message : String(error);
-  if (/claim conflict|owned by|claim token mismatch/i.test(message)) {
+  if (/claim conflict|owned by|claim token mismatch|no active claim/i.test(message)) {
     return { code: "claim_conflict", message };
   }
   if (/invalid transition/i.test(message)) {
@@ -199,6 +265,167 @@ export async function executeTeamApiOperation(
   const status = await readTeamStatus(teamName, cwd);
   if (!status) {
     return buildTeamApiErrorEnvelope(operation, "team_not_found", `team not found: ${teamName}`);
+  }
+
+  if (operation === "create-task") {
+    const subject = requiredString(input, "subject");
+    const description = requiredString(input, "description");
+    const owner = optionalString(input, "owner");
+    const role = optionalString(input, "role");
+    const blockedBy = optionalStringArray(input, "blocked_by");
+    const dependsOn = optionalStringArray(input, "depends_on");
+    const requiresCodeChange = optionalBoolean(input, "requires_code_change");
+    if (isTeamApiError(subject)) {
+      return buildTeamApiErrorEnvelope(operation, subject.code, subject.message);
+    }
+    if (isTeamApiError(description)) {
+      return buildTeamApiErrorEnvelope(operation, description.code, description.message);
+    }
+    if (isTeamApiError(owner)) {
+      return buildTeamApiErrorEnvelope(operation, owner.code, owner.message);
+    }
+    if (isTeamApiError(role)) {
+      return buildTeamApiErrorEnvelope(operation, role.code, role.message);
+    }
+    if (isTeamApiError(blockedBy)) {
+      return buildTeamApiErrorEnvelope(operation, blockedBy.code, blockedBy.message);
+    }
+    if (isTeamApiError(dependsOn)) {
+      return buildTeamApiErrorEnvelope(operation, dependsOn.code, dependsOn.message);
+    }
+    if (blockedBy !== undefined && dependsOn !== undefined) {
+      return buildTeamApiErrorEnvelope(
+        operation,
+        "invalid_input",
+        "provide only one of blocked_by or depends_on"
+      );
+    }
+    if (isTeamApiError(requiresCodeChange)) {
+      return buildTeamApiErrorEnvelope(operation, requiresCodeChange.code, requiresCodeChange.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await createTeamTask(
+          teamName,
+          {
+            subject,
+            description,
+            ...(owner ? { owner } : {}),
+            ...(role ? { role } : {}),
+            ...(blockedBy !== undefined || dependsOn !== undefined
+              ? { dependsOn: blockedBy ?? dependsOn ?? [] }
+              : {}),
+            ...(requiresCodeChange !== undefined
+              ? { requiresCodeChange }
+              : {})
+          },
+          cwd
+        )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "update-task") {
+    const taskId = requiredString(input, "task_id");
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    const lifecycleFields = UPDATE_TASK_LIFECYCLE_FIELDS.filter((field) => field in input);
+    if (lifecycleFields.length > 0) {
+      return buildTeamApiErrorEnvelope(
+        operation,
+        "invalid_input",
+        `update-task cannot mutate lifecycle fields: ${lifecycleFields.join(", ")}`
+      );
+    }
+    const unsupportedFields = Object.keys(input).filter(
+      (field) => !UPDATE_TASK_MUTABLE_FIELDS.has(field)
+    );
+    if (unsupportedFields.length > 0) {
+      return buildTeamApiErrorEnvelope(
+        operation,
+        "invalid_input",
+        `update-task received unsupported fields: ${unsupportedFields.join(", ")}`
+      );
+    }
+    const subject = optionalString(input, "subject");
+    const description = optionalString(input, "description");
+    const blockedBy = optionalStringArray(input, "blocked_by");
+    const dependsOn = optionalStringArray(input, "depends_on");
+    const requiresCodeChange = optionalBoolean(input, "requires_code_change");
+    if (isTeamApiError(subject)) {
+      return buildTeamApiErrorEnvelope(operation, subject.code, subject.message);
+    }
+    if (isTeamApiError(description)) {
+      return buildTeamApiErrorEnvelope(operation, description.code, description.message);
+    }
+    if (isTeamApiError(blockedBy)) {
+      return buildTeamApiErrorEnvelope(operation, blockedBy.code, blockedBy.message);
+    }
+    if (isTeamApiError(dependsOn)) {
+      return buildTeamApiErrorEnvelope(operation, dependsOn.code, dependsOn.message);
+    }
+    if (blockedBy !== undefined && dependsOn !== undefined) {
+      return buildTeamApiErrorEnvelope(
+        operation,
+        "invalid_input",
+        "provide only one of blocked_by or depends_on"
+      );
+    }
+    if (isTeamApiError(requiresCodeChange)) {
+      return buildTeamApiErrorEnvelope(operation, requiresCodeChange.code, requiresCodeChange.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await updateTeamTask(
+          teamName,
+          taskId,
+          {
+            ...(subject !== undefined ? { subject } : {}),
+            ...(description !== undefined ? { description } : {}),
+            ...(blockedBy !== undefined || dependsOn !== undefined
+              ? { dependsOn: blockedBy ?? dependsOn ?? [] }
+              : {}),
+            ...(requiresCodeChange !== undefined
+              ? { requiresCodeChange }
+              : {})
+          },
+          cwd
+        )
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "release-task-claim") {
+    const taskId = requiredString(input, "task_id");
+    const worker = requiredString(input, "worker");
+    const claimToken = requiredString(input, "claim_token");
+    if (isTeamApiError(taskId)) {
+      return buildTeamApiErrorEnvelope(operation, taskId.code, taskId.message);
+    }
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(claimToken)) {
+      return buildTeamApiErrorEnvelope(operation, claimToken.code, claimToken.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await releaseTaskClaimForWorker(teamName, taskId, worker, claimToken, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
   }
 
   if (operation === "claim-task") {

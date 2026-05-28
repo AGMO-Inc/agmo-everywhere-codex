@@ -132,6 +132,9 @@ function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined
 
 function parseTeamApiOperation(value: string | undefined): TeamApiOperation {
   if (
+    value === "create-task" ||
+    value === "update-task" ||
+    value === "release-task-claim" ||
     value === "read-task" ||
     value === "list-tasks" ||
     value === "get-summary" ||
@@ -141,7 +144,7 @@ function parseTeamApiOperation(value: string | undefined): TeamApiOperation {
     return value;
   }
   throw new Error(
-    "usage: agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json"
+    "usage: agmo team api <create-task|update-task|release-task-claim|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json"
   );
 }
 
@@ -1276,7 +1279,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
     default:
       console.log(`Usage:
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
-  agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json
+  agmo team api <create-task|update-task|release-task-claim|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
   agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]

@@ -234,6 +234,151 @@ test("runTeamCommand team api supports read-only success operations", async () =
   );
 });
 
+test("runTeamCommand team api creates tasks visible to list and read", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-create-"));
+  const teamName = "cli-api-create-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 2,
+      task: "Expose task creation API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const create = await captureTeamCommand(
+    [
+      "api",
+      "create-task",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        subject: "Dynamic follow-up",
+        description: "Created through the team API",
+        owner: "worker-1",
+        blocked_by: ["1"],
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(create, "create-task");
+  assert.equal(create.command, "team api create-task");
+  const createData = create.data as {
+    task?: {
+      id?: string;
+      owner?: string;
+      role?: string;
+      status?: string;
+      depends_on?: string[];
+      requires_code_change?: boolean;
+      version?: number;
+    };
+  };
+  assert.equal(createData.task?.id, "3");
+  assert.equal(createData.task?.owner, "worker-1");
+  assert.equal(createData.task?.role, "agmo-executor");
+  assert.equal(createData.task?.status, "blocked");
+  assert.deepEqual(createData.task?.depends_on, ["1"]);
+  assert.equal(createData.task?.requires_code_change, true);
+  assert.equal(createData.task?.version, 1);
+
+  const list = await captureTeamCommand(
+    ["api", "list-tasks", "--input", JSON.stringify({ team_name: teamName }), "--json"],
+    tempRoot,
+  );
+  const listData = list.data as { tasks?: Array<{ id?: string }> };
+  assert.deepEqual(listData.tasks?.map((task) => task.id), ["1", "2", "3"]);
+
+  const read = await captureTeamCommand(
+    [
+      "api",
+      "read-task",
+      "--input",
+      JSON.stringify({ team_name: teamName, task_id: "3" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const readData = read.data as { task?: { subject?: string } };
+  assert.equal(readData.task?.subject, "Dynamic follow-up");
+});
+
+test("runTeamCommand team api update-task rejects lifecycle fields", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-update-"));
+  const teamName = "cli-api-update-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject lifecycle task mutation",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const update = await captureTeamCommand(
+    [
+      "api",
+      "update-task",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        subject: "Allowed metadata",
+        description: "Updated metadata only",
+        requires_code_change: false,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(update, "update-task");
+  assert.equal(update.command, "team api update-task");
+  const updateData = update.data as {
+    task?: {
+      subject?: string;
+      description?: string;
+      requires_code_change?: boolean;
+      status?: string;
+      version?: number;
+    };
+  };
+  assert.equal(updateData.task?.subject, "Allowed metadata");
+  assert.equal(updateData.task?.description, "Updated metadata only");
+  assert.equal(updateData.task?.requires_code_change, false);
+  assert.equal(updateData.task?.status, "pending");
+  assert.equal(updateData.task?.version, 2);
+
+  const result = await captureTeamCommandOutput(
+    [
+      "api",
+      "update-task",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        subject: "Allowed metadata",
+        status: "completed",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+  assert.equal(result.exitCode, 1);
+  assertMachineEnvelope(output, "update-task", false);
+  assert.equal(output.command, "team api update-task");
+  assert.deepEqual(output.error, {
+    code: "invalid_input",
+    message: "update-task cannot mutate lifecycle fields: status",
+  });
+});
+
 test("runTeamCommand team api supports claim-safe terminal transitions", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-transition-"));
   const teamName = "cli-api-transition-team";
@@ -328,6 +473,111 @@ test("runTeamCommand team api supports claim-safe terminal transitions", async (
   assert.equal(transitionData.task?.result, "lifecycle complete");
   assert.equal(transitionData.task?.claim, undefined);
   assert.equal(transitionData.auto_shutdown?.triggered, true);
+});
+
+test("runTeamCommand team api release-task-claim requires token and makes task claimable", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-release-"));
+  const teamName = "cli-api-release-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Release task claim through API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const claim = await captureTeamCommand(
+    [
+      "api",
+      "claim-task",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        worker: "worker-1",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const claimData = claim.data as { claimToken?: string };
+  assert.equal(typeof claimData.claimToken, "string");
+
+  const badReleaseResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "release-task-claim",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        worker: "worker-1",
+        claim_token: "not-the-claim-token",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const badRelease = JSON.parse(badReleaseResult.stdout) as Record<string, unknown>;
+  assert.equal(badReleaseResult.exitCode, 1);
+  assertMachineEnvelope(badRelease, "release-task-claim", false);
+  assert.deepEqual(badRelease.error, {
+    code: "claim_conflict",
+    message: "claim token mismatch for task 1",
+  });
+
+  const release = await captureTeamCommand(
+    [
+      "api",
+      "release-task-claim",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        worker: "worker-1",
+        claim_token: claimData.claimToken,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(release, "release-task-claim");
+  assert.equal(release.command, "team api release-task-claim");
+  const releaseData = release.data as {
+    task?: {
+      status?: string;
+      owner?: string;
+      claim?: unknown;
+      claim_history?: Array<{ release_reason?: string }>;
+    };
+    worker_marked_idle?: boolean;
+  };
+  assert.equal(releaseData.task?.status, "pending");
+  assert.equal(releaseData.task?.owner, undefined);
+  assert.equal(releaseData.task?.claim, undefined);
+  assert.equal(releaseData.task?.claim_history?.at(-1)?.release_reason, "released");
+  assert.equal(releaseData.worker_marked_idle, true);
+
+  const secondClaim = await captureTeamCommand(
+    [
+      "api",
+      "claim-task",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        task_id: "1",
+        worker: "worker-1",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const secondClaimData = secondClaim.data as { task?: { status?: string; claim?: { token?: string } } };
+  assert.equal(secondClaimData.task?.status, "in_progress");
+  assert.equal(typeof secondClaimData.task?.claim?.token, "string");
 });
 
 test("runTeamCommand team api returns ok false envelope for missing team", async () => {

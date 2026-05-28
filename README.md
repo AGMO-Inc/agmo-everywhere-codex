@@ -301,6 +301,7 @@ When one execution lane is no longer enough, Agmo can move into a durable team r
 ```bash
 agmo team start 3 "Ship the scoped feature with verification"
 agmo team api get-summary --input '{"team_name":"<team-name>"}' --json
+agmo team api create-task --input '{"team_name":"<team-name>","subject":"Follow-up","description":"Implement the follow-up slice"}' --json
 agmo team status <team-name>
 agmo team monitor <team-name> --preset balanced --leader-view
 agmo team integrate <team-name> --strategy squash --target-ref @base
@@ -311,9 +312,10 @@ Machine-oriented JSON commands keep existing `command` fields and add a stable e
 `schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
 Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo team` commands,
 and JSON-producing `agmo vault` commands.
-For machine interop, `agmo team api <read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json`
+For machine interop, `agmo team api <create-task|update-task|release-task-claim|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json`
 returns an OMC-style envelope with either `data` or `error`; lifecycle mutation is limited to claim-safe
-`in_progress -> completed|failed` terminal transitions.
+claim/release and `in_progress -> completed|failed` terminal transitions. Task creation uses durable numeric
+IDs and `list-tasks`/`read-task` include dynamically created task files.
 
 ### Operational features
 
