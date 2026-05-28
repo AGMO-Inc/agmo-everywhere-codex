@@ -6,6 +6,7 @@ import {
   buildLeaderMonitorView,
   configureLeaderAlertDelivery,
   deliverLeaderAlerts,
+  deleteTeamRuntime,
   evaluateLeaderEscalations,
   rebalanceTeamAssignments,
   claimTaskForWorker,
@@ -35,7 +36,7 @@ import { resolveTeamMonitorPolicyPath } from "../team/state/index.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
-import { ellipsize } from "../team/terminal-format.js";
+import { ellipsize, fitLines } from "../team/terminal-format.js";
 
 function parseWorkerCount(value: string | undefined): number {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -90,14 +91,14 @@ function parseBooleanFlag(
   return undefined;
 }
 
-function parseHudPreset(value: string | undefined): "minimal" | "focused" | "full" | undefined {
+function parseHudPreset(value: string | undefined): "minimal" | "sidecar" | "focused" | "full" | undefined {
   if (!value) {
     return undefined;
   }
-  if (value === "minimal" || value === "focused" || value === "full") {
+  if (value === "minimal" || value === "sidecar" || value === "focused" || value === "full") {
     return value;
   }
-  throw new Error("--preset must be one of: minimal, focused, full");
+  throw new Error("--preset must be one of: minimal, sidecar, focused, full");
 }
 
 function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined {
@@ -137,6 +138,116 @@ function parseRoleMapOption(value: string | undefined): Record<string, string> |
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type TeamHudWatchLoopStreams = {
+  stdout: Pick<NodeJS.WriteStream, "write">;
+  stderr: Pick<NodeJS.WriteStream, "write">;
+};
+
+type TeamHudSignalProcess = {
+  on(signal: "SIGINT", handler: () => void): unknown;
+  off(signal: "SIGINT", handler: () => void): unknown;
+};
+
+type TeamHudWatchLoopOptions = {
+  watch: boolean;
+  clearScreen: boolean;
+  iterations?: number;
+  intervalMs: number;
+  renderFrame: () => Promise<string>;
+  sleepFn?: (ms: number) => Promise<void>;
+  streams?: TeamHudWatchLoopStreams;
+  signalProcess?: TeamHudSignalProcess;
+};
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function boundedWatchErrorLine(error: unknown, width = 200): string {
+  const sanitized = errorMessage(error).replace(/\s+/g, " ").trim();
+  return ellipsize(`watch render error: ${sanitized}`, width);
+}
+
+export async function runTeamHudWatchLoop({
+  watch,
+  clearScreen,
+  iterations,
+  intervalMs,
+  renderFrame,
+  sleepFn = sleep,
+  streams = { stdout: process.stdout, stderr: process.stderr },
+  signalProcess = process
+}: TeamHudWatchLoopOptions): Promise<void> {
+  let previousText: string | null = null;
+  let previousHeight = 0;
+  let stdoutEndsCleanly = true;
+  let interrupted = false;
+
+  const writeStdout = (text: string): void => {
+    streams.stdout.write(text);
+    stdoutEndsCleanly = text.endsWith("\n");
+  };
+  const ensureFinalStdoutNewline = (): void => {
+    if (!stdoutEndsCleanly) {
+      streams.stdout.write("\n");
+      stdoutEndsCleanly = true;
+    }
+  };
+  const handleSigint = (): void => {
+    interrupted = true;
+  };
+
+  if (watch) {
+    signalProcess.on("SIGINT", handleSigint);
+  }
+
+  try {
+    const maxIterations = watch ? iterations ?? Number.POSITIVE_INFINITY : 1;
+    for (let index = 0; index < maxIterations && !interrupted; index += 1) {
+      let outputText: string;
+      try {
+        outputText = await renderFrame();
+      } catch (error) {
+        ensureFinalStdoutNewline();
+        if (watch) {
+          streams.stderr.write(`${boundedWatchErrorLine(error)}\n`);
+        }
+        throw error;
+      }
+
+      if (watch && clearScreen && outputText === previousText) {
+        if (index + 1 < maxIterations && !interrupted) {
+          await sleepFn(intervalMs);
+        }
+        continue;
+      }
+
+      if (watch && clearScreen) {
+        const nextHeight = outputText.split("\n").length;
+        writeStdout("\x1b[H\x1b[2J");
+        if (previousHeight > nextHeight) {
+          writeStdout("\x1b[J");
+        }
+        previousHeight = nextHeight;
+      }
+      previousText = outputText;
+      writeStdout(`${outputText}\n`);
+
+      if (index + 1 < maxIterations && !interrupted) {
+        await sleepFn(intervalMs);
+      }
+    }
+  } finally {
+    if (watch) {
+      signalProcess.off("SIGINT", handleSigint);
+    }
+    ensureFinalStdoutNewline();
+  }
 }
 
 function parseOption(args: string[], optionName: string): string | undefined {
@@ -305,6 +416,36 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       console.log(
         JSON.stringify(
           { command: "team shutdown", ...result },
+          null,
+          2
+        )
+      );
+      return;
+    }
+    case "delete": {
+      const teamName = args[1];
+      if (!teamName) {
+        throw new Error(
+          "usage: agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]"
+        );
+      }
+      const keepWorktrees = args.slice(2).includes("--keep-worktrees");
+      const removeWorktrees = args.slice(2).includes("--remove-worktrees");
+      if (keepWorktrees && removeWorktrees) {
+        throw new Error("cannot use both --keep-worktrees and --remove-worktrees");
+      }
+      const result = await deleteTeamRuntime(
+        teamName,
+        {
+          force: args.slice(2).includes("--force"),
+          dryRun: args.slice(2).includes("--dry-run"),
+          keepWorktrees
+        },
+        cwd
+      );
+      console.log(
+        JSON.stringify(
+          { command: "team delete", ...result },
           null,
           2
         )
@@ -785,7 +926,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       const teamName = args[1];
       if (!teamName) {
         throw new Error(
-          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
+          "usage: agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]"
         );
       }
       const staleRaw = parseOption(args.slice(2), "--stale-ms");
@@ -820,10 +961,8 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       if (maxLines !== undefined && maxLines < 1) {
         throw new Error("--max-lines must be at least 1");
       }
-      let previousText: string | null = null;
-      let previousHeight = 0;
       const intervalMs = refreshMs ?? 2000;
-      const runHudOnce = async (): Promise<void> => {
+      const renderHudFrame = async (): Promise<string> => {
         if (repair) {
           await repairTeamHudPane(teamName, cwd);
         }
@@ -847,31 +986,19 @@ export async function runTeamCommand(args: string[]): Promise<void> {
             : footer
               ? `${hud.text}\n${footer}`
               : hud.text;
-        if (watch && clearScreen && outputText === previousText) {
-          return;
+        if (maxLines !== undefined) {
+          const maxWidth = renderWidth ?? width ?? 100;
+          return fitLines(outputText.split("\n"), maxWidth, maxLines).join("\n");
         }
-        if (watch && clearScreen) {
-          const nextHeight = outputText.split("\n").length;
-          process.stdout.write("\x1b[H\x1b[2J");
-          if (previousHeight > nextHeight) {
-            process.stdout.write("\x1b[J");
-          }
-          previousHeight = nextHeight;
-        }
-        previousText = outputText;
-        process.stdout.write(`${outputText}\n`);
+        return outputText;
       };
-      if (watch) {
-        const maxIterations = iterations ?? Number.POSITIVE_INFINITY;
-        for (let index = 0; index < maxIterations; index += 1) {
-          await runHudOnce();
-          if (index + 1 < maxIterations) {
-            await sleep(intervalMs);
-          }
-        }
-      } else {
-        await runHudOnce();
-      }
+      await runTeamHudWatchLoop({
+        watch,
+        clearScreen,
+        iterations,
+        intervalMs,
+        renderFrame: renderHudFrame
+      });
       return;
     }
     case "layout": {
@@ -1122,6 +1249,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
+  agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]
   agmo team shutdown-ack <team> <worker> <accepted|busy|rejected> [--reason <text>] [--task <id>]
   agmo team cleanup-stale [--stale-ms <ms>] [--dead-ms <ms>] [--include-stale|--no-include-stale] [--dry-run|--no-dry-run] [--retry-pane-closes|--no-retry-pane-closes] [--sweep-tmux|--no-sweep-tmux]
   agmo team send <team> <worker> "<message>"
@@ -1133,7 +1261,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
   agmo team monitor <team> [--preset observe|conservative|balanced|aggressive] [--stale-ms <ms>] [--dead-ms <ms>] [--auto-nudge|--no-auto-nudge] [--nudge-cooldown-ms <ms>] [--auto-reclaim|--no-auto-reclaim] [--auto-reassign|--no-auto-reassign] [--reclaim-lease-ms <ms>] [--include-stale|--no-include-stale] [--escalate-leader|--no-escalate-leader] [--notify-on-stale|--no-notify-on-stale] [--notify-on-dead|--no-notify-on-dead] [--notify-on-claim-risk|--no-notify-on-claim-risk] [--leader-alert-cooldown-ms <ms>] [--escalation-repeat-threshold <n>] [--repair-hud] [--leader-view]
   agmo team alert-delivery show <team>
   agmo team alert-delivery set <team> [--mailbox|--no-mailbox] [--slack|--no-slack] [--slack-webhook-url <url>] [--slack-username <name>] [--slack-icon-emoji <emoji>] [--email|--no-email] [--email-to <a,b>] [--email-from <addr>] [--email-sendmail-path <path>] [--email-subject-prefix <prefix>]
-  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
+  agmo team hud <team> [--stale-ms <ms>] [--dead-ms <ms>] [--watch] [--refresh-ms <ms>] [--iterations <n>] [--repair] [--clear|--no-clear] [--preset minimal|sidecar|focused|full] [--width <cols>] [--max-lines <n>] [--legend] [--color|--no-color]
   agmo team layout status <team>
   agmo team layout repair <team> [--dry-run] [--force]
   agmo team layout rebalance <team> [--layout auto|main-vertical|tiled] [--dry-run]

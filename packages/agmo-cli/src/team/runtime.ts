@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { appendFile, readdir, realpath, rm } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { buildHookCommand, mergeManagedHooksConfig } from "../hooks/codex-hooks.js";
 import { agmoCliDistEntryPath } from "../utils/paths.js";
 import {
@@ -31,12 +32,21 @@ import {
   type TeamHudSuggestedAction
 } from "./hud-renderer.js";
 import type { AgmoColorMode } from "./terminal-format.js";
-import type { TeamLayoutPreset } from "./layout-planner.js";
+import type {
+  TeamLayoutCapacityMetrics,
+  TeamLayoutPlan,
+  TeamLayoutPreset
+} from "./layout-planner.js";
 import {
   buildInitialWorkerInbox,
   buildWorkerInstructions
 } from "./worker-bootstrap.js";
-import { provisionWorkerWorktree } from "./worktree.js";
+import {
+  cleanupTeamWorktrees,
+  provisionWorkerWorktree,
+  type TeamWorktreeCleanupSummary,
+  writeTeamWorktreeManifest
+} from "./worktree.js";
 import {
   buildDefaultWorkerHeartbeat,
   buildDefaultWorkerStatus,
@@ -238,6 +248,19 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
   }
 
   return JSON.parse(content) as T;
+}
+
+function isPathWithin(parent: string, child: string): boolean {
+  const pathRelative = relative(parent, child);
+  return pathRelative === "" || (pathRelative.length > 0 && !pathRelative.startsWith("..") && !isAbsolute(pathRelative));
+}
+
+async function canonicalExistingPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 async function readTaskRecord(
@@ -3093,17 +3116,86 @@ type LayoutAction = {
   reason: string;
 };
 
+type LayoutPlanStatus = {
+  preset: TeamLayoutPlan["preset"];
+  choice: TeamLayoutPlan["choice"];
+  health: TeamLayoutPlan["health"];
+  selected_reason: string;
+  worker_count: number;
+  window_width: number | null;
+  window_height: number | null;
+  leader_width: number | null;
+  hud_height: number;
+  columns: number;
+  rows: number;
+  metrics: {
+    window_area: TeamLayoutCapacityMetrics["windowArea"];
+    usable_height: TeamLayoutCapacityMetrics["usableHeight"];
+    reserved_hud_height: TeamLayoutCapacityMetrics["reservedHudHeight"];
+    available_worker_width: TeamLayoutCapacityMetrics["availableWorkerWidth"];
+    available_worker_height: TeamLayoutCapacityMetrics["availableWorkerHeight"];
+    worker_cell_width: TeamLayoutCapacityMetrics["workerCellWidth"];
+    worker_cell_height: TeamLayoutCapacityMetrics["workerCellHeight"];
+    worker_cell_area: TeamLayoutCapacityMetrics["workerCellArea"];
+    requested_workers: TeamLayoutCapacityMetrics["requestedWorkers"];
+    visible_worker_capacity: TeamLayoutCapacityMetrics["visibleWorkerCapacity"];
+    overflow_workers: TeamLayoutCapacityMetrics["overflowWorkers"];
+    leader_meets_minimum: TeamLayoutCapacityMetrics["leaderMeetsMinimum"];
+    workers_meet_minimum_width: TeamLayoutCapacityMetrics["workersMeetMinimumWidth"];
+    workers_meet_minimum_height: TeamLayoutCapacityMetrics["workersMeetMinimumHeight"];
+    hud_fits: TeamLayoutCapacityMetrics["hudFits"];
+    hud_disabled: TeamLayoutCapacityMetrics["hudDisabled"];
+  };
+  warnings: string[];
+};
+
 type LayoutOperation = {
   command: "team layout repair" | "team layout rebalance";
   team_name: string;
   dry_run: boolean;
   status: "completed" | "partial" | "skipped" | "failed" | "refused";
+  layout_plan?: LayoutPlanStatus;
   planned: LayoutAction[];
   performed: LayoutAction[];
   skipped: LayoutAction[];
   failed: Array<LayoutAction & { error: string }>;
   refused: Array<LayoutAction & { reason: string }>;
 };
+
+function mapLayoutPlanStatus(plan: TeamLayoutPlan): LayoutPlanStatus {
+  return {
+    preset: plan.preset,
+    choice: plan.choice,
+    health: plan.health,
+    selected_reason: plan.selectedReason,
+    worker_count: plan.workerCount,
+    window_width: plan.windowWidth,
+    window_height: plan.windowHeight,
+    leader_width: plan.leaderWidth,
+    hud_height: plan.hudHeight,
+    columns: plan.columns,
+    rows: plan.rows,
+    metrics: {
+      window_area: plan.metrics.windowArea,
+      usable_height: plan.metrics.usableHeight,
+      reserved_hud_height: plan.metrics.reservedHudHeight,
+      available_worker_width: plan.metrics.availableWorkerWidth,
+      available_worker_height: plan.metrics.availableWorkerHeight,
+      worker_cell_width: plan.metrics.workerCellWidth,
+      worker_cell_height: plan.metrics.workerCellHeight,
+      worker_cell_area: plan.metrics.workerCellArea,
+      requested_workers: plan.metrics.requestedWorkers,
+      visible_worker_capacity: plan.metrics.visibleWorkerCapacity,
+      overflow_workers: plan.metrics.overflowWorkers,
+      leader_meets_minimum: plan.metrics.leaderMeetsMinimum,
+      workers_meet_minimum_width: plan.metrics.workersMeetMinimumWidth,
+      workers_meet_minimum_height: plan.metrics.workersMeetMinimumHeight,
+      hud_fits: plan.metrics.hudFits,
+      hud_disabled: plan.metrics.hudDisabled
+    },
+    warnings: plan.warnings
+  };
+}
 
 function mapHudReapAction(entry: { pane_id: string; reason: string }): LayoutAction {
   return {
@@ -3179,6 +3271,7 @@ export async function readTeamLayoutStatus(
   transport: "tmux" | "none";
   dry_run: false;
   layout_health: "ok" | "degraded" | "repairable" | "unknown" | "skipped";
+  layout_plan?: LayoutPlanStatus;
   panes: {
     leader: LayoutPaneHealth;
     hud?: LayoutPaneHealth;
@@ -3257,7 +3350,8 @@ export async function readTeamLayoutStatus(
   const recommended_actions = [
     ...(hud.health === "missing" || hud.health === "dead" ? ["team layout repair"] : []),
     ...(orphanHudReap.planned.length > 0 ? ["team layout repair --dry-run"] : []),
-    ...(plan.health === "degraded" ? ["team layout rebalance --dry-run"] : [])
+    ...(plan.health === "degraded" ? ["team layout rebalance --dry-run"] : []),
+    ...(plan.metrics.overflowWorkers > 0 ? ["resize terminal or reduce worker count"] : [])
   ];
   const repairable = hud.health === "missing" || hud.health === "dead";
   return {
@@ -3271,6 +3365,7 @@ export async function readTeamLayoutStatus(
       hud,
       workers
     },
+    layout_plan: mapLayoutPlanStatus(plan),
     warnings,
     recommended_actions
   };
@@ -3381,7 +3476,13 @@ export async function rebalanceTeamLayout(
     command: "team layout rebalance",
     team_name: normalizedTeamName,
     dry_run: Boolean(options.dryRun),
-    ...operation
+    status: operation.status,
+    layout_plan: operation.layoutPlan ? mapLayoutPlanStatus(operation.layoutPlan) : undefined,
+    planned: operation.planned,
+    performed: operation.performed,
+    skipped: operation.skipped,
+    failed: operation.failed,
+    refused: operation.refused
   };
 }
 
@@ -3645,6 +3746,23 @@ export async function startTeamRuntime(
     })
   );
 
+  const worktreeManifest = await writeTeamWorktreeManifest(
+    teamName,
+    workerRuntimeSpecs.map((spec) => ({
+      worker_name: spec.workerName,
+      path: spec.worktree.path,
+      git_enabled: spec.worktree.git_enabled,
+      repo_root: spec.worktree.repo_root,
+      base_ref: spec.worktree.base_ref,
+      ...(spec.worktree.branch_name ? { branch_name: spec.worktree.branch_name } : {}),
+      status: spec.worktree.status
+    })),
+    {
+      createdAt: timestamp,
+      cwd
+    }
+  );
+
   const primaryGitWorktree = workerRuntimeSpecs.find((spec) => spec.worktree.git_enabled)?.worktree;
   if (primaryGitWorktree) {
     config.workspace = {
@@ -3738,6 +3856,7 @@ export async function startTeamRuntime(
     team_name: teamName,
     config,
     manifest,
+    worktree_manifest: worktreeManifest,
     phase,
     tasks_created: tasks.length,
     ...(request.allocationIntent ? { allocation_intent: request.allocationIntent } : {}),
@@ -4071,6 +4190,175 @@ export async function shutdownTeamRuntime(
     tmux_pane_destruction: tmuxPaneDestruction,
     pane_close_retry: paneCloseRetry,
     preserved_state_root: resolveTeamDir(latestStatus.config.name, cwd)
+  };
+}
+
+async function removeTeamStateDirSafely(
+  teamName: string,
+  options: { dryRun?: boolean },
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const stateRoot = resolveTeamStateRoot(cwd);
+  const teamDir = resolveTeamDir(normalizedTeamName, cwd);
+  const stateRootCanonical = await canonicalExistingPath(stateRoot);
+  const teamDirCanonical = await canonicalExistingPath(teamDir);
+
+  if (!isPathWithin(stateRootCanonical, teamDirCanonical) || teamDirCanonical === stateRootCanonical) {
+    throw new Error(`refusing to remove unsafe team state path: ${teamDir}`);
+  }
+
+  if (options.dryRun) {
+    return {
+      status: "would_remove",
+      path: teamDir
+    };
+  }
+
+  await rm(teamDirCanonical, { recursive: true, force: true });
+  return {
+    status: "removed",
+    path: teamDir
+  };
+}
+
+function describeBlockingWorktreeCleanup(
+  cleanup: TeamWorktreeCleanupSummary,
+  options: { keepWorktrees?: boolean }
+): string | null {
+  if (options.keepWorktrees) {
+    return null;
+  }
+
+  if (cleanup.manifest_status === "missing") {
+    return existsSync(cleanup.worktree_root)
+      ? "worktree ownership manifest missing while worktree root exists"
+      : null;
+  }
+
+  if (cleanup.manifest_status === "invalid") {
+    return "worktree ownership manifest failed validation";
+  }
+
+  if (cleanup.status === "failed" || cleanup.status === "partial") {
+    return "worktree cleanup did not complete";
+  }
+
+  const unsafeWorker = cleanup.workers.find(
+    (worker) => worker.reason === "worker path escapes team worktree root"
+  );
+  if (unsafeWorker) {
+    return `unsafe worker worktree path detected: ${unsafeWorker.worker_name}`;
+  }
+
+  return null;
+}
+
+export async function deleteTeamRuntime(
+  teamName: string,
+  options: {
+    force?: boolean;
+    dryRun?: boolean;
+    keepWorktrees?: boolean;
+  } = {},
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const force = options.force === true;
+  const dryRun = options.dryRun === true;
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+
+  if (!status) {
+    return {
+      team_name: normalizedTeamName,
+      dry_run: dryRun,
+      force,
+      status: "not_found",
+      shutdown: null,
+      worktree_cleanup: await cleanupTeamWorktrees(
+        normalizedTeamName,
+        { dryRun, force, keepWorktrees: options.keepWorktrees },
+        cwd
+      ),
+      state_removal: {
+        status: "skipped",
+        reason: "team state not found",
+        path: resolveTeamDir(normalizedTeamName, cwd)
+      }
+    };
+  }
+
+  if (status.config.active && !force) {
+    return {
+      team_name: normalizedTeamName,
+      dry_run: dryRun,
+      force,
+      status: "refused_active",
+      active: true,
+      error: "team is active; use --force to shut it down before deletion",
+      shutdown: null,
+      worktree_cleanup: {
+        status: "skipped",
+        reason: "team is active"
+      },
+      state_removal: {
+        status: "skipped",
+        reason: "team is active",
+        path: resolveTeamDir(normalizedTeamName, cwd)
+      }
+    };
+  }
+
+  const shutdown =
+    status.config.active && force && !dryRun
+      ? await shutdownTeamRuntime(normalizedTeamName, { graceMs: 0 }, cwd)
+      : status.config.active && force && dryRun
+        ? {
+            status: "would_shutdown",
+            grace_ms: 0
+          }
+        : null;
+
+  const worktreeCleanup = await cleanupTeamWorktrees(
+    normalizedTeamName,
+    { dryRun, force, keepWorktrees: options.keepWorktrees },
+    cwd
+  );
+  const blockingWorktreeCleanup = describeBlockingWorktreeCleanup(worktreeCleanup, {
+    keepWorktrees: options.keepWorktrees
+  });
+  if (blockingWorktreeCleanup) {
+    return {
+      team_name: normalizedTeamName,
+      dry_run: dryRun,
+      force,
+      status: "blocked_worktree_cleanup",
+      shutdown,
+      worktree_cleanup: worktreeCleanup,
+      state_removal: {
+        status: "skipped",
+        reason: blockingWorktreeCleanup,
+        path: resolveTeamDir(normalizedTeamName, cwd)
+      }
+    };
+  }
+
+  const stateRemoval = await removeTeamStateDirSafely(normalizedTeamName, { dryRun }, cwd);
+  const deleteStatus =
+    dryRun
+      ? "would_delete"
+      : worktreeCleanup.status === "failed" || worktreeCleanup.status === "partial"
+        ? "deleted_with_worktree_errors"
+        : "deleted";
+
+  return {
+    team_name: normalizedTeamName,
+    dry_run: dryRun,
+    force,
+    status: deleteStatus,
+    shutdown,
+    worktree_cleanup: worktreeCleanup,
+    state_removal: stateRemoval
   };
 }
 

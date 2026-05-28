@@ -8,6 +8,9 @@ import {
   type TeamLayoutPlan
 } from "./layout-planner.js";
 
+const DEFAULT_TMUX_HUD_PRESET: AgmoTeamHudPreset = "sidecar";
+const DEFAULT_TMUX_HUD_MAX_LINES = 6;
+
 export type TmuxTopology = {
   available: boolean;
   in_tmux_client: boolean;
@@ -36,6 +39,7 @@ export type CreatedTmuxSession = {
   leaderPaneId: string;
   workerPaneIds: Record<string, string>;
   hudPaneId?: string | null;
+  layoutPlan?: TeamLayoutPlan;
 };
 
 export type TmuxPaneDestructionResult = {
@@ -122,6 +126,7 @@ export type TmuxLayoutAction = {
 
 export type TmuxLayoutOperationResult = {
   status: "completed" | "partial" | "skipped" | "failed" | "refused";
+  layoutPlan?: TeamLayoutPlan;
   planned: TmuxLayoutAction[];
   performed: TmuxLayoutAction[];
   skipped: TmuxLayoutAction[];
@@ -218,6 +223,8 @@ function buildWorkerBootstrapCommand(spec: TmuxWorkerPaneSpec): string {
 
 function buildHudCliArgs(spec: TmuxHudSpec): string[] {
   const refreshMs = Math.max(spec.refreshMs ?? 2000, 250);
+  const preset = spec.preset ?? DEFAULT_TMUX_HUD_PRESET;
+  const maxLines = spec.maxLines ?? DEFAULT_TMUX_HUD_MAX_LINES;
   const args = [
     "team",
     "hud",
@@ -227,15 +234,11 @@ function buildHudCliArgs(spec: TmuxHudSpec): string[] {
     String(refreshMs),
     spec.clearScreen === false ? "--no-clear" : "--clear"
   ];
-  if (spec.preset) {
-    args.push("--preset", spec.preset);
-  }
+  args.push("--preset", preset);
   if (typeof spec.width === "number") {
     args.push("--width", String(spec.width));
   }
-  if (typeof spec.maxLines === "number") {
-    args.push("--max-lines", String(spec.maxLines));
-  }
+  args.push("--max-lines", String(maxLines));
   if (spec.color === "always") {
     args.push("--color");
   } else if (spec.color === "never") {
@@ -547,14 +550,16 @@ export function createTeamSession(
   workerSpecs: TmuxWorkerPaneSpec[],
   options: {
     hud?: TmuxHudSpec;
+    runner?: TmuxRunner;
   } = {}
 ): CreatedTmuxSession {
-  const current = currentTmuxPaneInfo();
+  const runner = options.runner ?? runTmux;
+  const current = currentTmuxPaneInfo(runner);
   const leaderPaneId = current?.pane_id ?? currentTmuxPaneId();
   if (!leaderPaneId) {
     throw new Error("tmux current pane not detected");
   }
-  const currentPane = listTmuxPanes().find((pane) => pane.pane_id === leaderPaneId);
+  const currentPane = listTmuxPanes(runner).find((pane) => pane.pane_id === leaderPaneId);
   const layoutPlan = computeTeamLayoutPlan(
     currentPane?.window_width,
     currentPane?.window_height,
@@ -564,7 +569,7 @@ export function createTeamSession(
 
   const workerPaneIds: Record<string, string> = {};
   let rightStackRootPaneId: string | null = null;
-  runTmux(["select-pane", "-t", leaderPaneId, "-T", `agmo:leader:${workerSpecs[0]?.teamName ?? "team"}`]);
+  runner(["select-pane", "-t", leaderPaneId, "-T", `agmo:leader:${workerSpecs[0]?.teamName ?? "team"}`]);
 
   for (let index = 0; index < workerSpecs.length; index += 1) {
     const spec = workerSpecs[index];
@@ -580,7 +585,7 @@ export function createTeamSession(
             : "-v";
     const splitTarget = index === 0 ? leaderPaneId : rightStackRootPaneId ?? leaderPaneId;
     const command = buildWorkerBootstrapCommand(spec);
-    const result = runTmux([
+    const result = runner([
       "split-window",
       splitDirection,
       "-d",
@@ -604,14 +609,14 @@ export function createTeamSession(
     }
 
     workerPaneIds[spec.workerName] = paneId;
-    runTmux(["select-pane", "-t", paneId, "-T", `agmo:worker:${spec.teamName}:${spec.workerName}`]);
+    runner(["select-pane", "-t", paneId, "-T", `agmo:worker:${spec.teamName}:${spec.workerName}`]);
     if (index === 0) {
       rightStackRootPaneId = paneId;
     }
   }
 
   let hudPaneId: string | null = null;
-  if (options.hud) {
+  if (options.hud && layoutPlan.hudHeight > 0) {
     hudPaneId = createHudPane(
       {
         ...options.hud,
@@ -621,19 +626,20 @@ export function createTeamSession(
       },
       {
         targetPaneId: leaderPaneId,
-        runner: runTmux
+        runner
       }
     );
   }
 
-  runTmux(["select-layout", "-t", leaderPaneId, layoutPlan.choice === "tiled" ? "tiled" : "main-vertical"]);
-  runTmux(["select-pane", "-t", leaderPaneId]);
+  runner(["select-layout", "-t", leaderPaneId, layoutPlan.choice === "tiled" ? "tiled" : "main-vertical"]);
+  runner(["select-pane", "-t", leaderPaneId]);
 
   return {
     sessionId: current?.session_id ?? null,
     leaderPaneId,
     workerPaneIds,
-    hudPaneId
+    hudPaneId,
+    layoutPlan
   };
 }
 
@@ -823,33 +829,33 @@ export function applyTeamLayout(
   const panes = listTmuxPanes(runner);
   const leader = spec.leaderPaneId ? panes.find((pane) => pane.pane_id === spec.leaderPaneId) : undefined;
   const current = currentTmuxPaneInfo(runner);
+  const plan = computeTeamLayoutPlan(
+    leader?.window_width,
+    leader?.window_height,
+    Object.keys(spec.workerPaneIds ?? {}).length,
+    { preset: spec.layout ?? "auto", hud: Boolean(spec.hudPaneId) }
+  );
 
   if (!spec.leaderPaneId || !leader || leader.dead) {
     const action = { kind: "refuse", target: spec.leaderPaneId ?? "leader", reason: "leader_pane_unavailable" };
-    return { status: "refused", planned: [action], performed, skipped, failed, refused: [{ ...action, reason: action.reason }] };
+    return { status: "refused", layoutPlan: plan, planned: [action], performed, skipped, failed, refused: [{ ...action, reason: action.reason }] };
   }
   if (spec.sessionId && leader.session_id !== spec.sessionId) {
     const action = { kind: "refuse", target: spec.leaderPaneId, reason: "leader_pane_foreign_session" };
-    return { status: "refused", planned: [action], performed, skipped, failed, refused: [{ ...action, reason: action.reason }] };
+    return { status: "refused", layoutPlan: plan, planned: [action], performed, skipped, failed, refused: [{ ...action, reason: action.reason }] };
   }
   if (current?.pane_id === spec.leaderPaneId) {
     skipped.push({ kind: "select-pane", target: spec.leaderPaneId, reason: "leader_is_current_pane" });
   }
 
-  const plan = computeTeamLayoutPlan(
-    leader.window_width,
-    leader.window_height,
-    Object.keys(spec.workerPaneIds ?? {}).length,
-    { preset: spec.layout ?? "auto", hud: Boolean(spec.hudPaneId) }
-  );
-  const layoutName = spec.layout === "tiled" || plan.choice === "tiled" ? "tiled" : "main-vertical";
-  planned.push({ kind: "select-layout", target: spec.leaderPaneId, reason: `apply_${layoutName}` });
+  const layoutName = plan.choice === "tiled" ? "tiled" : "main-vertical";
+  planned.push({ kind: "select-layout", target: spec.leaderPaneId, reason: `apply_${layoutName}:${plan.selectedReason}` });
   if (layoutName === "main-vertical" && plan.leaderWidth) {
     planned.push({ kind: "resize-pane", target: spec.leaderPaneId, reason: `leader_width_${plan.leaderWidth}` });
   }
 
   if (spec.dryRun) {
-    return { status: "skipped", planned, performed, skipped: [...skipped, ...planned], failed, refused };
+    return { status: "skipped", layoutPlan: plan, planned, performed, skipped: [...skipped, ...planned], failed, refused };
   }
 
   for (const action of planned) {
@@ -866,6 +872,7 @@ export function applyTeamLayout(
 
   return {
     status: failed.length > 0 ? (performed.length > 0 ? "partial" : "failed") : "completed",
+    layoutPlan: plan,
     planned,
     performed,
     skipped,

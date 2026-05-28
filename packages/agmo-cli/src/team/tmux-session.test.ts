@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyTeamLayout,
   buildWorkerCodexArgs,
   buildHudCommand,
+  createTeamSession,
   destroyWorkerPanes,
   findHudPaneIds,
   listTmuxPanes,
   readAgmoHudPaneOwner,
   reapOrphanHudPanes
 } from "./tmux-session.js";
+
+function ok(stdout = "") {
+  return { ok: true, stdout, stderr: "" };
+}
 
 test("buildWorkerCodexArgs injects --full-auto for tmux workers", () => {
   assert.deepEqual(buildWorkerCodexArgs("hello"), [
@@ -160,6 +166,22 @@ test("HUD command uses CLI watch mode with owner tags", () => {
   assert.doesNotMatch(command, /while true/);
   assert.doesNotMatch(command, /clear;/);
   assert.match(command, /--no-clear/);
+  assert.match(command, /--preset.*minimal/);
+  assert.match(command, /--max-lines.*10/);
+});
+
+test("HUD command defaults team-created panes to sidecar preset with bounded height", () => {
+  const command = buildHudCommand({
+    teamName: "demo",
+    projectRoot: "/repo",
+    cliEntryPath: "/repo/dist/cli/index.js",
+    refreshMs: 500,
+    leaderPaneId: "%1",
+    sessionId: "$1"
+  });
+
+  assert.match(command, /--preset.*sidecar/);
+  assert.match(command, /--max-lines.*6/);
 });
 
 test("HUD owner helpers parse tagged panes and find reusable panes", () => {
@@ -307,4 +329,133 @@ test("reapOrphanHudPanes dry-run reports plans without tmux mutation", () => {
   assert.deepEqual(calls.filter((args) => args[0] === "kill-pane"), []);
   assert.deepEqual(result.planned.map((entry) => entry.pane_id), ["%2"]);
   assert.equal(result.performed.length, 0);
+});
+
+test("applyTeamLayout returns planner output and selected layout actions", () => {
+  const calls: string[][] = [];
+  const result = applyTeamLayout(
+    {
+      teamName: "demo",
+      leaderPaneId: "%1",
+      sessionId: "$1",
+      workerPaneIds: {
+        "worker-1": "%2",
+        "worker-2": "%3",
+        "worker-3": "%4",
+        "worker-4": "%5",
+        "worker-5": "%6",
+        "worker-6": "%7"
+      },
+      hudPaneId: "%8",
+      layout: "auto"
+    },
+    (args) => {
+      calls.push(args);
+      if (args[0] === "list-panes") {
+        return ok("$1\tteam\t@1\t%1\t1\t0\tzsh\tzsh\tagmo:leader:demo\t120\t40\t0\t0\t220\t60");
+      }
+      if (args[0] === "display-message") {
+        return ok("$1\tteam\t@1\t%9");
+      }
+      return ok();
+    }
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.layoutPlan?.choice, "leader-left-grid-right");
+  assert.equal(result.layoutPlan?.selectedReason, "grid_preserves_worker_capacity");
+  assert.deepEqual(calls.filter((args) => args[0] === "select-layout"), [
+    ["select-layout", "-t", "%1", "main-vertical"]
+  ]);
+  assert.ok(calls.some((args) => args[0] === "resize-pane" && args[1] === "-t" && args[2] === "%1"));
+});
+
+test("applyTeamLayout honors explicit tiled preset in dry-run output", () => {
+  const calls: string[][] = [];
+  const result = applyTeamLayout(
+    {
+      teamName: "demo",
+      leaderPaneId: "%1",
+      sessionId: "$1",
+      workerPaneIds: {
+        "worker-1": "%2",
+        "worker-2": "%3"
+      },
+      layout: "tiled",
+      dryRun: true
+    },
+    (args) => {
+      calls.push(args);
+      if (args[0] === "list-panes") {
+        return ok("$1\tteam\t@1\t%1\t1\t0\tzsh\tzsh\tagmo:leader:demo\t80\t40\t0\t0\t120\t40");
+      }
+      if (args[0] === "display-message") {
+        return ok("$1\tteam\t@1\t%9");
+      }
+      return ok();
+    }
+  );
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.layoutPlan?.choice, "tiled");
+  assert.equal(result.layoutPlan?.selectedReason, "explicit_tiled_preset");
+  assert.deepEqual(result.planned, [
+    { kind: "select-layout", target: "%1", reason: "apply_tiled:explicit_tiled_preset" }
+  ]);
+  assert.deepEqual(calls.filter((args) => args[0] === "select-layout"), []);
+});
+
+test("createTeamSession skips requested HUD when planner disables it", () => {
+  const calls: string[][] = [];
+  const splitPaneIds = ["%2", "%3"];
+  const result = createTeamSession(
+    [
+      {
+        teamName: "demo",
+        workerName: "worker-1",
+        projectRoot: "/repo",
+        workingDir: "/repo",
+        inboxPath: "/repo/inbox-1.md",
+        role: "agmo-executor",
+        taskSummary: "task",
+        instructionsPath: "/repo/AGENTS.md"
+      },
+      {
+        teamName: "demo",
+        workerName: "worker-2",
+        projectRoot: "/repo",
+        workingDir: "/repo",
+        inboxPath: "/repo/inbox-2.md",
+        role: "agmo-verifier",
+        taskSummary: "task",
+        instructionsPath: "/repo/AGENTS.md"
+      }
+    ],
+    {
+      hud: {
+        teamName: "demo",
+        projectRoot: "/repo",
+        cliEntryPath: "/repo/dist/cli/index.js"
+      },
+      runner: (args) => {
+        calls.push(args);
+        if (args[0] === "display-message") {
+          return ok("$1\tteam\t@1\t%1");
+        }
+        if (args[0] === "list-panes") {
+          return ok("$1\tteam\t@1\t%1\t1\t0\tzsh\tzsh\tagmo:leader:demo\t80\t20\t0\t0\t160\t20");
+        }
+        if (args[0] === "split-window") {
+          return ok(splitPaneIds.shift() ?? "%99");
+        }
+        return ok();
+      }
+    }
+  );
+
+  assert.equal(result.layoutPlan?.choice, "compact-no-hud");
+  assert.equal(result.layoutPlan?.hudHeight, 0);
+  assert.equal(result.hudPaneId, null);
+  assert.equal(calls.filter((args) => args[0] === "split-window").length, 2);
+  assert.equal(calls.some((args) => args.join(" ").includes(" team hud ")), false);
 });

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import { mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
-import { runTeamCommand } from "./team.js";
+import { resolveTeamDir } from "../team/state/index.js";
+import { resolveTeamWorktreeRoot } from "../team/worktree.js";
+import { runTeamCommand, runTeamHudWatchLoop } from "./team.js";
 
 async function captureTeamCommand(
   args: string[],
@@ -17,10 +20,19 @@ async function captureTeamCommandText(
   args: string[],
   cwd: string,
 ): Promise<string> {
+  return (await captureTeamCommandOutput(args, cwd)).stdout;
+}
+
+async function captureTeamCommandOutput(
+  args: string[],
+  cwd: string,
+): Promise<{ stdout: string; stderr: string }> {
   const originalCwd = process.cwd();
   const originalProjectRoot = process.env.AGMO_PROJECT_ROOT;
   const originalWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
   const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
 
   process.env.AGMO_PROJECT_ROOT = cwd;
   process.chdir(cwd);
@@ -30,11 +42,24 @@ async function captureTeamCommandText(
     );
     return true;
   }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderrChunks.push(
+      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"),
+    );
+    return true;
+  }) as typeof process.stderr.write;
 
   try {
     await runTeamCommand(args);
+  } catch (error) {
+    Object.assign(error as object, {
+      stdout: stdoutChunks.join(""),
+      stderr: stderrChunks.join(""),
+    });
+    throw error;
   } finally {
     process.stdout.write = originalWrite;
+    process.stderr.write = originalStderrWrite;
     process.chdir(originalCwd);
     if (originalProjectRoot === undefined) {
       delete process.env.AGMO_PROJECT_ROOT;
@@ -43,7 +68,16 @@ async function captureTeamCommandText(
     }
   }
 
-  return stdoutChunks.join("");
+  return { stdout: stdoutChunks.join(""), stderr: stderrChunks.join("") };
+}
+
+function captureWrite(chunks: string[]): Pick<NodeJS.WriteStream, "write"> {
+  return {
+    write: ((chunk: string | Uint8Array) => {
+      chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
+      return true;
+    }) as NodeJS.WriteStream["write"],
+  };
 }
 
 test("runTeamCommand status prints current ad hoc JSON shape for an existing team", async () => {
@@ -144,6 +178,103 @@ test("runTeamCommand shutdown-ack prints current ad hoc JSON shape after shutdow
   });
 });
 
+test("runTeamCommand delete refuses active teams without force", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-delete-active-"));
+  const teamName = "cli-delete-active-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Refuse active delete",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommand(["delete", teamName], tempRoot);
+
+  assert.equal(output.command, "team delete");
+  assert.equal(output.team_name, teamName);
+  assert.equal(output.status, "refused_active");
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), true);
+  assert.equal(existsSync(resolveTeamWorktreeRoot(teamName, tempRoot)), true);
+});
+
+test("runTeamCommand delete dry-run reports intended deletion without removing state or worktrees", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-delete-dry-run-"));
+  const teamName = "cli-delete-dry-run-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Dry-run team delete",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+  await shutdownTeamRuntime(teamName, { graceMs: 0 }, tempRoot);
+
+  const output = await captureTeamCommand(["delete", teamName, "--dry-run"], tempRoot);
+
+  assert.equal(output.command, "team delete");
+  assert.equal(output.status, "would_delete");
+  assert.equal((output.state_removal as { status?: string }).status, "would_remove");
+  assert.equal((output.worktree_cleanup as { status?: string }).status, "would_remove");
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), true);
+  assert.equal(existsSync(resolveTeamWorktreeRoot(teamName, tempRoot)), true);
+});
+
+test("runTeamCommand delete force shuts down active teams and removes state safely", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-delete-force-"));
+  const teamName = "cli-delete-force-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Force delete active team",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommand(["delete", teamName, "--force"], tempRoot);
+
+  assert.equal(output.command, "team delete");
+  assert.equal(output.status, "deleted");
+  assert.ok(output.shutdown && typeof output.shutdown === "object");
+  assert.equal((output.state_removal as { status?: string }).status, "removed");
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), false);
+  assert.equal(existsSync(resolveTeamWorktreeRoot(teamName, tempRoot)), false);
+});
+
+test("runTeamCommand delete keep-worktrees removes state but preserves owned worktree root", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-delete-keep-worktrees-"));
+  const teamName = "cli-delete-keep-worktrees-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Delete team but keep worktrees",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+  await shutdownTeamRuntime(teamName, { graceMs: 0 }, tempRoot);
+
+  const output = await captureTeamCommand(["delete", teamName, "--keep-worktrees"], tempRoot);
+
+  assert.equal(output.command, "team delete");
+  assert.equal(output.status, "deleted");
+  assert.equal((output.worktree_cleanup as { status?: string }).status, "skipped");
+  assert.equal((output.state_removal as { status?: string }).status, "removed");
+  assert.equal(existsSync(resolveTeamDir(teamName, tempRoot)), false);
+  assert.equal(existsSync(resolveTeamWorktreeRoot(teamName, tempRoot)), true);
+});
+
 test("runTeamCommand hud supports preset width max-lines and no-color flags", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-flags-"));
   const teamName = "cli-hud-flags-team";
@@ -189,6 +320,39 @@ test("runTeamCommand hud width rejects non-integer values", async () => {
   await assert.rejects(
     () => runTeamCommand(["hud", "demo", "--width", "auto"]),
     /--width must be an integer/,
+  );
+});
+
+test("runTeamCommand hud accepts sidecar preset and rejects invalid presets", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-sidecar-"));
+  const teamName = "cli-hud-sidecar-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Render HUD sidecar preset",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommandText(
+    ["hud", teamName, "--preset", "sidecar", "--width", "90", "--max-lines", "6", "--no-color"],
+    tempRoot,
+  );
+
+  assert.match(output, /AGMO sidecar/);
+  assert.match(output, /workers worker-1:/);
+  assert.match(output, /task /);
+  assert.doesNotMatch(output, /\x1b\[/);
+  for (const line of output.trimEnd().split("\n")) {
+    assert.ok(line.length <= 90, line);
+  }
+
+  await assert.rejects(
+    () => runTeamCommand(["hud", teamName, "--preset", "wide"]),
+    /--preset must be one of: minimal, sidecar, focused, full/,
   );
 });
 
@@ -256,6 +420,176 @@ test("runTeamCommand hud watch includes refresh footer", async () => {
   }
 });
 
+test("runTeamCommand hud non-watch output remains footer-free", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-no-watch-footer-"));
+  const teamName = "cli-hud-no-watch-footer-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Render HUD without watch footer",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommandText(
+    ["hud", teamName, "--width", "80", "--no-color"],
+    tempRoot,
+  );
+
+  assert.match(output, /AGMO HUD/);
+  assert.doesNotMatch(output, /watch refresh=/);
+  assert.doesNotMatch(output, /\x1b\[H\x1b\[2J/);
+});
+
+test("runTeamCommand hud non-watch render failure remains stderr-free", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-no-watch-error-"));
+  let output: { stdout: string; stderr: string } | undefined;
+
+  await assert.rejects(
+    async () => {
+      try {
+        output = await captureTeamCommandOutput(
+          ["hud", "missing-team", "--width", "80", "--no-color"],
+          tempRoot,
+        );
+      } catch (error) {
+        output = {
+          stdout: (error as { stdout?: string }).stdout ?? "",
+          stderr: (error as { stderr?: string }).stderr ?? "",
+        };
+        throw error;
+      }
+    },
+    /team not found: missing-team/,
+  );
+
+  assert.equal(output?.stdout ?? "", "");
+  assert.equal(output?.stderr ?? "", "");
+});
+
+test("runTeamHudWatchLoop suppresses duplicate clear-screen frames only in clear mode", async () => {
+  const renderFrame = async () => "same frame";
+  const sleepFn = async () => {};
+  const clearChunks: string[] = [];
+  const noClearChunks: string[] = [];
+  const stderrChunks: string[] = [];
+
+  await runTeamHudWatchLoop({
+    watch: true,
+    clearScreen: true,
+    iterations: 2,
+    intervalMs: 250,
+    renderFrame,
+    sleepFn,
+    streams: {
+      stdout: captureWrite(clearChunks),
+      stderr: captureWrite(stderrChunks),
+    },
+  });
+
+  await runTeamHudWatchLoop({
+    watch: true,
+    clearScreen: false,
+    iterations: 2,
+    intervalMs: 250,
+    renderFrame,
+    sleepFn,
+    streams: {
+      stdout: captureWrite(noClearChunks),
+      stderr: captureWrite(stderrChunks),
+    },
+  });
+
+  assert.equal(clearChunks.join(""), "\x1b[H\x1b[2Jsame frame\n");
+  assert.equal(noClearChunks.join(""), "same frame\nsame frame\n");
+  assert.deepEqual(stderrChunks, []);
+});
+
+test("runTeamCommand hud watch render failure writes bounded stderr without partial clear frame", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-watch-error-"));
+  let output: { stdout: string; stderr: string } | undefined;
+
+  await assert.rejects(
+    async () => {
+      try {
+        output = await captureTeamCommandOutput(
+          [
+            "hud",
+            "missing-team",
+            "--watch",
+            "--iterations",
+            "1",
+            "--refresh-ms",
+            "250",
+            "--width",
+            "80",
+            "--no-color",
+          ],
+          tempRoot,
+        );
+      } catch (error) {
+        output = {
+          stdout: (error as { stdout?: string }).stdout ?? output?.stdout ?? "",
+          stderr: (error as { stderr?: string }).stderr ?? output?.stderr ?? "",
+        };
+        throw error;
+      }
+    },
+    /team not found: missing-team/,
+  );
+
+  assert.equal(output?.stdout ?? "", "");
+  assert.match(output?.stderr ?? "", /^watch render error: team not found: missing-team\n$/);
+  assert.ok((output?.stderr ?? "").length <= 201);
+  assert.doesNotMatch(output?.stdout ?? "", /\x1b\[H\x1b\[2J/);
+});
+
+test("runTeamHudWatchLoop unregisters SIGINT handler and stops cleanly", async () => {
+  const stdoutChunks: string[] = [];
+  const signalHandlers = new Set<() => void>();
+  const signalProcess = {
+    on: (signal: string, handler: () => void) => {
+      assert.equal(signal, "SIGINT");
+      signalHandlers.add(handler);
+      return signalProcess;
+    },
+    off: (signal: string, handler: () => void) => {
+      assert.equal(signal, "SIGINT");
+      signalHandlers.delete(handler);
+      return signalProcess;
+    },
+  };
+  let renders = 0;
+
+  await runTeamHudWatchLoop({
+    watch: true,
+    clearScreen: false,
+    iterations: 3,
+    intervalMs: 250,
+    renderFrame: async () => {
+      renders += 1;
+      return `frame ${renders}`;
+    },
+    sleepFn: async () => {
+      for (const handler of signalHandlers) {
+        handler();
+      }
+    },
+    streams: {
+      stdout: captureWrite(stdoutChunks),
+      stderr: captureWrite([]),
+    },
+    signalProcess,
+  });
+
+  assert.equal(renders, 1);
+  assert.equal(stdoutChunks.join(""), "frame 1\n");
+  assert.equal(signalHandlers.size, 0);
+});
+
 test("runTeamCommand layout commands print stable JSON contracts for non-tmux teams", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-layout-"));
   const teamName = "cli-layout-team";
@@ -277,6 +611,7 @@ test("runTeamCommand layout commands print stable JSON contracts for non-tmux te
   assert.equal(status.dry_run, false);
   assert.equal(status.layout_health, "skipped");
   assert.ok(status.panes && typeof status.panes === "object");
+  assert.equal(status.layout_plan, undefined);
   assert.deepEqual(status.recommended_actions, []);
 
   const repair = await captureTeamCommand(

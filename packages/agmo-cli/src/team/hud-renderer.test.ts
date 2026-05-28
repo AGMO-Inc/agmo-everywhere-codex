@@ -116,6 +116,31 @@ test("renderTeamHud supports presets, clipping, and no-color output", () => {
   }
 });
 
+test("renderTeamHud sidecar is compact, sanitized, and action-oriented", () => {
+  const rendered = renderTeamHud(context(), {
+    preset: "sidecar",
+    maxWidth: 82,
+    maxLines: 6,
+    color: "never"
+  });
+  const lines = rendered.trimEnd().split("\n");
+
+  assert.ok(lines.length <= 6);
+  assert.match(rendered, /AGMO sidecar/);
+  assert.match(rendered, /team=demo\?team/);
+  assert.match(rendered, /health workers h\/s\/d=1\/0\/0/);
+  assert.match(rendered, /tmux leader=live hud=live layout=ok/);
+  assert.match(rendered, /dispatch=1/);
+  assert.match(rendered, /delta=0/);
+  assert.match(rendered, /workers worker-1:h\/working open=1 t=task-1 d=1/);
+  assert.match(rendered, /task task-1:in_progress owner=worker-1 finish renderer/);
+  assert.match(rendered, /actions retry-dispatch:warning/);
+  assert.doesNotMatch(rendered, /\x1b\[/);
+  for (const line of lines) {
+    assert.ok(visibleLength(line) <= 82, line);
+  }
+});
+
 test("renderTeamHud sorts structured actions and limits focused commands to safe actions", () => {
   const testContext = context();
   testContext.suggestedActions = [
