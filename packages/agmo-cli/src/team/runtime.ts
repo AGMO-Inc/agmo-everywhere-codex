@@ -27,7 +27,8 @@ import {
 import {
   buildTeamHudRenderContext,
   renderTeamHud,
-  type AgmoTeamHudPreset
+  type AgmoTeamHudPreset,
+  type TeamHudSuggestedAction
 } from "./hud-renderer.js";
 import type { AgmoColorMode } from "./terminal-format.js";
 import type { TeamLayoutPreset } from "./layout-planner.js";
@@ -2781,6 +2782,7 @@ export async function buildLeaderHudView(
     width?: number;
     maxLines?: number;
     color?: AgmoColorMode;
+    showLegend?: boolean;
   } = {},
   cwd = process.cwd()
 ): Promise<{
@@ -2817,29 +2819,83 @@ export async function buildLeaderHudView(
   const activeLeaderAlerts = Object.values(status.leader_escalations?.by_key ?? {}).filter(
     (entry) => Boolean(entry.alert_at)
   ).length;
-  const topActions: string[] = [];
+  const suggestedActions: TeamHudSuggestedAction[] = [];
 
   if (snapshot.dead_workers > 0 || snapshot.stale_workers > 0) {
-    topActions.push("nudge");
+    suggestedActions.push({
+      key: "nudge",
+      label: "Nudge workers",
+      reason: `${snapshot.stale_workers} stale, ${snapshot.dead_workers} dead`,
+      severity: "warning"
+    });
   }
   if (snapshot.workers.some((worker) => worker.claim_at_risk)) {
-    topActions.push("reclaim");
+    suggestedActions.push({
+      key: "reclaim",
+      label: "Reclaim task claims",
+      reason: "one or more workers have claims at risk",
+      severity: "critical"
+    });
   }
   if (openLoadDelta > 1) {
-    topActions.push("rebalance");
+    suggestedActions.push({
+      key: "task-rebalance",
+      label: "Rebalance tasks",
+      reason: `open task load delta is ${openLoadDelta}`,
+      severity: "warning"
+    });
   }
   if (pendingDispatch > 0) {
-    topActions.push("retry-dispatch");
+    suggestedActions.push({
+      key: "retry-dispatch",
+      label: "Retry dispatch",
+      reason: `${pendingDispatch} dispatch request${pendingDispatch === 1 ? "" : "s"} pending`,
+      severity: "warning"
+    });
   }
   if (activeLeaderAlerts > 0) {
-    topActions.push("alert");
+    suggestedActions.push({
+      key: "alert",
+      label: "Review alerts",
+      reason: `${activeLeaderAlerts} leader alert${activeLeaderAlerts === 1 ? "" : "s"} active`,
+      severity: "info"
+    });
   }
   if (isUnavailableTmuxPane(snapshot.leader)) {
-    topActions.push("leader-orphan");
+    suggestedActions.push({
+      key: "leader-orphan",
+      label: "Leader pane orphaned",
+      reason: "leader tmux pane is missing or orphaned",
+      severity: "critical"
+    });
   }
   if (isUnavailableTmuxPane(snapshot.hud)) {
-    topActions.push("repair-hud");
+    suggestedActions.push({
+      key: "repair-hud",
+      label: "Repair HUD pane",
+      reason: "HUD tmux pane is missing or orphaned",
+      severity: "critical"
+    });
   }
+  if (snapshot.layout_health === "repairable" || snapshot.tmux_health?.layout === "repairable") {
+    suggestedActions.push({
+      key: "layout-repair",
+      label: "Repair layout",
+      reason: "tmux layout health is repairable",
+      severity: "critical"
+    });
+  } else if (
+    snapshot.layout_health === "degraded" ||
+    snapshot.tmux_health?.layout === "degraded"
+  ) {
+    suggestedActions.push({
+      key: "layout-rebalance",
+      label: "Rebalance layout",
+      reason: "tmux layout health is degraded",
+      severity: "warning"
+    });
+  }
+  const topActions = suggestedActions.map((action) => action.key);
 
   const text = renderTeamHud(
     buildTeamHudRenderContext(normalizedTeamName, snapshot, status, {
@@ -2848,13 +2904,15 @@ export async function buildLeaderHudView(
       activeLeaderAlerts,
       openLoads,
       openLoadDelta,
-      topActions
+      topActions,
+      suggestedActions
     }),
     {
       preset: options.preset,
       maxWidth: options.width,
       maxLines: options.maxLines,
-      color: options.color
+      color: options.color,
+      showLegend: options.showLegend
     }
   ).replace(/\n$/, "");
 

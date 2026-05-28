@@ -181,6 +181,81 @@ test("runTeamCommand hud supports preset width max-lines and no-color flags", as
   }
 });
 
+test("runTeamCommand hud width rejects non-integer values", async () => {
+  await assert.rejects(
+    () => runTeamCommand(["hud", "demo", "--width", "80px"]),
+    /--width must be an integer/,
+  );
+  await assert.rejects(
+    () => runTeamCommand(["hud", "demo", "--width", "auto"]),
+    /--width must be an integer/,
+  );
+});
+
+test("runTeamCommand hud supports legend flag without enabling it by default", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-legend-"));
+  const teamName = "cli-hud-legend-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Render HUD legend with CLI flag",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const defaultOutput = await captureTeamCommandText(
+    ["hud", teamName, "--preset", "focused", "--width", "120", "--no-color"],
+    tempRoot,
+  );
+  const legendOutput = await captureTeamCommandText(
+    ["hud", teamName, "--preset", "focused", "--width", "120", "--legend", "--no-color"],
+    tempRoot,
+  );
+
+  assert.doesNotMatch(defaultOutput, /Legend:/);
+  assert.match(legendOutput, /Legend: h=healthy s=stale d=dead/);
+});
+
+test("runTeamCommand hud watch includes refresh footer", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-hud-watch-"));
+  const teamName = "cli-hud-watch-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Render HUD watch footer",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const output = await captureTeamCommandText(
+    [
+      "hud",
+      teamName,
+      "--watch",
+      "--iterations",
+      "1",
+      "--no-clear",
+      "--refresh-ms",
+      "250",
+      "--width",
+      "80",
+      "--no-color",
+    ],
+    tempRoot,
+  );
+
+  assert.match(output, /watch refresh=250ms checked=/);
+  for (const line of output.trimEnd().split("\n")) {
+    assert.ok(line.length <= 80, line);
+  }
+});
+
 test("runTeamCommand layout commands print stable JSON contracts for non-tmux teams", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-layout-"));
   const teamName = "cli-layout-team";
