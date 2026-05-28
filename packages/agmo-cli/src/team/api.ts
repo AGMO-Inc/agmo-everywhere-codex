@@ -17,6 +17,8 @@ import {
   appendTeamApiEvent,
   readTeamApiEvents,
   awaitTeamApiEvent,
+  readTeamApiMonitorSnapshot,
+  writeTeamApiMonitorSnapshot,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
@@ -40,6 +42,8 @@ export type TeamApiOperation =
   | "append-event"
   | "read-events"
   | "await-event"
+  | "read-monitor-snapshot"
+  | "write-monitor-snapshot"
   | "read-task"
   | "list-tasks"
   | "get-summary"
@@ -380,6 +384,17 @@ function optionalRecord(input: TeamApiInput, fieldName: string): Record<string, 
     };
   }
   return value as Record<string, unknown>;
+}
+
+function requiredRecord(input: TeamApiInput, fieldName: string): Record<string, unknown> | TeamApiError {
+  const value = optionalRecord(input, fieldName);
+  if (value === undefined) {
+    return {
+      code: "invalid_input",
+      message: `${fieldName} is required`
+    };
+  }
+  return value;
 }
 
 function requiredTaskStatus(input: TeamApiInput, fieldName: string): AgmoTeamTaskStatus | TeamApiError {
@@ -830,6 +845,31 @@ export async function executeTeamApiOperation(
         cwd
       );
       return dataEnvelope(operation, result);
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "read-monitor-snapshot") {
+    try {
+      return dataEnvelope(operation, await readTeamApiMonitorSnapshot(teamName, cwd));
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "write-monitor-snapshot") {
+    const snapshot = requiredRecord(input, "snapshot");
+    if (isTeamApiError(snapshot)) {
+      return buildTeamApiErrorEnvelope(operation, snapshot.code, snapshot.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await writeTeamApiMonitorSnapshot(teamName, snapshot, cwd)
+      );
     } catch (error) {
       const mapped = mapRuntimeError(error);
       return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);

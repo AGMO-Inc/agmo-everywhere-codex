@@ -9,6 +9,7 @@ import {
   resolveTeamDir,
   resolveTeamEventsPath,
   resolveTeamManifestPath,
+  resolveTeamMonitorSnapshotPath,
   resolveWorkerHeartbeatPath,
   resolveWorkerIdentityPath,
   resolveWorkerInboxPath,
@@ -1025,6 +1026,171 @@ test("runTeamCommand team api rejects invalid event read filters", async () => {
   assert.deepEqual(pollOutput.error, {
     code: "invalid_input",
     message: "poll_ms must be a non-negative integer when provided",
+  });
+});
+
+test("runTeamCommand team api reads and writes monitor snapshots", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-monitor-snapshot-"));
+  const teamName = "cli-api-monitor-snapshot-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Expose monitor snapshot API state",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const missing = await captureTeamCommand(
+    [
+      "api",
+      "read-monitor-snapshot",
+      "--input",
+      JSON.stringify({ team_name: teamName }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(missing, "read-monitor-snapshot");
+  const missingData = missing.data as {
+    team_name?: string;
+    found?: boolean;
+    snapshot?: unknown;
+  };
+  assert.equal(missingData.team_name, teamName);
+  assert.equal(missingData.found, false);
+  assert.equal(missingData.snapshot, null);
+
+  const snapshot = {
+    checked_at: "2026-05-28T00:00:00.000Z",
+    workerStateByName: { "worker-1": "idle" },
+    workerAliveByName: { "worker-1": true },
+    taskStatusById: { "1": "pending" },
+  };
+  const write = await captureTeamCommand(
+    [
+      "api",
+      "write-monitor-snapshot",
+      "--input",
+      JSON.stringify({ team_name: teamName, snapshot }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(write, "write-monitor-snapshot");
+  const writeData = write.data as {
+    team_name?: string;
+    written?: boolean;
+    snapshot?: Record<string, unknown>;
+  };
+  assert.equal(writeData.team_name, teamName);
+  assert.equal(writeData.written, true);
+  assert.deepEqual(writeData.snapshot, {
+    ...snapshot,
+    team_name: teamName,
+  });
+  assert.deepEqual(
+    JSON.parse(await readFile(resolveTeamMonitorSnapshotPath(teamName, tempRoot), "utf-8")),
+    writeData.snapshot,
+  );
+
+  const read = await captureTeamCommand(
+    [
+      "api",
+      "read-monitor-snapshot",
+      "--input",
+      JSON.stringify({ team_name: teamName }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(read, "read-monitor-snapshot");
+  const readData = read.data as {
+    team_name?: string;
+    found?: boolean;
+    snapshot?: Record<string, unknown>;
+  };
+  assert.equal(readData.team_name, teamName);
+  assert.equal(readData.found, true);
+  assert.deepEqual(readData.snapshot, writeData.snapshot);
+
+  const eventLines = (await readFile(resolveTeamEventsPath(teamName, tempRoot), "utf-8"))
+    .trim()
+    .split("\n");
+  const persistedEvent = JSON.parse(eventLines[eventLines.length - 1] ?? "{}") as Record<string, unknown>;
+  assert.equal(persistedEvent.type, "team_monitor_snapshot");
+  assert.equal(persistedEvent.source, "team_api");
+  assert.equal(persistedEvent.snapshot_checked_at, snapshot.checked_at);
+});
+
+test("runTeamCommand team api rejects invalid monitor snapshot writes", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-monitor-snapshot-invalid-"));
+  const teamName = "cli-api-monitor-snapshot-invalid-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Reject invalid monitor snapshot API writes",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const missingSnapshotResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-monitor-snapshot",
+      "--input",
+      JSON.stringify({ team_name: teamName }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const missingSnapshot = JSON.parse(missingSnapshotResult.stdout) as Record<string, unknown>;
+  assert.equal(missingSnapshotResult.exitCode, 1);
+  assertMachineEnvelope(missingSnapshot, "write-monitor-snapshot", false);
+  assert.deepEqual(missingSnapshot.error, {
+    code: "invalid_input",
+    message: "snapshot is required",
+  });
+
+  const arraySnapshotResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-monitor-snapshot",
+      "--input",
+      JSON.stringify({ team_name: teamName, snapshot: [] }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const arraySnapshot = JSON.parse(arraySnapshotResult.stdout) as Record<string, unknown>;
+  assert.equal(arraySnapshotResult.exitCode, 1);
+  assertMachineEnvelope(arraySnapshot, "write-monitor-snapshot", false);
+  assert.deepEqual(arraySnapshot.error, {
+    code: "invalid_input",
+    message: "snapshot must be an object when provided",
+  });
+
+  const mismatchResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "write-monitor-snapshot",
+      "--input",
+      JSON.stringify({ team_name: teamName, snapshot: { team_name: "other-team" } }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const mismatch = JSON.parse(mismatchResult.stdout) as Record<string, unknown>;
+  assert.equal(mismatchResult.exitCode, 1);
+  assertMachineEnvelope(mismatch, "write-monitor-snapshot", false);
+  assert.deepEqual(mismatch.error, {
+    code: "runtime_error",
+    message: `snapshot team_name must match team_name: ${teamName}`,
   });
 });
 

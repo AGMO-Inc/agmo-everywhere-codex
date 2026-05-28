@@ -149,6 +149,8 @@ const TEAM_API_OPERATION_NAMES = [
   "append-event",
   "read-events",
   "await-event",
+  "read-monitor-snapshot",
+  "write-monitor-snapshot",
   "read-task",
   "list-tasks",
   "get-summary",

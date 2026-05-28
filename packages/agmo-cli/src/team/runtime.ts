@@ -6246,6 +6246,130 @@ export async function awaitTeamApiEvent(
   };
 }
 
+type TeamApiMonitorSnapshotRecord = Record<string, unknown> & {
+  team_name: string;
+  checked_at: string;
+};
+
+function normalizeTeamApiMonitorSnapshot(
+  teamName: string,
+  raw: unknown
+): TeamApiMonitorSnapshotRecord {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("snapshot must be an object");
+  }
+
+  const snapshot = raw as Record<string, unknown>;
+  const snapshotTeamName = cleanString(snapshot.team_name);
+  const snapshotTeam = cleanString(snapshot.team);
+  if (snapshotTeamName && snapshotTeamName !== teamName) {
+    throw new Error(`snapshot team_name must match team_name: ${teamName}`);
+  }
+  if (snapshotTeam && snapshotTeam !== teamName) {
+    throw new Error(`snapshot team must match team_name: ${teamName}`);
+  }
+
+  return {
+    ...snapshot,
+    team_name: teamName,
+    checked_at: cleanString(snapshot.checked_at) ?? nowIso()
+  };
+}
+
+export async function readTeamApiMonitorSnapshot(
+  teamName: string,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+
+  const path = resolveTeamMonitorSnapshotPath(normalizedTeamName, cwd);
+  const snapshot = await readJsonFile<Record<string, unknown>>(path);
+  if (!snapshot) {
+    return {
+      team_name: normalizedTeamName,
+      path,
+      found: false,
+      snapshot: null
+    };
+  }
+
+  return {
+    team_name: normalizedTeamName,
+    path,
+    found: true,
+    snapshot: normalizeTeamApiMonitorSnapshot(normalizedTeamName, snapshot)
+  };
+}
+
+export async function writeTeamApiMonitorSnapshot(
+  teamName: string,
+  snapshot: Record<string, unknown>,
+  cwd = process.cwd()
+): Promise<Record<string, unknown>> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const path = resolveTeamMonitorSnapshotPath(normalizedTeamName, cwd);
+  return await withTeamStateLock(
+    normalizedTeamName,
+    "team-state",
+    "write monitor snapshot",
+    async () => {
+      const status = await readTeamStatus(normalizedTeamName, cwd);
+      if (!status) {
+        throw new Error(`team not found: ${normalizedTeamName}`);
+      }
+
+      const nextSnapshot = normalizeTeamApiMonitorSnapshot(normalizedTeamName, snapshot);
+      await Promise.all([
+        writeJsonFile(path, nextSnapshot),
+        writeEvent(
+          normalizedTeamName,
+          {
+            timestamp: nowIso(),
+            type: "team_monitor_snapshot",
+            team_name: normalizedTeamName,
+            source: "team_api",
+            snapshot_checked_at: nextSnapshot.checked_at,
+            stale_workers:
+              typeof nextSnapshot.stale_workers === "number"
+                ? nextSnapshot.stale_workers
+                : undefined,
+            dead_workers:
+              typeof nextSnapshot.dead_workers === "number"
+                ? nextSnapshot.dead_workers
+                : undefined,
+            leader_health:
+              nextSnapshot.leader &&
+              typeof nextSnapshot.leader === "object" &&
+              "health" in nextSnapshot.leader
+                ? (nextSnapshot.leader as { health?: unknown }).health
+                : undefined,
+            hud_health:
+              nextSnapshot.hud &&
+              typeof nextSnapshot.hud === "object" &&
+              "health" in nextSnapshot.hud
+                ? (nextSnapshot.hud as { health?: unknown }).health
+                : undefined,
+            layout_health: nextSnapshot.layout_health
+          },
+          cwd
+        )
+      ]);
+
+      return {
+        team_name: normalizedTeamName,
+        path,
+        written: true,
+        snapshot: nextSnapshot
+      };
+    },
+    cwd
+  );
+}
+
 export async function reportWorkerStatus(
   teamName: string,
   workerName: string,
