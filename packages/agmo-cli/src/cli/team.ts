@@ -130,21 +130,30 @@ function parseColorMode(args: string[]): "auto" | "always" | "never" | undefined
   return undefined;
 }
 
+const TEAM_API_OPERATION_NAMES = [
+  "send-message",
+  "broadcast",
+  "mailbox-list",
+  "mailbox-mark-delivered",
+  "mailbox-mark-notified",
+  "create-task",
+  "update-task",
+  "release-task-claim",
+  "read-task",
+  "list-tasks",
+  "get-summary",
+  "claim-task",
+  "transition-task-status"
+] as const satisfies readonly TeamApiOperation[];
+
+const TEAM_API_OPERATION_USAGE = TEAM_API_OPERATION_NAMES.join("|");
+
 function parseTeamApiOperation(value: string | undefined): TeamApiOperation {
-  if (
-    value === "create-task" ||
-    value === "update-task" ||
-    value === "release-task-claim" ||
-    value === "read-task" ||
-    value === "list-tasks" ||
-    value === "get-summary" ||
-    value === "claim-task" ||
-    value === "transition-task-status"
-  ) {
-    return value;
+  if (TEAM_API_OPERATION_NAMES.includes(value as TeamApiOperation)) {
+    return value as TeamApiOperation;
   }
   throw new Error(
-    "usage: agmo team api <create-task|update-task|release-task-claim|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json"
+    `usage: agmo team api <${TEAM_API_OPERATION_USAGE}> --input '<json>' --json`
   );
 }
 
@@ -1279,7 +1288,7 @@ export async function runTeamCommand(args: string[]): Promise<void> {
     default:
       console.log(`Usage:
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
-  agmo team api <create-task|update-task|release-task-claim|read-task|list-tasks|get-summary|claim-task|transition-task-status> --input '<json>' --json
+  agmo team api <${TEAM_API_OPERATION_USAGE}> --input '<json>' --json
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
   agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]

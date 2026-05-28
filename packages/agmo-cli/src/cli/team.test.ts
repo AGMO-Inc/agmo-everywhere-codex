@@ -234,6 +234,237 @@ test("runTeamCommand team api supports read-only success operations", async () =
   );
 });
 
+test("runTeamCommand team api sends, lists, and marks mailbox messages delivered", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-mailbox-"));
+  const teamName = "cli-api-mailbox-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 1,
+      task: "Exercise mailbox message API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const send = await captureTeamCommand(
+    [
+      "api",
+      "send-message",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        from_worker: "leader-fixed",
+        to_worker: "worker-1",
+        body: "Check the handoff note",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(send, "send-message");
+  assert.equal(send.command, "team api send-message");
+  const sendData = send.data as {
+    message?: {
+      message_id?: string;
+      from_worker?: string;
+      to_worker?: string;
+      body?: string;
+      delivered_at?: string;
+    };
+    dispatch?: {
+      message_id?: string;
+      dispatch_request_id?: string;
+      dispatch_status?: string;
+    };
+  };
+  assert.equal(sendData.message?.from_worker, "leader-fixed");
+  assert.equal(sendData.message?.to_worker, "worker-1");
+  assert.equal(sendData.message?.body, "Check the handoff note");
+  assert.equal(sendData.message?.message_id, sendData.dispatch?.message_id);
+  assert.equal(sendData.dispatch?.dispatch_status, "pending");
+
+  const list = await captureTeamCommand(
+    [
+      "api",
+      "mailbox-list",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(list, "mailbox-list");
+  const listData = list.data as {
+    worker?: string;
+    count?: number;
+    messages?: Array<{ message_id?: string; delivered_at?: string }>;
+  };
+  assert.equal(listData.worker, "worker-1");
+  assert.ok((listData.count ?? 0) >= 1);
+  assert.ok(
+    listData.messages?.some((message) => message.message_id === sendData.message?.message_id),
+  );
+
+  const delivered = await captureTeamCommand(
+    [
+      "api",
+      "mailbox-mark-delivered",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        message_id: sendData.message?.message_id,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(delivered, "mailbox-mark-delivered");
+  const deliveredData = delivered.data as {
+    updated?: boolean;
+    dispatch_request_id?: string | null;
+    dispatch_updated?: boolean;
+  };
+  assert.equal(deliveredData.updated, true);
+  assert.equal(deliveredData.dispatch_request_id, sendData.dispatch?.dispatch_request_id);
+  assert.equal(deliveredData.dispatch_updated, true);
+
+  const openList = await captureTeamCommand(
+    [
+      "api",
+      "mailbox-list",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        worker: "worker-1",
+        include_delivered: false,
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const openListData = openList.data as { count?: number; messages?: unknown[] };
+  assert.equal(
+    openListData.messages?.some(
+      (message) =>
+        Boolean(message) &&
+        typeof message === "object" &&
+        (message as { message_id?: string }).message_id === sendData.message?.message_id,
+    ),
+    false,
+  );
+});
+
+test("runTeamCommand team api broadcasts to all workers except the sender", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-broadcast-"));
+  const teamName = "cli-api-broadcast-team";
+
+  await startTeamRuntime(
+    {
+      teamName,
+      workerCount: 3,
+      task: "Exercise mailbox broadcast API",
+      mode: "interactive",
+    },
+    tempRoot,
+  );
+
+  const broadcast = await captureTeamCommand(
+    [
+      "api",
+      "broadcast",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        from_worker: "worker-1",
+        body: "Shared coordination note",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  assertMachineEnvelope(broadcast, "broadcast");
+  assert.equal(broadcast.command, "team api broadcast");
+  const broadcastData = broadcast.data as {
+    count?: number;
+    messages?: Array<{ worker_name?: string; from_worker?: string }>;
+  };
+  assert.equal(broadcastData.count, 2);
+  assert.deepEqual(
+    broadcastData.messages?.map((message) => message.worker_name),
+    ["worker-2", "worker-3"],
+  );
+  assert.deepEqual(
+    broadcastData.messages?.map((message) => message.from_worker),
+    ["worker-1", "worker-1"],
+  );
+
+  const senderMailbox = await captureTeamCommand(
+    [
+      "api",
+      "mailbox-list",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-1" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const senderMailboxData = senderMailbox.data as {
+    messages?: Array<{ body?: string }>;
+  };
+  assert.equal(
+    senderMailboxData.messages?.some((message) => message.body === "Shared coordination note"),
+    false,
+  );
+
+  const recipientMailbox = await captureTeamCommand(
+    [
+      "api",
+      "mailbox-list",
+      "--input",
+      JSON.stringify({ team_name: teamName, worker: "worker-2" }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const recipientMailboxData = recipientMailbox.data as {
+    count?: number;
+    messages?: Array<{ from_worker?: string; body?: string }>;
+  };
+  assert.ok((recipientMailboxData.count ?? 0) >= 1);
+  assert.ok(
+    recipientMailboxData.messages?.some(
+      (message) =>
+        message.from_worker === "worker-1" &&
+        message.body === "Shared coordination note",
+    ),
+  );
+
+  const invalidSenderResult = await captureTeamCommandOutput(
+    [
+      "api",
+      "broadcast",
+      "--input",
+      JSON.stringify({
+        team_name: teamName,
+        from_worker: "worker-404",
+        body: "Invalid sender",
+      }),
+      "--json",
+    ],
+    tempRoot,
+  );
+  const invalidSender = JSON.parse(invalidSenderResult.stdout) as Record<string, unknown>;
+  assert.equal(invalidSenderResult.exitCode, 1);
+  assertMachineEnvelope(invalidSender, "broadcast", false);
+  assert.deepEqual(invalidSender.error, {
+    code: "worker_not_found",
+    message: "worker not found: worker-404",
+  });
+});
+
 test("runTeamCommand team api creates tasks visible to list and read", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-api-create-"));
   const teamName = "cli-api-create-team";

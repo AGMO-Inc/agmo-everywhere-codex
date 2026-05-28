@@ -1,16 +1,26 @@
 import { machineJsonEnvelope } from "../utils/machine-json.js";
 import {
   claimTaskForWorker,
+  broadcastWorkerMessage,
   completeTaskForWorker,
   createTeamTask,
   failTaskForWorker,
+  listWorkerMailboxMessages,
+  markWorkerMailboxMessageDelivered,
+  markWorkerMailboxMessageNotified,
   releaseTaskClaimForWorker,
+  sendWorkerMessage,
   updateTeamTask,
   readTeamStatus
 } from "./runtime.js";
 import type { AgmoTeamTaskStatus } from "./state/tasks.js";
 
 export type TeamApiOperation =
+  | "send-message"
+  | "broadcast"
+  | "mailbox-list"
+  | "mailbox-mark-delivered"
+  | "mailbox-mark-notified"
   | "create-task"
   | "update-task"
   | "release-task-claim"
@@ -29,6 +39,7 @@ export type TeamApiErrorCode =
   | "claim_conflict"
   | "invalid_transition"
   | "lease_expired"
+  | "worker_not_found"
   | "runtime_error";
 
 type TeamApiError = {
@@ -237,6 +248,9 @@ function mapRuntimeError(error: unknown): TeamApiError {
   if (/task not found/i.test(message)) {
     return { code: "task_not_found", message };
   }
+  if (/worker not found|worker identity not found/i.test(message)) {
+    return { code: "worker_not_found", message };
+  }
   if (/team not found/i.test(message)) {
     return { code: "team_not_found", message };
   }
@@ -265,6 +279,115 @@ export async function executeTeamApiOperation(
   const status = await readTeamStatus(teamName, cwd);
   if (!status) {
     return buildTeamApiErrorEnvelope(operation, "team_not_found", `team not found: ${teamName}`);
+  }
+
+  if (operation === "send-message") {
+    const fromWorker = requiredString(input, "from_worker");
+    const toWorker = requiredString(input, "to_worker");
+    const body = requiredString(input, "body");
+    if (isTeamApiError(fromWorker)) {
+      return buildTeamApiErrorEnvelope(operation, fromWorker.code, fromWorker.message);
+    }
+    if (isTeamApiError(toWorker)) {
+      return buildTeamApiErrorEnvelope(operation, toWorker.code, toWorker.message);
+    }
+    if (isTeamApiError(body)) {
+      return buildTeamApiErrorEnvelope(operation, body.code, body.message);
+    }
+    try {
+      const dispatch = await sendWorkerMessage(teamName, toWorker, body, cwd, { fromWorker });
+      const mailbox = await listWorkerMailboxMessages(teamName, toWorker, {}, cwd);
+      const message = mailbox.messages.find(
+        (entry) => entry.message_id === dispatch.message_id
+      );
+      if (!message) {
+        throw new Error(`send-message could not locate persisted mailbox message for ${fromWorker} -> ${toWorker}`);
+      }
+      return dataEnvelope(operation, {
+        message,
+        dispatch
+      });
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "broadcast") {
+    const fromWorker = requiredString(input, "from_worker");
+    const body = requiredString(input, "body");
+    if (isTeamApiError(fromWorker)) {
+      return buildTeamApiErrorEnvelope(operation, fromWorker.code, fromWorker.message);
+    }
+    if (isTeamApiError(body)) {
+      return buildTeamApiErrorEnvelope(operation, body.code, body.message);
+    }
+    try {
+      return dataEnvelope(operation, await broadcastWorkerMessage(teamName, fromWorker, body, cwd));
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "mailbox-list") {
+    const worker = requiredString(input, "worker");
+    const includeDelivered = optionalBoolean(input, "include_delivered");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(includeDelivered)) {
+      return buildTeamApiErrorEnvelope(operation, includeDelivered.code, includeDelivered.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await listWorkerMailboxMessages(teamName, worker, { includeDelivered }, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "mailbox-mark-delivered") {
+    const worker = requiredString(input, "worker");
+    const messageId = requiredString(input, "message_id");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(messageId)) {
+      return buildTeamApiErrorEnvelope(operation, messageId.code, messageId.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await markWorkerMailboxMessageDelivered(teamName, worker, messageId, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
+  }
+
+  if (operation === "mailbox-mark-notified") {
+    const worker = requiredString(input, "worker");
+    const messageId = requiredString(input, "message_id");
+    if (isTeamApiError(worker)) {
+      return buildTeamApiErrorEnvelope(operation, worker.code, worker.message);
+    }
+    if (isTeamApiError(messageId)) {
+      return buildTeamApiErrorEnvelope(operation, messageId.code, messageId.message);
+    }
+    try {
+      return dataEnvelope(
+        operation,
+        await markWorkerMailboxMessageNotified(teamName, worker, messageId, cwd)
+      );
+    } catch (error) {
+      const mapped = mapRuntimeError(error);
+      return buildTeamApiErrorEnvelope(operation, mapped.code, mapped.message);
+    }
   }
 
   if (operation === "create-task") {

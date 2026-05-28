@@ -4745,7 +4745,10 @@ export async function sendWorkerMessage(
   teamName: string,
   workerName: string,
   body: string,
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  options: {
+    fromWorker?: string;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const normalizedTeamName = sanitizeTeamName(teamName);
   const status = await readTeamStatus(normalizedTeamName, cwd);
@@ -4756,12 +4759,16 @@ export async function sendWorkerMessage(
   if (!status.config.worker_names.includes(workerName)) {
     throw new Error(`worker not found: ${workerName}`);
   }
+  const fromWorker = options.fromWorker ?? "leader-fixed";
+  if (fromWorker !== "leader-fixed" && !status.config.worker_names.includes(fromWorker)) {
+    throw new Error(`worker not found: ${fromWorker}`);
+  }
 
   const timestamp = nowIso();
   const identity = await readWorkerIdentity(normalizedTeamName, workerName, cwd);
   const message: AgmoMailboxMessage = {
     message_id: createMessageId(),
-    from_worker: "leader-fixed",
+    from_worker: fromWorker,
     to_worker: workerName,
     body,
     created_at: timestamp
@@ -4826,9 +4833,261 @@ export async function sendWorkerMessage(
   return {
     team_name: normalizedTeamName,
     worker_name: workerName,
+    from_worker: message.from_worker,
     message_id: message.message_id,
     dispatch_request_id: request.request_id,
     dispatch_status: request.status
+  };
+}
+
+export async function broadcastWorkerMessage(
+  teamName: string,
+  fromWorker: string,
+  body: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  from_worker: string;
+  count: number;
+  messages: Record<string, unknown>[];
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (fromWorker !== "leader-fixed" && !status.config.worker_names.includes(fromWorker)) {
+    throw new Error(`worker not found: ${fromWorker}`);
+  }
+
+  const messages: Record<string, unknown>[] = [];
+  for (const workerName of status.config.worker_names) {
+    if (workerName === fromWorker) {
+      continue;
+    }
+    messages.push(
+      await sendWorkerMessage(normalizedTeamName, workerName, body, cwd, { fromWorker })
+    );
+  }
+
+  return {
+    team_name: normalizedTeamName,
+    from_worker: fromWorker,
+    count: messages.length,
+    messages
+  };
+}
+
+export async function listWorkerMailboxMessages(
+  teamName: string,
+  workerName: string,
+  options: {
+    includeDelivered?: boolean;
+  } = {},
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  worker: string;
+  count: number;
+  messages: AgmoMailboxMessage[];
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.config.worker_names.includes(workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const allMessages = status.mailbox[workerName] ?? [];
+  const messages = options.includeDelivered === false
+    ? allMessages.filter((message) => !message.delivered_at)
+    : allMessages;
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    count: messages.length,
+    messages
+  };
+}
+
+function findLatestDispatchRequestForMessage(
+  requests: AgmoDispatchRequest[],
+  workerName: string,
+  messageId: string
+): AgmoDispatchRequest | undefined {
+  return requests
+    .filter((request) => request.to_worker === workerName && request.message_id === messageId)
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))[0];
+}
+
+export async function markWorkerMailboxMessageNotified(
+  teamName: string,
+  workerName: string,
+  messageId: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  worker: string;
+  message_id: string;
+  notified: boolean;
+  dispatch_request_id: string | null;
+  dispatch_updated: boolean;
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.config.worker_names.includes(workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const message = (status.mailbox[workerName] ?? []).find((entry) => entry.message_id === messageId);
+  if (!message) {
+    return {
+      team_name: normalizedTeamName,
+      worker: workerName,
+      message_id: messageId,
+      notified: false,
+      dispatch_request_id: null,
+      dispatch_updated: false
+    };
+  }
+
+  const timestamp = nowIso();
+  const requests = await readDispatchRequests(normalizedTeamName, cwd);
+  const dispatch = findLatestDispatchRequestForMessage(requests, workerName, messageId);
+  let dispatchUpdated = false;
+
+  if (dispatch && dispatch.status !== "notified" && dispatch.status !== "delivered") {
+    dispatch.status = "notified";
+    dispatch.notified_at = dispatch.notified_at ?? timestamp;
+    dispatch.failed_at = undefined;
+    dispatchUpdated = true;
+  }
+
+  await Promise.all([
+    updateMailboxMessage(
+      normalizedTeamName,
+      workerName,
+      messageId,
+      { notified_at: message.notified_at ?? timestamp },
+      cwd
+    ),
+    dispatchUpdated
+      ? writeDispatchRequests(normalizedTeamName, requests, cwd)
+      : Promise.resolve(),
+    writeEvent(
+      normalizedTeamName,
+      {
+        timestamp,
+        type: "mailbox_message_notified",
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        message_id: messageId,
+        dispatch_request_id: dispatch?.request_id ?? null,
+        dispatch_updated: dispatchUpdated
+      },
+      cwd
+    )
+  ]);
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    message_id: messageId,
+    notified: true,
+    dispatch_request_id: dispatch?.request_id ?? null,
+    dispatch_updated: dispatchUpdated
+  };
+}
+
+export async function markWorkerMailboxMessageDelivered(
+  teamName: string,
+  workerName: string,
+  messageId: string,
+  cwd = process.cwd()
+): Promise<{
+  team_name: string;
+  worker: string;
+  message_id: string;
+  updated: boolean;
+  dispatch_request_id: string | null;
+  dispatch_updated: boolean;
+}> {
+  const normalizedTeamName = sanitizeTeamName(teamName);
+  const status = await readTeamStatus(normalizedTeamName, cwd);
+  if (!status) {
+    throw new Error(`team not found: ${normalizedTeamName}`);
+  }
+  if (!status.config.worker_names.includes(workerName)) {
+    throw new Error(`worker not found: ${workerName}`);
+  }
+
+  const message = (status.mailbox[workerName] ?? []).find((entry) => entry.message_id === messageId);
+  if (!message) {
+    return {
+      team_name: normalizedTeamName,
+      worker: workerName,
+      message_id: messageId,
+      updated: false,
+      dispatch_request_id: null,
+      dispatch_updated: false
+    };
+  }
+
+  const timestamp = nowIso();
+  const requests = await readDispatchRequests(normalizedTeamName, cwd);
+  const dispatch = findLatestDispatchRequestForMessage(requests, workerName, messageId);
+  let dispatchUpdated = false;
+
+  if (dispatch && dispatch.status !== "delivered") {
+    dispatch.status = "delivered";
+    dispatch.notified_at = dispatch.notified_at ?? timestamp;
+    dispatch.delivered_at = timestamp;
+    dispatch.failed_at = undefined;
+    dispatchUpdated = true;
+  }
+
+  await Promise.all([
+    updateMailboxMessage(
+      normalizedTeamName,
+      workerName,
+      messageId,
+      {
+        notified_at: message.notified_at ?? dispatch?.notified_at ?? timestamp,
+        delivered_at: message.delivered_at ?? timestamp
+      },
+      cwd
+    ),
+    dispatchUpdated
+      ? writeDispatchRequests(normalizedTeamName, requests, cwd)
+      : Promise.resolve(),
+    writeEvent(
+      normalizedTeamName,
+      {
+        timestamp,
+        type: "mailbox_message_delivered",
+        team_name: normalizedTeamName,
+        worker_name: workerName,
+        message_id: messageId,
+        dispatch_request_id: dispatch?.request_id ?? null,
+        dispatch_updated: dispatchUpdated
+      },
+      cwd
+    )
+  ]);
+
+  return {
+    team_name: normalizedTeamName,
+    worker: workerName,
+    message_id: messageId,
+    updated: true,
+    dispatch_request_id: dispatch?.request_id ?? null,
+    dispatch_updated: dispatchUpdated
   };
 }
 
