@@ -50,6 +50,14 @@ type TeamHudHighlight = {
   message: string;
 };
 
+type TeamHudInspectHint = {
+  severity: TeamHudActionSeverity;
+  key: string;
+  command: string;
+  metadata: Record<string, string>;
+  reason: string;
+};
+
 export type TeamHudRenderContext = {
   teamName: string;
   snapshot: AgmoTeamMonitorSnapshot;
@@ -223,6 +231,22 @@ function highlightPriority(highlight: TeamHudHighlight): number {
   return ACTION_SEVERITY_PRIORITY.indexOf(highlight.severity);
 }
 
+function inspectHintPriority(hint: TeamHudInspectHint): number {
+  const keyPriority: Record<string, number> = {
+    "layout-repairable": 0,
+    "leader-pane": 1,
+    "hud-pane": 2,
+    "worker-dead": 3,
+    "claim-risk": 4,
+    "task-failed": 5,
+    "worker-stale": 6,
+    "worker-blocked": 7,
+    "task-blocked": 8,
+    "layout-degraded": 9
+  };
+  return ACTION_SEVERITY_PRIORITY.indexOf(hint.severity) * 100 + (keyPriority[hint.key] ?? 50);
+}
+
 function normalizeAction(action: TeamHudSuggestedAction): TeamHudSuggestedAction {
   const fallback = DEFAULT_ACTIONS[action.key];
   return {
@@ -335,6 +359,22 @@ function pushUniqueHighlight(highlights: TeamHudHighlight[], highlight: TeamHudH
   highlights.push(highlight);
 }
 
+function inspectHintIdentity(hint: TeamHudInspectHint): string {
+  const metadata = Object.entries(hint.metadata)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  return `${hint.command}|${metadata}`;
+}
+
+function pushUniqueInspectHint(hints: TeamHudInspectHint[], hint: TeamHudInspectHint): void {
+  const identity = inspectHintIdentity(hint);
+  if (hints.some((entry) => inspectHintIdentity(entry) === identity)) {
+    return;
+  }
+  hints.push(hint);
+}
+
 function resolveSidecarHighlights(context: TeamHudRenderContext): TeamHudHighlight[] {
   const highlights: TeamHudHighlight[] = [];
   const { snapshot } = context;
@@ -411,6 +451,100 @@ function resolveSidecarHighlights(context: TeamHudRenderContext): TeamHudHighlig
   return highlights.sort((left, right) => highlightPriority(left) - highlightPriority(right));
 }
 
+function resolveSidecarInspectHints(context: TeamHudRenderContext): TeamHudInspectHint[] {
+  const hints: TeamHudInspectHint[] = [];
+  const { snapshot } = context;
+  const statusCommand = `status ${context.teamName}`;
+  const layoutCommand = `layout status ${context.teamName}`;
+
+  if (snapshot.leader && isUnavailablePane(snapshot.leader.health)) {
+    pushUniqueInspectHint(hints, {
+      severity: "critical",
+      key: "leader-pane",
+      command: layoutCommand,
+      metadata: {},
+      reason: "leader-pane"
+    });
+  }
+  if (snapshot.hud && isUnavailablePane(snapshot.hud.health)) {
+    pushUniqueInspectHint(hints, {
+      severity: "critical",
+      key: "hud-pane",
+      command: layoutCommand,
+      metadata: {},
+      reason: "hud-pane"
+    });
+  }
+  if (snapshot.layout_health === "repairable" || snapshot.tmux_health?.layout === "repairable") {
+    pushUniqueInspectHint(hints, {
+      severity: "critical",
+      key: "layout-repairable",
+      command: layoutCommand,
+      metadata: {},
+      reason: "layout"
+    });
+  } else if (snapshot.layout_health === "degraded" || snapshot.tmux_health?.layout === "degraded") {
+    pushUniqueInspectHint(hints, {
+      severity: "warning",
+      key: "layout-degraded",
+      command: layoutCommand,
+      metadata: {},
+      reason: "layout"
+    });
+  }
+
+  for (const worker of snapshot.workers) {
+    const baseMetadata = {
+      worker: worker.worker_name,
+      ...(worker.current_task_id ? { task: worker.current_task_id } : {})
+    };
+    if (worker.health === "dead" || worker.health === "stale") {
+      pushUniqueInspectHint(hints, {
+        severity: worker.health === "dead" ? "critical" : "warning",
+        key: `worker-${worker.health}`,
+        command: statusCommand,
+        metadata: baseMetadata,
+        reason: worker.health
+      });
+    }
+    if (worker.status_state === "blocked") {
+      pushUniqueInspectHint(hints, {
+        severity: "warning",
+        key: "worker-blocked",
+        command: statusCommand,
+        metadata: baseMetadata,
+        reason: "blocked"
+      });
+    }
+    if (worker.claim_at_risk) {
+      pushUniqueInspectHint(hints, {
+        severity: "critical",
+        key: "claim-risk",
+        command: statusCommand,
+        metadata: baseMetadata,
+        reason: "claim-risk"
+      });
+    }
+  }
+
+  for (const task of context.status.tasks) {
+    if (task.status === "failed" || task.status === "blocked") {
+      pushUniqueInspectHint(hints, {
+        severity: task.status === "failed" ? "critical" : "warning",
+        key: `task-${task.status}`,
+        command: statusCommand,
+        metadata: {
+          task: task.id,
+          ...(task.owner ? { worker: task.owner } : {})
+        },
+        reason: task.status
+      });
+    }
+  }
+
+  return hints.sort((left, right) => inspectHintPriority(left) - inspectHintPriority(right));
+}
+
 function formatSidecarHighlightLine(context: TeamHudRenderContext): string | null {
   const highlights = resolveSidecarHighlights(context);
   if (highlights.length === 0) {
@@ -422,6 +556,23 @@ function formatSidecarHighlightLine(context: TeamHudRenderContext): string | nul
   });
   const more = highlights.length > entries.length ? ` +${highlights.length - entries.length}` : "";
   return `highlights ${entries.join(" | ")}${more}`;
+}
+
+function formatSidecarInspectLine(context: TeamHudRenderContext): string | null {
+  const hints = resolveSidecarInspectHints(context);
+  if (hints.length === 0) {
+    return null;
+  }
+
+  const entries = hints.slice(0, 3).map((hint) => {
+    const metadata = Object.entries(hint.metadata)
+      .map(([key, value]) => `${clean(key)}=${clean(value)}`)
+      .join(" ");
+    const metadataSuffix = metadata ? ` ${metadata}` : "";
+    return `${clean(hint.command)}${metadataSuffix} reason=${clean(hint.reason)}`;
+  });
+  const more = hints.length > entries.length ? ` +${hints.length - entries.length}` : "";
+  return `inspect=${entries.join(" | ")}${more}`;
 }
 
 function formatSidecarWorkerStrip(context: TeamHudRenderContext): string {
@@ -593,37 +744,53 @@ export function renderTeamHud(
     ];
     const highlightSummary = formatSidecarHighlightLine(context);
     if (highlightSummary) {
-      sidecarLines.push(highlightSummary);
+      sidecarLines.push(ellipsize(highlightSummary, width, false));
+    }
+    const pushSidecarLine = (line: string): void => {
+      if (sidecarLines.length < sidecarMaxLines) {
+        sidecarLines.push(ellipsize(line, width, false));
+      }
+    };
+    const inspectSummary = formatSidecarInspectLine(context);
+    if (inspectSummary) {
+      pushSidecarLine(inspectSummary);
     }
     const topologySummary = formatSidecarTopologyLine(context);
     const eventSummary = formatSidecarEventsLine(context);
     const taskSignal = formatSidecarTaskSignal(context);
     const actionLineCount = suggestedActions.length > 0 ? 1 : 0;
     const taskLineCount = taskSignal ? 1 : 0;
-    const reservedLineCount = actionLineCount + taskLineCount;
+    const reserveTaskSignal = !inspectSummary || !eventSummary;
+    const reservedLineCount = actionLineCount + (reserveTaskSignal ? taskLineCount : 0);
+    const actionSummary =
+      suggestedActions.length > 0
+        ? suggestedActions
+            .slice(0, 3)
+            .map((action) => formatSidecarActionLine(action, context.teamName))
+            .join(" | ")
+        : null;
     if (
       topologySummary &&
       sidecarMaxLines > 6 &&
       sidecarLines.length + reservedLineCount < sidecarMaxLines
     ) {
-      sidecarLines.push(topologySummary);
+      pushSidecarLine(topologySummary);
     }
     if (
       eventSummary &&
       sidecarMaxLines > 6 &&
       sidecarLines.length + reservedLineCount < sidecarMaxLines
     ) {
-      sidecarLines.push(eventSummary);
+      pushSidecarLine(eventSummary);
+    }
+    if (actionSummary && inspectSummary) {
+      pushSidecarLine(`${c("actions", "cyan")} ${actionSummary}`);
     }
     if (taskSignal) {
-      sidecarLines.push(taskSignal);
+      pushSidecarLine(taskSignal);
     }
-    if (suggestedActions.length > 0) {
-      const actionSummary = suggestedActions
-        .slice(0, 3)
-        .map((action) => formatSidecarActionLine(action, context.teamName))
-        .join(" | ");
-      sidecarLines.push(ellipsize(`${c("actions", "cyan")} ${actionSummary}`, width, false));
+    if (actionSummary && !inspectSummary) {
+      pushSidecarLine(`${c("actions", "cyan")} ${actionSummary}`);
     }
     return `${fitLines(sidecarLines, width, sidecarMaxLines).join("\n")}\n`;
   }
