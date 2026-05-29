@@ -12,6 +12,7 @@ import {
 } from "../vault/checkpoint.js";
 import { escalateToSameSessionTeam } from "../team/escalation.js";
 import type { AgmoTeamEscalationResult } from "../team/escalation.js";
+import { withOperationalMetadata } from "./workflow-route-metadata.js";
 
 type WorkflowRoute = WorkflowRouteRecord;
 
@@ -348,10 +349,10 @@ function withRouteMetadata(
   route: BaseWorkflowRoute,
   metadata: Omit<WorkflowRoute, "skill" | "label" | "reason">
 ): WorkflowRoute {
-  return {
+  return withOperationalMetadata({
     ...route,
     ...metadata
-  };
+  });
 }
 
 function routeAlternative(candidate: RouteCandidate): NonNullable<WorkflowRoute["alternatives"]>[number] {
@@ -486,38 +487,38 @@ export function detectWorkflowRoute(
 function routeForIntent(intent: "implementation" | "verification" | "planning" | "knowledge"): WorkflowRoute {
   switch (intent) {
     case "verification":
-      return {
+      return withOperationalMetadata({
         skill: "verify",
         label: "verify",
         reason: "team escalation requested verification-oriented execution",
         source: "team-escalation",
         confidence: "high"
-      };
+      });
     case "planning":
-      return {
+      return withOperationalMetadata({
         skill: "plan",
         label: "plan",
         reason: "team escalation requested planning-oriented execution",
         source: "team-escalation",
         confidence: "high"
-      };
+      });
     case "knowledge":
-      return {
+      return withOperationalMetadata({
         skill: "wisdom",
         label: "wisdom",
         reason: "team escalation requested knowledge-oriented execution",
         source: "team-escalation",
         confidence: "high"
-      };
+      });
     case "implementation":
     default:
-      return {
+      return withOperationalMetadata({
         skill: "execute",
         label: "execute",
         reason: "team escalation requested implementation-oriented execution",
         source: "team-escalation",
         confidence: "high"
-      };
+      });
   }
 }
 
@@ -556,7 +557,7 @@ function buildWorkflowEnforcementContext(args: {
       case "plan-review":
         return [
           "Agmo runtime enforcement: plan-review must not self-approve the leader's own plan.",
-          "Hand the critique/approval pass to agmo-verifier (optionally with agmo-planner for revisions) and keep the result as a planning-lane verdict: approve, revise, or reject."
+          "Hand the critique/approval pass to agmo-critic (optionally with agmo-planner for revisions or agmo-verifier for acceptance criteria evidence) and keep the result as a planning-lane verdict: approve, revise, or reject."
         ];
       case "execute":
       case "ralph":
@@ -643,8 +644,11 @@ function buildIntentGateEvidenceLine(route: WorkflowRoute): string {
         )
         .join(",")}`
     : "";
+  const category = route.operational_category ? ` category=${route.operational_category}` : "";
+  const agent = route.recommended_agent ? ` agent=${route.recommended_agent}` : "";
+  const effort = route.recommended_effort ? ` effort=${route.recommended_effort}` : "";
 
-  return `IntentGate evidence: skill=${route.skill} label=${route.label} source=${route.source} confidence=${route.confidence} reason=${route.reason}${score}${fallback}${alternatives}.`;
+  return `IntentGate evidence: skill=${route.skill} label=${route.label} source=${route.source} confidence=${route.confidence} reason=${route.reason}${score}${fallback}${alternatives}${category}${agent}${effort}.`;
 }
 
 export async function handleUserPromptSubmit(args: {
