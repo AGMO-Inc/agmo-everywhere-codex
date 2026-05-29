@@ -3,7 +3,16 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readPersistedSessionState } from "./runtime-state.js";
 import { detectWorkflowRoute, handleUserPromptSubmit } from "./user-prompt-submit.js";
+
+test("detectWorkflowRoute marks explicit routes as high confidence", () => {
+  const route = detectWorkflowRoute("$execute implement the accepted fix", null);
+  assert.ok(route);
+  assert.equal(route.skill, "execute");
+  assert.equal(route.source, "explicit");
+  assert.equal(route.confidence, "high");
+});
 
 test("detectWorkflowRoute prefers vault-search for prior note retrieval asks", () => {
   const route = detectWorkflowRoute("이전 설계 노트 찾아서 읽어줘", null);
@@ -83,6 +92,9 @@ test("detectWorkflowRoute keeps canonical plan on continuation prompts", () => {
   assert.ok(route);
   assert.equal(route?.skill, "plan");
   assert.equal(route?.label, "plan");
+  assert.equal(route?.source, "continuation");
+  assert.equal(route?.confidence, "high");
+  assert.equal(route?.fallback, "plan");
 });
 
 test("detectWorkflowRoute keeps canonical execute on continuation prompts", () => {
@@ -97,6 +109,29 @@ test("detectWorkflowRoute keeps canonical execute on continuation prompts", () =
   assert.ok(route);
   assert.equal(route?.skill, "execute");
   assert.equal(route?.label, "execute");
+});
+
+test("detectWorkflowRoute preserves previous workflow on ambiguous ties with alternatives", () => {
+  const route = detectWorkflowRoute("docs code", {
+    version: 1,
+    session_id: "s3",
+    active: true,
+    last_event: "UserPromptSubmit",
+    workflow: "wisdom",
+    updated_at: new Date(0).toISOString()
+  });
+
+  assert.ok(route);
+  assert.equal(route.skill, "wisdom");
+  assert.equal(route.label, "wisdom");
+  assert.equal(route.source, "ambiguous-tie");
+  assert.equal(route.confidence, "low");
+  assert.equal(route.score, 3);
+  assert.equal(route.fallback, "wisdom");
+  assert.deepEqual(
+    route.alternatives?.map((alternative) => alternative.skill),
+    ["execute"]
+  );
 });
 
 test("handleUserPromptSubmit injects native subagent cleanup guidance for delegated workflows", async () => {
@@ -131,4 +166,39 @@ test("handleUserPromptSubmit injects workflow artifact guidance for delegated wo
   assert.match(context, /Agmo workflow artifact contract:/);
   assert.match(context, /artifact-grade summary/);
   assert.match(context, /rather than relying only on terse hook checkpoints/);
+});
+
+test("handleUserPromptSubmit persists route metadata and emits compact IntentGate evidence", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-user-prompt-route-metadata-"));
+  const payload = {
+    session_id: "route-metadata-session",
+    prompt: "$execute implement the accepted fix"
+  };
+  const result = await handleUserPromptSubmit({
+    cwd: tempRoot,
+    payload
+  });
+
+  assert.ok(result);
+  const context = result.hookSpecificOutput.additionalContext;
+  assert.match(
+    context,
+    /IntentGate evidence: skill=execute label=execute source=explicit confidence=high reason=explicit \$execute invocation\./
+  );
+
+  const state = await readPersistedSessionState({
+    cwd: tempRoot,
+    payload
+  });
+
+  assert.ok(state);
+  assert.equal(state.workflow, "execute");
+  assert.equal(state.workflow_reason, "explicit $execute invocation");
+  assert.deepEqual(state.workflow_route, {
+    skill: "execute",
+    label: "execute",
+    reason: "explicit $execute invocation",
+    source: "explicit",
+    confidence: "high"
+  });
 });

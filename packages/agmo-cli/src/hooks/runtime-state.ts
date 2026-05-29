@@ -20,6 +20,22 @@ export type VerificationRecord = {
   recorded_at: string;
 };
 
+export type WorkflowRouteRecord = {
+  skill: string;
+  label: string;
+  reason: string;
+  source: "explicit" | "continuation" | "pattern" | "ambiguous-tie" | "team-escalation";
+  confidence: "high" | "medium" | "low";
+  score?: number;
+  fallback?: string;
+  alternatives?: Array<{
+    skill: string;
+    label: string;
+    reason: string;
+    score?: number;
+  }>;
+};
+
 export type SessionState = {
   version: 1;
   session_id: string;
@@ -29,6 +45,7 @@ export type SessionState = {
   last_event: string;
   workflow?: string;
   workflow_reason?: string;
+  workflow_route?: WorkflowRouteRecord;
   prompt_excerpt?: string;
   last_tool_name?: string;
   last_tool_summary?: string;
@@ -215,6 +232,12 @@ function mergeWisdomPersistenceState(
   };
 }
 
+function mergeWorkflowRouteState(
+  base: SessionState | null | undefined
+): Pick<SessionState, "workflow_route"> {
+  return base?.workflow_route ? { workflow_route: base.workflow_route } : {};
+}
+
 function nextVerificationHistory(args: {
   base: SessionState | null | undefined;
   lastEvent: "PreToolUse" | "PostToolUse";
@@ -243,6 +266,7 @@ export async function writeWorkflowActivation(args: {
   payload: AgmoHookPayload;
   workflow: string;
   reason: string;
+  workflowRoute?: WorkflowRouteRecord;
 }): Promise<{ sessionId: string; workflowStatePathStem: string }> {
   const sessionId = readSessionId(args.payload);
   const threadId = readThreadId(args.payload);
@@ -264,6 +288,7 @@ export async function writeWorkflowActivation(args: {
     last_event: "UserPromptSubmit",
     workflow: args.workflow,
     workflow_reason: args.reason,
+    ...(args.workflowRoute ? { workflow_route: args.workflowRoute } : {}),
     ...(promptExcerpt(prompt) ? { prompt_excerpt: promptExcerpt(prompt) } : {}),
     ...mergeAutosaveState(base),
     ...mergeVerificationState(base),
@@ -302,6 +327,7 @@ export async function markSessionStopped(args: {
     last_event: "Stop",
     ...(base?.workflow ? { workflow: base.workflow } : {}),
     ...(base?.workflow_reason ? { workflow_reason: base.workflow_reason } : {}),
+    ...mergeWorkflowRouteState(base),
     ...(base?.prompt_excerpt ? { prompt_excerpt: base.prompt_excerpt } : {}),
     ...(base?.last_tool_name ? { last_tool_name: base.last_tool_name } : {}),
     ...(base?.last_tool_summary ? { last_tool_summary: base.last_tool_summary } : {}),
@@ -360,6 +386,7 @@ export async function recordSessionActivity(args: {
     last_event: args.lastEvent,
     ...(base?.workflow ? { workflow: base.workflow } : {}),
     ...(base?.workflow_reason ? { workflow_reason: base.workflow_reason } : {}),
+    ...mergeWorkflowRouteState(base),
     ...(base?.prompt_excerpt ? { prompt_excerpt: base.prompt_excerpt } : {}),
     ...(args.toolName
       ? { last_tool_name: args.toolName }
@@ -422,6 +449,7 @@ export async function recordSessionAutosave(args: {
     last_event: base?.last_event ?? "UserPromptSubmit",
     ...(base?.workflow ? { workflow: base.workflow } : {}),
     ...(base?.workflow_reason ? { workflow_reason: base.workflow_reason } : {}),
+    ...mergeWorkflowRouteState(base),
     ...(base?.prompt_excerpt ? { prompt_excerpt: base.prompt_excerpt } : {}),
     ...(base?.last_tool_name ? { last_tool_name: base.last_tool_name } : {}),
     ...(base?.last_tool_summary ? { last_tool_summary: base.last_tool_summary } : {}),
@@ -482,6 +510,7 @@ export async function recordSessionArtifact(args: {
     last_event: base?.last_event ?? "UserPromptSubmit",
     ...(base?.workflow ? { workflow: base.workflow } : {}),
     ...(base?.workflow_reason ? { workflow_reason: base.workflow_reason } : {}),
+    ...mergeWorkflowRouteState(base),
     ...(base?.prompt_excerpt ? { prompt_excerpt: base.prompt_excerpt } : {}),
     ...(base?.last_tool_name ? { last_tool_name: base.last_tool_name } : {}),
     ...(base?.last_tool_summary ? { last_tool_summary: base.last_tool_summary } : {}),
@@ -534,6 +563,7 @@ export async function recordSessionWisdomPersistence(args: {
     last_event: base?.last_event ?? "UserPromptSubmit",
     ...(base?.workflow ? { workflow: base.workflow } : {}),
     ...(base?.workflow_reason ? { workflow_reason: base.workflow_reason } : {}),
+    ...mergeWorkflowRouteState(base),
     ...(base?.prompt_excerpt ? { prompt_excerpt: base.prompt_excerpt } : {}),
     ...(base?.last_tool_name ? { last_tool_name: base.last_tool_name } : {}),
     ...(base?.last_tool_summary ? { last_tool_summary: base.last_tool_summary } : {}),

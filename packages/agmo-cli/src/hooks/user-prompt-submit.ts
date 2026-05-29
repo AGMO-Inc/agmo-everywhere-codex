@@ -3,6 +3,7 @@ import {
   readPromptText,
   type SessionState,
   type AgmoHookPayload,
+  type WorkflowRouteRecord,
   writeWorkflowActivation
 } from "./runtime-state.js";
 import {
@@ -12,16 +13,19 @@ import {
 import { escalateToSameSessionTeam } from "../team/escalation.js";
 import type { AgmoTeamEscalationResult } from "../team/escalation.js";
 
-type WorkflowRoute = {
-  skill: string;
-  label: string;
-  reason: string;
-};
+type WorkflowRoute = WorkflowRouteRecord;
 
 type ScoredPattern = {
   pattern: RegExp;
   score: number;
 };
+
+type RouteCandidate = {
+  route: BaseWorkflowRoute;
+  score: number;
+};
+
+type BaseWorkflowRoute = Pick<WorkflowRoute, "skill" | "label" | "reason">;
 
 const CONTINUATION_PATTERNS: RegExp[] = [
   /^계속/u,
@@ -34,7 +38,7 @@ const CONTINUATION_PATTERNS: RegExp[] = [
 
 const EXPLICIT_ROUTE_OVERRIDES: Array<{
   pattern: RegExp;
-  route: WorkflowRoute;
+  route: BaseWorkflowRoute;
 }> = [
   {
     pattern: /^\$git-workflow\b/i,
@@ -143,7 +147,7 @@ const EXPLICIT_ROUTE_OVERRIDES: Array<{
 ];
 
 const ROUTES: Array<{
-  route: WorkflowRoute;
+  route: BaseWorkflowRoute;
   patterns: ScoredPattern[];
 }> = [
   {
@@ -340,7 +344,38 @@ const ROUTES: Array<{
   }
 ];
 
-function routeForWorkflowLabel(workflow: string | undefined): WorkflowRoute | null {
+function withRouteMetadata(
+  route: BaseWorkflowRoute,
+  metadata: Omit<WorkflowRoute, "skill" | "label" | "reason">
+): WorkflowRoute {
+  return {
+    ...route,
+    ...metadata
+  };
+}
+
+function routeAlternative(candidate: RouteCandidate): NonNullable<WorkflowRoute["alternatives"]>[number] {
+  return {
+    skill: candidate.route.skill,
+    label: candidate.route.label,
+    reason: candidate.route.reason,
+    score: candidate.score
+  };
+}
+
+function confidenceForPatternScore(score: number): WorkflowRoute["confidence"] {
+  if (score >= 8) {
+    return "high";
+  }
+
+  if (score >= 5) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function routeForWorkflowLabel(workflow: string | undefined): BaseWorkflowRoute | null {
   if (!workflow) {
     return null;
   }
@@ -372,7 +407,10 @@ export function detectWorkflowRoute(
 
   const explicitRoute = EXPLICIT_ROUTE_OVERRIDES.find((entry) => entry.pattern.test(normalized));
   if (explicitRoute) {
-    return explicitRoute.route;
+    return withRouteMetadata(explicitRoute.route, {
+      source: "explicit",
+      confidence: "high"
+    });
   }
 
   if (
@@ -382,7 +420,11 @@ export function detectWorkflowRoute(
     const continuedRoute = routeForWorkflowLabel(previousState.workflow);
     if (continuedRoute) {
       return {
-        ...continuedRoute,
+        ...withRouteMetadata(continuedRoute, {
+          source: "continuation",
+          confidence: "high",
+          fallback: previousState.workflow
+        }),
         reason: `continuation prompt preserved previous ${continuedRoute.label} workflow`
       };
     }
@@ -403,7 +445,13 @@ export function detectWorkflowRoute(
   const bestScore = scored[0].score;
   const topCandidates = scored.filter((candidate) => candidate.score === bestScore);
   if (topCandidates.length === 1) {
-    return topCandidates[0].route;
+    const winner = topCandidates[0];
+    return withRouteMetadata(winner.route, {
+      source: "pattern",
+      confidence: confidenceForPatternScore(winner.score),
+      score: winner.score,
+      ...(scored.length > 1 ? { alternatives: scored.slice(1, 4).map(routeAlternative) } : {})
+    });
   }
 
   if (previousState?.workflow) {
@@ -412,13 +460,27 @@ export function detectWorkflowRoute(
     );
     if (previousMatch) {
       return {
-        ...previousMatch.route,
+        ...withRouteMetadata(previousMatch.route, {
+          source: "ambiguous-tie",
+          confidence: "low",
+          score: previousMatch.score,
+          fallback: previousState.workflow,
+          alternatives: topCandidates
+            .filter((candidate) => candidate.route.skill !== previousMatch.route.skill)
+            .map(routeAlternative)
+        }),
         reason: `ambiguous route tie resolved to previous ${previousMatch.route.label} workflow`
       };
     }
   }
 
-  return topCandidates[0].route;
+  const winner = topCandidates[0];
+  return withRouteMetadata(winner.route, {
+    source: "ambiguous-tie",
+    confidence: "low",
+    score: winner.score,
+    alternatives: topCandidates.slice(1).map(routeAlternative)
+  });
 }
 
 function routeForIntent(intent: "implementation" | "verification" | "planning" | "knowledge"): WorkflowRoute {
@@ -427,26 +489,34 @@ function routeForIntent(intent: "implementation" | "verification" | "planning" |
       return {
         skill: "verify",
         label: "verify",
-        reason: "team escalation requested verification-oriented execution"
+        reason: "team escalation requested verification-oriented execution",
+        source: "team-escalation",
+        confidence: "high"
       };
     case "planning":
       return {
         skill: "plan",
         label: "plan",
-        reason: "team escalation requested planning-oriented execution"
+        reason: "team escalation requested planning-oriented execution",
+        source: "team-escalation",
+        confidence: "high"
       };
     case "knowledge":
       return {
         skill: "wisdom",
         label: "wisdom",
-        reason: "team escalation requested knowledge-oriented execution"
+        reason: "team escalation requested knowledge-oriented execution",
+        source: "team-escalation",
+        confidence: "high"
       };
     case "implementation":
     default:
       return {
         skill: "execute",
         label: "execute",
-        reason: "team escalation requested implementation-oriented execution"
+        reason: "team escalation requested implementation-oriented execution",
+        source: "team-escalation",
+        confidence: "high"
       };
   }
 }
@@ -563,6 +633,20 @@ function buildWorkflowEnforcementContext(args: {
   ];
 }
 
+function buildIntentGateEvidenceLine(route: WorkflowRoute): string {
+  const score = route.score === undefined ? "" : ` score=${route.score}`;
+  const fallback = route.fallback ? ` fallback=${route.fallback}` : "";
+  const alternatives = route.alternatives?.length
+    ? ` alternatives=${route.alternatives
+        .map((alternative) =>
+          `${alternative.skill}${alternative.score === undefined ? "" : `:${alternative.score}`}`
+        )
+        .join(",")}`
+    : "";
+
+  return `IntentGate evidence: skill=${route.skill} label=${route.label} source=${route.source} confidence=${route.confidence} reason=${route.reason}${score}${fallback}${alternatives}.`;
+}
+
 export async function handleUserPromptSubmit(args: {
   cwd: string;
   payload: AgmoHookPayload;
@@ -615,7 +699,8 @@ export async function handleUserPromptSubmit(args: {
     cwd: args.cwd,
     payload: args.payload,
     workflow: route.label,
-    reason: route.reason
+    reason: route.reason,
+    workflowRoute: route
   });
 
   return {
@@ -623,6 +708,7 @@ export async function handleUserPromptSubmit(args: {
       hookEventName: "UserPromptSubmit",
       additionalContext: [
         `Agmo native UserPromptSubmit routed this prompt to ${route.skill} (${route.reason}). Prefer that skill surface for this turn. Durable workflow state was written to .agmo/state/workflows/${persisted.workflowStatePathStem}.json for session ${persisted.sessionId}.`,
+        buildIntentGateEvidenceLine(route),
         ...buildWorkflowEnforcementContext({
           route,
           teamEscalation
