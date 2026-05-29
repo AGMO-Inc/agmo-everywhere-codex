@@ -26,6 +26,24 @@ export type WorkflowRouteRecord = {
   reason: string;
   source: "explicit" | "continuation" | "pattern" | "ambiguous-tie" | "team-escalation";
   confidence: "high" | "medium" | "low";
+  operational_category?:
+    | "design"
+    | "planning"
+    | "implementation"
+    | "verification"
+    | "knowledge"
+    | "repo-ops"
+    | "issue-ops";
+  recommended_agent?:
+    | "agmo-planner"
+    | "agmo-executor"
+    | "agmo-verifier"
+    | "agmo-wisdom"
+    | "agmo-architect"
+    | "agmo-critic"
+    | "agmo-explore";
+  recommended_effort?: "low" | "medium" | "high";
+  verification_strategy?: string;
   score?: number;
   fallback?: string;
   alternatives?: Array<{

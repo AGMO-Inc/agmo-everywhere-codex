@@ -263,6 +263,42 @@ test("checked-in .codex skill mirrors stay aligned with packaged Agmo skill sour
   }
 });
 
+test("managed agent prompt contracts preserve role boundaries and critical guidance", async () => {
+  const prompts: Record<string, string> = Object.fromEntries(
+    await Promise.all(
+      AGMO_AGENT_DEFINITIONS.map(async (agent) => [
+        agent.promptFile,
+        await readPromptContent(agent.promptFile),
+      ]),
+    ),
+  );
+
+  assert.match(prompts["planner.md"] ?? "", /You plan\. You do not implement\./);
+  assert.match(prompts["planner.md"] ?? "", /Do not write code files\./);
+
+  assert.match(prompts["executor.md"] ?? "", /Explore, implement, verify, and finish\./);
+  assert.match(prompts["executor.md"] ?? "", /No evidence = not complete\./);
+  assert.match(prompts["executor.md"] ?? "", /When committing code, follow the Lore commit protocol/);
+  for (const [promptFile, prompt] of Object.entries(prompts)) {
+    if (promptFile !== "executor.md") {
+      assert.doesNotMatch(prompt, /Lore commit protocol/i, `${promptFile} should not carry Lore commit guidance`);
+    }
+  }
+
+  assert.match(prompts["agmo-architect.md"] ?? "", /You are read-only\./);
+  assert.match(prompts["agmo-architect.md"] ?? "", /Never write or edit files\./);
+  assert.match(prompts["agmo-critic.md"] ?? "", /Read-only: Write and Edit tools are blocked\./);
+  assert.match(prompts["agmo-critic.md"] ?? "", /not responsible.*implementing changes/s);
+  assert.match(prompts["agmo-explore.md"] ?? "", /Read-only: you cannot create, modify, or delete files\./);
+  assert.match(prompts["agmo-explore.md"] ?? "", /not responsible for modifying code, implementing features/);
+
+  assert.match(prompts["verifier.md"] ?? "", /Distinguish missing evidence from failed behavior\./);
+  assert.match(prompts["verifier.md"] ?? "", /Did I call out missing proof clearly\?/);
+
+  assert.match(prompts["wisdom.md"] ?? "", /Separate facts, inference, and save proposals\./);
+  assert.match(prompts["wisdom.md"] ?? "", /explicit evidence vs inference/);
+});
+
 test("runtime config publishes the managed prompt and skill directories", () => {
   const tempProject = "/tmp/agmo-runtime-config-prompts";
   const paths = resolveInstallPaths("project", tempProject);
