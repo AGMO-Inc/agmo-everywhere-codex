@@ -57,6 +57,57 @@ export type TeamWorktreeCleanupSummary = {
   errors: string[];
 };
 
+export type TeamWorktreeDiagnosticReason =
+  | "manifest_owned"
+  | "missing_manifest"
+  | "invalid_manifest"
+  | "worker_path_missing"
+  | "worker_path_not_git_worktree"
+  | "git_worktree_registered"
+  | "dirty_worker"
+  | "clean_worker"
+  | "manual_review_required";
+
+export type TeamWorktreeDiagnosticWorker = {
+  worker_name: string;
+  path: string;
+  git_enabled: boolean;
+  exists: boolean;
+  is_git_worktree: boolean;
+  git_worktree_registered: boolean;
+  dirty: boolean;
+  reasons: TeamWorktreeDiagnosticReason[];
+};
+
+export type TeamWorktreeDiagnosticEntry = {
+  team_name: string;
+  worktree_root: string;
+  manifest_path: string;
+  manifest_status: "valid" | "missing" | "invalid";
+  reasons: TeamWorktreeDiagnosticReason[];
+  safe_to_delete_candidate: boolean;
+  workers: TeamWorktreeDiagnosticWorker[];
+  errors: string[];
+};
+
+export type TeamWorktreeDiagnosticsSummary = {
+  worktrees_root: string;
+  counts: {
+    teams: number;
+    manifest_owned: number;
+    missing_manifest: number;
+    invalid_manifest: number;
+    worker_path_missing: number;
+    worker_path_not_git_worktree: number;
+    git_worktree_registered: number;
+    dirty_worker: number;
+    clean_worker: number;
+    manual_review_required: number;
+    safe_to_delete_candidates: number;
+  };
+  teams: TeamWorktreeDiagnosticEntry[];
+};
+
 export function resolveTeamWorktreeRoot(
   teamName: string,
   cwd = process.cwd()
@@ -87,6 +138,14 @@ function runGit(args: string[], cwd = process.cwd()): string {
   }).trim();
 }
 
+function tryRunGit(args: string[], cwd = process.cwd()): string | null {
+  try {
+    return runGit(args, cwd);
+  } catch {
+    return null;
+  }
+}
+
 function isPathWithin(parent: string, child: string): boolean {
   const pathRelative = relative(parent, child);
   return pathRelative === "" || (pathRelative.length > 0 && !pathRelative.startsWith("..") && !isAbsolute(pathRelative));
@@ -109,6 +168,91 @@ async function readTeamWorktreeManifest(
     return null;
   }
   return JSON.parse(await readFile(manifestPath, "utf-8")) as TeamWorktreeManifest;
+}
+
+function incrementDiagnosticCount(
+  counts: TeamWorktreeDiagnosticsSummary["counts"],
+  reason: TeamWorktreeDiagnosticReason
+): void {
+  if (reason === "manifest_owned") {
+    counts.manifest_owned += 1;
+  } else if (reason === "missing_manifest") {
+    counts.missing_manifest += 1;
+  } else if (reason === "invalid_manifest") {
+    counts.invalid_manifest += 1;
+  } else if (reason === "worker_path_missing") {
+    counts.worker_path_missing += 1;
+  } else if (reason === "worker_path_not_git_worktree") {
+    counts.worker_path_not_git_worktree += 1;
+  } else if (reason === "git_worktree_registered") {
+    counts.git_worktree_registered += 1;
+  } else if (reason === "dirty_worker") {
+    counts.dirty_worker += 1;
+  } else if (reason === "clean_worker") {
+    counts.clean_worker += 1;
+  } else if (reason === "manual_review_required") {
+    counts.manual_review_required += 1;
+  }
+}
+
+function addDiagnosticReason(
+  reasons: TeamWorktreeDiagnosticReason[],
+  reason: TeamWorktreeDiagnosticReason
+): void {
+  if (!reasons.includes(reason)) {
+    reasons.push(reason);
+  }
+}
+
+function isGitWorktreePath(path: string): boolean {
+  return existsSync(join(path, ".git")) && tryRunGit(["rev-parse", "--show-toplevel"], path) === path;
+}
+
+function listRegisteredGitWorktreePaths(repoRoot: string): Set<string> {
+  const output = tryRunGit(["worktree", "list", "--porcelain"], repoRoot);
+  if (output === null) {
+    return new Set();
+  }
+
+  return new Set(
+    output
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => resolve(line.slice("worktree ".length)))
+  );
+}
+
+function gitStatusPorcelainIgnoringRuntimeFiles(cwd: string): string {
+  return (
+    tryRunGit(
+      [
+        "status",
+        "--porcelain",
+        "--",
+        ".",
+        ":(exclude)AGENTS.md",
+        ":(exclude).codex",
+        ":(exclude).agmo"
+      ],
+      cwd
+    ) ?? ""
+  );
+}
+
+function hasValidManifestShape(manifest: TeamWorktreeManifest): boolean {
+  return (
+    manifest.version === 1 &&
+    typeof manifest.team_name === "string" &&
+    typeof manifest.worktree_root === "string" &&
+    Array.isArray(manifest.workers) &&
+    manifest.workers.every(
+      (worker) =>
+        typeof worker.worker_name === "string" &&
+        typeof worker.path === "string" &&
+        typeof worker.git_enabled === "boolean" &&
+        typeof worker.repo_root === "string"
+    )
+  );
 }
 
 export function isGitRepository(cwd = process.cwd()): boolean {
@@ -235,6 +379,202 @@ export async function writeTeamWorktreeManifest(
 
   await writeJsonFile(resolveTeamWorktreeManifestPath(normalizedTeamName, cwd), manifest);
   return manifest;
+}
+
+export async function inspectTeamWorktrees(
+  cwd = process.cwd()
+): Promise<TeamWorktreeDiagnosticsSummary> {
+  const worktreesRoot = resolve(cwd, ".agmo", "worktrees");
+  const counts: TeamWorktreeDiagnosticsSummary["counts"] = {
+    teams: 0,
+    manifest_owned: 0,
+    missing_manifest: 0,
+    invalid_manifest: 0,
+    worker_path_missing: 0,
+    worker_path_not_git_worktree: 0,
+    git_worktree_registered: 0,
+    dirty_worker: 0,
+    clean_worker: 0,
+    manual_review_required: 0,
+    safe_to_delete_candidates: 0
+  };
+
+  if (!existsSync(worktreesRoot)) {
+    return {
+      worktrees_root: worktreesRoot,
+      counts,
+      teams: []
+    };
+  }
+
+  const worktreesRootCanonical = await canonicalExistingPath(worktreesRoot);
+  const teamDirs = (await readdir(worktreesRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b));
+
+  const teams: TeamWorktreeDiagnosticEntry[] = [];
+  for (const teamDir of teamDirs) {
+    const teamName = sanitizeTeamName(teamDir);
+    const expectedRoot = resolveTeamWorktreeRoot(teamName, cwd);
+    const manifestPath = resolveTeamWorktreeManifestPath(teamName, cwd);
+    const teamReasons: TeamWorktreeDiagnosticReason[] = [];
+    const errors: string[] = [];
+    const workers: TeamWorktreeDiagnosticWorker[] = [];
+    let manifestStatus: TeamWorktreeDiagnosticEntry["manifest_status"] = "missing";
+    let manifest: TeamWorktreeManifest | null = null;
+
+    if (!existsSync(manifestPath)) {
+      addDiagnosticReason(teamReasons, "missing_manifest");
+      addDiagnosticReason(teamReasons, "manual_review_required");
+    } else {
+      try {
+        manifest = await readTeamWorktreeManifest(teamName, cwd);
+      } catch (error) {
+        manifestStatus = "invalid";
+        addDiagnosticReason(teamReasons, "invalid_manifest");
+        addDiagnosticReason(teamReasons, "manual_review_required");
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    if (manifest) {
+      const expectedRootCanonical = await canonicalExistingPath(expectedRoot);
+      const manifestRootCanonical = hasValidManifestShape(manifest)
+        ? await canonicalExistingPath(manifest.worktree_root)
+        : null;
+      if (
+        !hasValidManifestShape(manifest) ||
+        manifest.version !== 1 ||
+        manifest.team_name !== teamName ||
+        !isPathWithin(worktreesRootCanonical, expectedRootCanonical) ||
+        manifestRootCanonical === null ||
+        !isPathWithin(expectedRootCanonical, manifestRootCanonical) ||
+        manifestRootCanonical !== expectedRootCanonical ||
+        !Array.isArray(manifest.workers)
+      ) {
+        manifestStatus = "invalid";
+        addDiagnosticReason(teamReasons, "invalid_manifest");
+        addDiagnosticReason(teamReasons, "manual_review_required");
+      } else {
+        manifestStatus = "valid";
+        addDiagnosticReason(teamReasons, "manifest_owned");
+
+        for (const worker of manifest.workers) {
+          const workerPath = resolve(worker.path);
+          const workerPathCanonical = await canonicalExistingPath(workerPath);
+          const workerReasons: TeamWorktreeDiagnosticReason[] = [];
+          const exists = existsSync(workerPath);
+          const workerPathWithinRoot =
+            isPathWithin(expectedRootCanonical, workerPathCanonical) ||
+            isPathWithin(expectedRoot, workerPath);
+          let isGitWorktree = false;
+          let gitWorktreeRegistered = false;
+          let dirty = false;
+
+          if (!workerPathWithinRoot) {
+            addDiagnosticReason(workerReasons, "manual_review_required");
+            addDiagnosticReason(teamReasons, "manual_review_required");
+            errors.push(`${worker.worker_name}: worker path escapes team worktree root`);
+          } else if (!exists) {
+            addDiagnosticReason(workerReasons, "worker_path_missing");
+            addDiagnosticReason(teamReasons, "worker_path_missing");
+          } else {
+            isGitWorktree = isGitWorktreePath(workerPathCanonical);
+            if (worker.git_enabled && !isGitWorktree) {
+              addDiagnosticReason(workerReasons, "worker_path_not_git_worktree");
+              addDiagnosticReason(workerReasons, "manual_review_required");
+              addDiagnosticReason(teamReasons, "worker_path_not_git_worktree");
+              addDiagnosticReason(teamReasons, "manual_review_required");
+            }
+
+            if (isGitWorktree) {
+              const registeredPaths = listRegisteredGitWorktreePaths(worker.repo_root);
+              gitWorktreeRegistered = registeredPaths.has(workerPathCanonical);
+              if (gitWorktreeRegistered) {
+                addDiagnosticReason(workerReasons, "git_worktree_registered");
+                addDiagnosticReason(teamReasons, "git_worktree_registered");
+              }
+
+              dirty = gitStatusPorcelainIgnoringRuntimeFiles(workerPathCanonical).length > 0;
+              if (dirty) {
+                addDiagnosticReason(workerReasons, "dirty_worker");
+                addDiagnosticReason(workerReasons, "manual_review_required");
+                addDiagnosticReason(teamReasons, "dirty_worker");
+                addDiagnosticReason(teamReasons, "manual_review_required");
+              } else {
+                addDiagnosticReason(workerReasons, "clean_worker");
+                addDiagnosticReason(teamReasons, "clean_worker");
+              }
+            } else if (!worker.git_enabled) {
+              addDiagnosticReason(workerReasons, "clean_worker");
+              addDiagnosticReason(teamReasons, "clean_worker");
+            }
+          }
+
+          workers.push({
+            worker_name: worker.worker_name,
+            path: worker.path,
+            git_enabled: worker.git_enabled,
+            exists,
+            is_git_worktree: isGitWorktree,
+            git_worktree_registered: gitWorktreeRegistered,
+            dirty,
+            reasons: workerReasons
+          });
+        }
+      }
+    }
+
+    const safeToDeleteCandidate =
+      manifestStatus === "valid" &&
+      workers.length > 0 &&
+      workers.every(
+        (worker) =>
+          worker.exists &&
+          worker.reasons.includes("clean_worker") &&
+          (!worker.git_enabled || worker.git_worktree_registered) &&
+          !worker.reasons.includes("manual_review_required")
+      );
+    if (safeToDeleteCandidate) {
+      counts.safe_to_delete_candidates += 1;
+    }
+
+    const entry: TeamWorktreeDiagnosticEntry = {
+      team_name: teamName,
+      worktree_root: expectedRoot,
+      manifest_path: manifestPath,
+      manifest_status: manifestStatus,
+      reasons: teamReasons,
+      safe_to_delete_candidate: safeToDeleteCandidate,
+      workers,
+      errors
+    };
+    teams.push(entry);
+    counts.teams += 1;
+
+    for (const reason of entry.reasons) {
+      if (
+        reason === "manifest_owned" ||
+        reason === "missing_manifest" ||
+        reason === "invalid_manifest" ||
+        (reason === "manual_review_required" && entry.workers.length === 0)
+      ) {
+        incrementDiagnosticCount(counts, reason);
+      }
+    }
+    for (const worker of entry.workers) {
+      for (const reason of worker.reasons) {
+        incrementDiagnosticCount(counts, reason);
+      }
+    }
+  }
+
+  return {
+    worktrees_root: worktreesRoot,
+    counts,
+    teams
+  };
 }
 
 export async function cleanupTeamWorktrees(
