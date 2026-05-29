@@ -44,6 +44,7 @@ import {
 } from "./worker-bootstrap.js";
 import {
   cleanupTeamWorktrees,
+  inspectTeamWorktrees,
   provisionWorkerWorktree,
   type TeamWorktreeCleanupSummary,
   writeTeamWorktreeManifest
@@ -6953,6 +6954,26 @@ export async function monitorTeamRuntime(
         )
       : [];
   const layoutHealth = buildTmuxLayoutHealth(status.config.transport, leader, hud, workerPanes);
+  const worktreeTeam = (await inspectTeamWorktrees(cwd)).teams.find(
+    (entry) => entry.team_name === normalizedTeamName
+  );
+  const worktreeDiagnostics = worktreeTeam
+    ? {
+        dirty: worktreeTeam.workers.filter((worker) => worker.dirty).length,
+        manual: worktreeTeam.workers.filter(
+          (worker) => worker.classification === "manual_review_required"
+        ).length,
+        cleanup: worktreeTeam.workers.filter(
+          (worker) => worker.classification === "cleanup_candidate"
+        ).length,
+        inspect: worktreeTeam.workers.filter(
+          (worker) => worker.classification === "inspect_required"
+        ).length,
+        missing: worktreeTeam.workers.filter(
+          (worker) => worker.classification === "already_missing"
+        ).length
+      }
+    : undefined;
 
   const snapshot: AgmoTeamMonitorSnapshot = {
     team_name: normalizedTeamName,
@@ -6968,7 +6989,8 @@ export async function monitorTeamRuntime(
     ...(hud ? { hud } : {}),
     ...(workerPanes.length > 0 ? { worker_panes: workerPanes } : {}),
     layout_health: layoutHealth,
-    tmux_health: buildTmuxHealthSummary(status, leader, hud, workerPanes, layoutHealth)
+    tmux_health: buildTmuxHealthSummary(status, leader, hud, workerPanes, layoutHealth),
+    ...(worktreeDiagnostics ? { worktree_diagnostics: worktreeDiagnostics } : {})
   };
 
   await Promise.all([

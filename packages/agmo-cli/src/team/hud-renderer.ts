@@ -247,7 +247,8 @@ function inspectHintPriority(hint: TeamHudInspectHint): number {
     "worker-stale": 6,
     "worker-blocked": 7,
     "task-blocked": 8,
-    "layout-degraded": 9
+    "layout-degraded": 9,
+    "worktree-diagnostics": 10
   };
   return ACTION_SEVERITY_PRIORITY.indexOf(hint.severity) * 100 + (keyPriority[hint.key] ?? 50);
 }
@@ -497,6 +498,23 @@ function resolveSidecarInspectHints(context: TeamHudRenderContext): TeamHudInspe
       reason: "layout"
     });
   }
+  const worktrees = snapshot.worktree_diagnostics;
+  if (
+    worktrees &&
+    (worktrees.dirty > 0 || worktrees.manual > 0 || worktrees.inspect > 0)
+  ) {
+    pushUniqueInspectHint(hints, {
+      severity: worktrees.manual > 0 || worktrees.dirty > 0 ? "warning" : "info",
+      key: "worktree-diagnostics",
+      command: `worktree inspect ${context.teamName}`,
+      metadata: {
+        dirty: String(worktrees.dirty),
+        manual: String(worktrees.manual),
+        cleanup: String(worktrees.cleanup)
+      },
+      reason: "worktrees"
+    });
+  }
 
   for (const worker of snapshot.workers) {
     const baseMetadata = {
@@ -578,6 +596,27 @@ function formatSidecarInspectLine(context: TeamHudRenderContext): string | null 
   });
   const more = hints.length > entries.length ? ` +${hints.length - entries.length}` : "";
   return `inspect=${entries.join(" | ")}${more}`;
+}
+
+function formatSidecarWorktreeLine(context: TeamHudRenderContext): string | null {
+  const diagnostics = context.snapshot.worktree_diagnostics;
+  if (
+    !diagnostics ||
+    (diagnostics.dirty === 0 &&
+      diagnostics.manual === 0 &&
+      diagnostics.cleanup === 0 &&
+      diagnostics.inspect === 0)
+  ) {
+    return null;
+  }
+  const parts = [
+    diagnostics.dirty > 0 ? `dirty=${diagnostics.dirty}` : null,
+    diagnostics.manual > 0 ? `manual=${diagnostics.manual}` : null,
+    diagnostics.cleanup > 0 ? `cleanup=${diagnostics.cleanup}` : null,
+    diagnostics.inspect > 0 ? `inspect=${diagnostics.inspect}` : null,
+    diagnostics.missing > 0 ? `missing=${diagnostics.missing}` : null
+  ].filter((part): part is string => part !== null);
+  return `worktrees ${parts.join(" ")} | inspect=worktree inspect ${clean(context.teamName)}`;
 }
 
 function formatSidecarWorkerStrip(context: TeamHudRenderContext): string {
@@ -819,6 +858,7 @@ export function renderTeamHud(
     const topologySummary = formatSidecarTopologyLine(context);
     const eventSummary = formatSidecarEventsLine(context);
     const taskSignal = formatSidecarTaskSignal(context);
+    const worktreeSummary = formatSidecarWorktreeLine(context);
     const actionLineCount = suggestedActions.length > 0 ? 1 : 0;
     const taskLineCount = taskSignal ? 1 : 0;
     const reserveTaskSignal = !inspectSummary || !eventSummary;
@@ -849,6 +889,9 @@ export function renderTeamHud(
     }
     if (taskSignal) {
       pushSidecarLine(taskSignal);
+    }
+    if (worktreeSummary) {
+      pushSidecarLine(worktreeSummary);
     }
     if (actionSummary && !inspectSummary) {
       pushSidecarLine(`${c("actions", "cyan")} ${actionSummary}`);

@@ -105,6 +105,11 @@ Usage:
   agmo internal hook
   agmo team start <workers> "<task>" [--allocation-intent <intent>] [--role-map worker-1=role,...] [--hud] [--hud-refresh-ms <ms>]
   agmo team api <send-message|broadcast|mailbox-list|mailbox-mark-delivered|mailbox-mark-notified|create-task|update-task|release-task-claim|read-config|read-manifest|read-worker-status|read-worker-heartbeat|update-worker-heartbeat|write-worker-inbox|write-worker-identity|append-event|read-events|await-event|read-monitor-snapshot|write-monitor-snapshot|write-shutdown-request|read-shutdown-ack|read-idle-state|read-stall-state|read-task-approval|write-task-approval|read-task|list-tasks|get-summary|cleanup|orphan-cleanup|claim-task|transition-task-status> --input '<json>' --json
+  agmo team worktrees
+  agmo team worktree inspect <team> [worker]
+  agmo team worktree archive <team> [worker] [--dry-run]
+  agmo team worktree discard <team> [worker] [--dry-run] [--force] [--archive]
+  agmo team worktree promote <team> <worker> [--branch <name>] [--dry-run]
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
   agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]
