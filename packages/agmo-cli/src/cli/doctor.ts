@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { inspectAgentsContent } from "../agents/agents-md.js";
 import { resolveLaunchPolicy } from "../config/runtime.js";
 import { listLaunchWorkspaces } from "../launch/session-workspace.js";
+import { inspectTeamWorktrees } from "../team/worktree.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { readTextFileIfExists } from "../utils/fs.js";
 import { machineJsonEnvelope, uniqueRecommendedActions } from "../utils/machine-json.js";
@@ -37,6 +38,7 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
   const launchWorkspaces = await listLaunchWorkspaces({
     projectRoot
   });
+  const teamWorktrees = await inspectTeamWorktrees(projectRoot);
   const setupRecommendations: DoctorRecommendation[] = [];
   const vaultRecommendations: DoctorRecommendation[] = [];
   const teamRecommendations: DoctorRecommendation[] = [];
@@ -65,6 +67,7 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
     }
   );
   const launchWorkspaceRecommendations: DoctorRecommendation[] = [];
+  const teamWorktreeRecommendations: DoctorRecommendation[] = [];
   const setupCommand = `agmo setup --scope ${scope}`;
 
   if (
@@ -150,11 +153,58 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
     );
   }
 
+  if (teamWorktrees.counts.missing_manifest > 0) {
+    teamWorktreeRecommendations.push({
+      severity: "warning",
+      message: `Found ${teamWorktrees.counts.missing_manifest} orphaned Agmo worktree directories without ownership manifests; inspect them manually before deleting.`,
+      command: "find .agmo/worktrees -mindepth 1 -maxdepth 2 -print"
+    });
+  }
+
+  if (teamWorktrees.counts.invalid_manifest > 0) {
+    teamWorktreeRecommendations.push({
+      severity: "warning",
+      message: `Found ${teamWorktrees.counts.invalid_manifest} invalid Agmo worktree manifest(s); review durable ownership evidence before cleanup.`,
+      command: "find .agmo/worktrees -name manifest.json -print"
+    });
+  }
+
+  if (teamWorktrees.counts.dirty_worker > 0) {
+    teamWorktreeRecommendations.push({
+      severity: "warning",
+      message: `Found ${teamWorktrees.counts.dirty_worker} dirty Agmo worker worktree(s); inspect git status before cleanup.`,
+      command: "git -C <worker-path> status --short"
+    });
+  }
+
+  if (teamWorktrees.counts.worker_path_not_git_worktree > 0) {
+    teamWorktreeRecommendations.push({
+      severity: "warning",
+      message: `Found ${teamWorktrees.counts.worker_path_not_git_worktree} manifest worker path(s) that are not git worktrees; manual review is required.`
+    });
+  }
+
+  if (teamWorktrees.counts.worker_path_missing > 0) {
+    teamWorktreeRecommendations.push({
+      severity: "info",
+      message: `Found ${teamWorktrees.counts.worker_path_missing} manifest worker path(s) already missing.`
+    });
+  }
+
+  if (teamWorktrees.counts.safe_to_delete_candidates > 0) {
+    teamWorktreeRecommendations.push({
+      severity: "info",
+      message: `Found ${teamWorktrees.counts.safe_to_delete_candidates} manifest-owned clean Agmo worktree set(s) that are cleanup candidates.`,
+      command: "agmo team delete <team> --dry-run --remove-worktrees"
+    });
+  }
+
   const recommendations = {
     setup: setupRecommendations,
     vault: vaultRecommendations,
     team: teamRecommendations,
-    launch_workspaces: launchWorkspaceRecommendations
+    launch_workspaces: launchWorkspaceRecommendations,
+    team_worktrees: teamWorktreeRecommendations
   };
   const allRecommendations = Object.values(recommendations).flat();
   const ok = allRecommendations.every((recommendation) => recommendation.severity !== "warning");
@@ -189,6 +239,7 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
           sources: launchPolicy.sources
         },
         launch_workspaces: launchWorkspaceSummary,
+        team_worktrees: teamWorktrees,
         recommendations,
         recommended_actions: recommendedActions,
         paths: {
