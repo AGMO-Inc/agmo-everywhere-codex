@@ -14,6 +14,13 @@ export type AgmoSessionStartPolicyConfig = {
   show_launch_policy_source?: boolean;
 };
 
+export type AgmoWikiContextPolicyConfig = {
+  context_mode?: "manifest" | "full" | "off";
+  context_budget_chars?: number;
+  manifest_budget_chars?: number;
+  manifest_health?: boolean;
+};
+
 export type AgmoVaultAutosaveUpdateMode = "overwrite" | "append-section";
 
 export type AgmoVaultAutosavePolicyConfig = {
@@ -40,6 +47,7 @@ export type AgmoRuntimeConfig = {
   vault_root?: string;
   launch?: AgmoLaunchPolicyConfig;
   session_start?: AgmoSessionStartPolicyConfig;
+  wiki?: AgmoWikiContextPolicyConfig;
   vault_autosave?: AgmoVaultAutosavePolicyConfig;
   [key: string]: unknown;
 };
@@ -54,6 +62,13 @@ export const DEFAULT_AGMO_LAUNCH_POLICY: Required<AgmoLaunchPolicyConfig> = {
 export const DEFAULT_AGMO_SESSION_START_POLICY: Required<AgmoSessionStartPolicyConfig> = {
   mode: "full",
   show_launch_policy_source: false
+};
+
+export const DEFAULT_AGMO_WIKI_CONTEXT_POLICY: Required<AgmoWikiContextPolicyConfig> = {
+  context_mode: "manifest",
+  context_budget_chars: 6000,
+  manifest_budget_chars: 800,
+  manifest_health: false
 };
 
 export const DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY: Required<
@@ -119,6 +134,16 @@ function normalizeSessionStartMode(
 ): "compact" | "full" | "debug" | undefined {
   return value === "compact" || value === "full" || value === "debug"
     ? value
+    : undefined;
+}
+
+function normalizeWikiContextMode(value: unknown): "manifest" | "full" | "off" | undefined {
+  return value === "manifest" || value === "full" || value === "off" ? value : undefined;
+}
+
+function normalizePositiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
     : undefined;
 }
 
@@ -334,6 +359,123 @@ export async function resolveSessionStartPolicy(cwd = process.cwd()): Promise<{
             : userShowSource !== undefined
               ? "user"
               : "default"
+      }
+    }
+  };
+}
+
+export async function resolveWikiContextPolicy(
+  cwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env
+): Promise<{
+  policy: Required<AgmoWikiContextPolicyConfig>;
+  env_warnings: string[];
+  sources: {
+    project_config_path: string;
+    user_config_path: string;
+    effective: {
+      context_mode: "env" | "project" | "user" | "default";
+      context_budget_chars: "env" | "project" | "user" | "default";
+      manifest_budget_chars: "project" | "user" | "default";
+      manifest_health: "env" | "project" | "user" | "default";
+    };
+  };
+}> {
+  const projectConfigPath = resolveInstallPaths("project", cwd).agmoConfigFile;
+  const userConfigPath = resolveInstallPaths("user", cwd).agmoConfigFile;
+  const userConfig = await readAgmoConfig(userConfigPath);
+  const projectConfig = await readAgmoConfig(projectConfigPath);
+  const userWiki = userConfig.wiki ?? {};
+  const projectWiki = projectConfig.wiki ?? {};
+  const envWarnings: string[] = [];
+
+  const envModeRaw = env.AGMO_CONTEXT_MODE?.trim();
+  const envMode = normalizeWikiContextMode(envModeRaw);
+  if (envModeRaw && envMode === undefined) {
+    envWarnings.push("Ignoring invalid AGMO_CONTEXT_MODE; using manifest wiki context.");
+  }
+  const projectMode = normalizeWikiContextMode(projectWiki.context_mode);
+  const userMode = normalizeWikiContextMode(userWiki.context_mode);
+
+  const envBudgetRaw = env.AGMO_CONTEXT_BUDGET_CHARS?.trim();
+  const envBudget = envBudgetRaw ? normalizePositiveNumber(Number(envBudgetRaw)) : undefined;
+  if (envBudgetRaw && envBudget === undefined) {
+    envWarnings.push("Ignoring invalid AGMO_CONTEXT_BUDGET_CHARS; using manifest wiki context.");
+  }
+  const projectContextBudget = normalizePositiveNumber(projectWiki.context_budget_chars);
+  const userContextBudget = normalizePositiveNumber(userWiki.context_budget_chars);
+  const projectManifestBudget = normalizePositiveNumber(projectWiki.manifest_budget_chars);
+  const userManifestBudget = normalizePositiveNumber(userWiki.manifest_budget_chars);
+
+  const envHealth =
+    env.AGMO_MANIFEST_HEALTH === "1"
+      ? true
+      : env.AGMO_MANIFEST_HEALTH === "0" || env.AGMO_MANIFEST_HEALTH === undefined
+        ? undefined
+        : undefined;
+  const projectHealth = normalizeBoolean(projectWiki.manifest_health);
+  const userHealth = normalizeBoolean(userWiki.manifest_health);
+  const forceManifest = envWarnings.length > 0;
+
+  return {
+    policy: {
+      context_mode: forceManifest
+        ? "manifest"
+        : envMode ??
+          projectMode ??
+          userMode ??
+          DEFAULT_AGMO_WIKI_CONTEXT_POLICY.context_mode,
+      context_budget_chars:
+        envBudget ??
+        projectContextBudget ??
+        userContextBudget ??
+        DEFAULT_AGMO_WIKI_CONTEXT_POLICY.context_budget_chars,
+      manifest_budget_chars:
+        projectManifestBudget ??
+        userManifestBudget ??
+        DEFAULT_AGMO_WIKI_CONTEXT_POLICY.manifest_budget_chars,
+      manifest_health:
+        envHealth ??
+        projectHealth ??
+        userHealth ??
+        DEFAULT_AGMO_WIKI_CONTEXT_POLICY.manifest_health
+    },
+    env_warnings: envWarnings,
+    sources: {
+      project_config_path: projectConfigPath,
+      user_config_path: userConfigPath,
+      effective: {
+        context_mode: forceManifest
+          ? "env"
+          : envMode !== undefined
+            ? "env"
+            : projectMode !== undefined
+              ? "project"
+              : userMode !== undefined
+                ? "user"
+                : "default",
+        context_budget_chars:
+          envBudget !== undefined
+            ? "env"
+            : projectContextBudget !== undefined
+              ? "project"
+              : userContextBudget !== undefined
+                ? "user"
+                : "default",
+        manifest_budget_chars:
+          projectManifestBudget !== undefined
+            ? "project"
+            : userManifestBudget !== undefined
+              ? "user"
+              : "default",
+        manifest_health:
+          envHealth !== undefined
+            ? "env"
+            : projectHealth !== undefined
+              ? "project"
+              : userHealth !== undefined
+                ? "user"
+                : "default"
       }
     }
   };

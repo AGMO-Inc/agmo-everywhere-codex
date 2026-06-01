@@ -2,6 +2,7 @@ import {
   readScopedAgmoConfig,
   resolveLaunchPolicy,
   resolveSessionStartPolicy,
+  resolveWikiContextPolicy,
   resolveVaultAutosavePolicy
 } from "../config/runtime.js";
 import { parseScopeFlag } from "../utils/args.js";
@@ -75,6 +76,7 @@ export async function runConfigCommand(args: string[]): Promise<void> {
 
     const launch = await resolveLaunchPolicy(projectRoot);
     const sessionStart = await resolveSessionStartPolicy(projectRoot);
+    const wiki = await resolveWikiContextPolicy(projectRoot);
     const vaultAutosave = await resolveVaultAutosavePolicy(projectRoot);
     const vault = await resolveVaultRoot(projectRoot);
     console.log(
@@ -85,6 +87,7 @@ export async function runConfigCommand(args: string[]): Promise<void> {
           vault,
           launch,
           session_start: sessionStart,
+          wiki,
           vault_autosave: vaultAutosave
         },
         null,

@@ -8,6 +8,8 @@ argument-hint: "[knowledge question, doc task, or note synthesis ask]"
 
 Use this when durable knowledge should shape the current run.
 
+Agmo treats the vault-backed llm-wiki as the startup-context SSOT. Session start injects a compact manifest by default; use `agmo wiki context --project <project> --full` for lazy full-body loading, `agmo wiki maintain --project <project>` for health checks, and `agmo wiki migrate-wisdom --scope <user|project> --project <project> --dry-run` before migrating legacy `.agmo/memory/wisdom.json` entries.
+
 ## Main-session contract
 
 The main session should delegate this workflow to `agmo-wisdom`, then integrate the result back into the active workflow.

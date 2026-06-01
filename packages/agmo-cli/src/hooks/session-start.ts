@@ -4,13 +4,15 @@ import { writeSessionComposedAgentsFile } from "../agents/agents-md.js";
 import { AGMO_AGENT_DEFINITIONS } from "../agents/definitions.js";
 import {
   resolveLaunchPolicy,
-  resolveSessionStartPolicy
+  resolveSessionStartPolicy,
+  resolveWikiContextPolicy
 } from "../config/runtime.js";
 import { readOptionalSessionId, type AgmoHookPayload } from "./runtime-state.js";
 import { readTextFileIfExists } from "../utils/fs.js";
 import { resolveInstallPaths, resolveRuntimeRoot } from "../utils/paths.js";
 import { resolveVaultRoot } from "../vault/runtime.js";
-import { readEffectiveWisdom, type AgmoEffectiveWisdomSummary } from "../wisdom/store.js";
+import { HOOK_FULL_HARD_CAP_CHARS, renderWikiContext } from "../wiki/context.js";
+import { inferProjectName, resolveWikiRuntime } from "../wiki/runtime.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -297,39 +299,6 @@ function formatWisdomLine(
   return `- Wisdom: vault ready at ${formatPath(vault.vault_root, runtimeRoot)} (${vault.source}).`;
 }
 
-function excerptWisdomContent(value: string): string {
-  return value.length > 96 ? `${value.slice(0, 93)}...` : value;
-}
-
-function formatWisdomMemoryLines(summary: AgmoEffectiveWisdomSummary): string[] {
-  if (summary.merged.length === 0) {
-    return ["- Wisdom memory: no Agmo-native learn/decision/issue entries yet."];
-  }
-
-  const lines = [
-    `- Wisdom memory: loaded ${summary.merged.length} entries (global=${summary.user.entries.length}, project=${summary.project.entries.length}).`
-  ];
-
-  for (const kind of ["decision", "issue", "learn"] as const) {
-    const scopedEntries = [
-      ...summary.project.entries
-        .filter((entry) => entry.kind === kind)
-        .slice(0, 1)
-        .map((entry) => `[project] ${excerptWisdomContent(entry.content)}`),
-      ...summary.user.entries
-        .filter((entry) => entry.kind === kind)
-        .slice(0, 1)
-        .map((entry) => `[global] ${excerptWisdomContent(entry.content)}`)
-    ];
-
-    if (scopedEntries.length > 0) {
-      lines.push(`  - ${kind}s: ${scopedEntries.join("; ")}`);
-    }
-  }
-
-  return lines;
-}
-
 function formatLaunchPolicyLine(
   policy: Awaited<ReturnType<typeof resolveLaunchPolicy>>["policy"]
 ): string {
@@ -359,7 +328,6 @@ function formatCompactStatusLine(args: {
   teams: TeamSummary[];
   vault: Awaited<ReturnType<typeof resolveVaultRoot>>;
   currentSessionId: string | null;
-  wisdom: AgmoEffectiveWisdomSummary;
 }): string {
   const workflowSummary =
     args.workflows.length === 0
@@ -367,12 +335,8 @@ function formatCompactStatusLine(args: {
       : `workflows=${args.workflows.length}`;
   const teamSummary = formatCompactTeamSummary(args.teams, args.currentSessionId);
   const vaultSummary = args.vault.vault_root ? "vault=ready" : "vault=unconfigured";
-  const wisdomSummary =
-    args.wisdom.merged.length === 0
-      ? "wisdom=none"
-      : `wisdom=global:${args.wisdom.user.entries.length}/project:${args.wisdom.project.entries.length}`;
 
-  return `- Status: ${workflowSummary}; ${teamSummary}; ${vaultSummary}; ${wisdomSummary}.`;
+  return `- Status: ${workflowSummary}; ${teamSummary}; ${vaultSummary}.`;
 }
 
 function resolveSessionStartMode(
@@ -450,13 +414,15 @@ function formatDebugLines(args: {
   vault: Awaited<ReturnType<typeof resolveVaultRoot>>;
   launchPolicy: Awaited<ReturnType<typeof resolveLaunchPolicy>>;
   sessionStartPolicy: Awaited<ReturnType<typeof resolveSessionStartPolicy>>;
+  wikiPolicy: Awaited<ReturnType<typeof resolveWikiContextPolicy>>;
 }): string[] {
   return [
     `- Debug: session_id=${args.payload ? readOptionalSessionId(args.payload) ?? "none" : "none"}; launch_workspace=${args.env.AGMO_LAUNCH_WORKSPACE_ROOT?.trim() || "none"}.`,
     `- Debug: vault source=${args.vault.source}; checked_paths=${args.vault.checked_paths.map((path) => formatPath(path, args.runtimeRoot)).join(", ") || "none"}.`,
     `- Debug: launch config paths: project=${formatPath(args.launchPolicy.sources.project_config_path, args.runtimeRoot)}; user=${formatPath(args.launchPolicy.sources.user_config_path, args.runtimeRoot)}.`,
     `- Debug: session-start config paths: project=${formatPath(args.sessionStartPolicy.sources.project_config_path, args.runtimeRoot)}; user=${formatPath(args.sessionStartPolicy.sources.user_config_path, args.runtimeRoot)}.`,
-    `- Debug: session-start policy source: mode=${args.sessionStartPolicy.sources.effective.mode}; show_launch_policy_source=${args.sessionStartPolicy.sources.effective.show_launch_policy_source}.`
+    `- Debug: session-start policy source: mode=${args.sessionStartPolicy.sources.effective.mode}; show_launch_policy_source=${args.sessionStartPolicy.sources.effective.show_launch_policy_source}.`,
+    `- Debug: wiki context policy source: mode=${args.wikiPolicy.sources.effective.context_mode}; budget=${args.wikiPolicy.sources.effective.context_budget_chars}; manifest_budget=${args.wikiPolicy.sources.effective.manifest_budget_chars}.`
   ];
 }
 
@@ -492,6 +458,46 @@ async function formatSessionInstructionsLine(args: {
   return `- Session AGENTS: ${formatPath(result.path, args.runtimeRoot)} (${sourceSummary}, ${result.status}).`;
 }
 
+async function formatWikiContextLines(args: {
+  runtimeRoot: string;
+  env: NodeJS.ProcessEnv;
+}): Promise<string[]> {
+  const wikiPolicy = await resolveWikiContextPolicy(args.runtimeRoot, args.env);
+  const warnings = wikiPolicy.env_warnings.map((warning) => `- Wiki context warning: ${warning}`);
+  if (wikiPolicy.policy.context_mode === "off") {
+    return [...warnings, "- Wiki context: off by policy."];
+  }
+
+  const runtime = await resolveWikiRuntime({
+    cwd: args.runtimeRoot,
+    project: inferProjectName(args.runtimeRoot)
+  });
+  if (!runtime) {
+    return [
+      ...warnings,
+      "- Wiki context: vault root not configured; run `agmo vault config set-root <path>` or set AGMO_VAULT_ROOT."
+    ];
+  }
+
+  const fullBudget = Math.min(
+    wikiPolicy.policy.context_budget_chars,
+    HOOK_FULL_HARD_CAP_CHARS
+  );
+  const mode = wikiPolicy.policy.context_mode;
+  const budget =
+    mode === "manifest" ? wikiPolicy.policy.manifest_budget_chars : fullBudget;
+
+  const context = await renderWikiContext({
+    runtime,
+    mode,
+    format: "markdown",
+    budgetChars: budget,
+    includeHealth: wikiPolicy.policy.manifest_health
+  });
+
+  return [...warnings, context.trimEnd()];
+}
+
 export async function buildSessionStartContext(
   cwd = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
@@ -506,8 +512,9 @@ export async function buildSessionStartContext(
   );
   const activeTeams = await listActiveTeams(runtimeRoot, currentSessionId);
   const vault = await resolveVaultRoot(runtimeRoot);
-  const wisdom = await readEffectiveWisdom(runtimeRoot);
   const sessionStartPolicy = await resolveSessionStartPolicy(runtimeRoot);
+  const wikiPolicy = await resolveWikiContextPolicy(runtimeRoot, env);
+  const wikiContextLines = await formatWikiContextLines({ runtimeRoot, env });
   const sessionInstructionsLine = await formatSessionInstructionsLine({
     runtimeRoot,
     payload,
@@ -537,9 +544,9 @@ export async function buildSessionStartContext(
         workflows,
         teams: activeTeams,
         vault,
-        currentSessionId,
-        wisdom
-      })
+        currentSessionId
+      }),
+      ...wikiContextLines
     ].join("\n");
   }
 
@@ -553,7 +560,7 @@ export async function buildSessionStartContext(
       ? [formatLaunchPolicySourceLine(launchPolicy.sources.effective)]
       : []),
     formatWisdomLine(vault, runtimeRoot),
-    ...formatWisdomMemoryLines(wisdom),
+    ...wikiContextLines,
     formatWorkflowLine(workflows),
     formatTeamLine(activeTeams, env, currentSessionId)
   ];
@@ -566,7 +573,8 @@ export async function buildSessionStartContext(
         payload,
         vault,
         launchPolicy,
-        sessionStartPolicy
+        sessionStartPolicy,
+        wikiPolicy
       })
     );
   }
