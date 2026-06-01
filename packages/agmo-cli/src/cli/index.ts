@@ -10,6 +10,7 @@ import { runSessionStartCommand } from "./session-start.js";
 import { runSetupCommand } from "./setup.js";
 import { runTeamCommand } from "./team.js";
 import { runVaultCommand } from "./vault.js";
+import { runWikiCommand } from "./wiki.js";
 import { runWisdomCommand } from "./wisdom.js";
 
 const args = process.argv.slice(2);
@@ -46,6 +47,9 @@ async function main(): Promise<void> {
       return;
     case "vault":
       await runVaultCommand(args.slice(1));
+      return;
+    case "wiki":
+      await runWikiCommand(args.slice(1));
       return;
     case "wisdom":
       await runWisdomCommand(args.slice(1));
@@ -134,6 +138,9 @@ Usage:
   agmo wisdom show [--scope user|project]
   agmo wisdom add <learn|decision|issue> <content> [--scope user|project]
   agmo wisdom reset [--scope user|project]
+  agmo wiki context --project <name> [--budget n] [--format markdown|json] [--manifest|--full]
+  agmo wiki maintain --project <name> [--max-age-days n] [--format markdown|json]
+  agmo wiki migrate-wisdom [--scope user|project] [--project <name>] [--dry-run]
   agmo vault config show
   agmo vault config set-root <path> [--scope user|project]
   agmo vault scaffold --type <type> --project <project> --title <title> [--schema <name>] [--template-file <path>]

@@ -7,6 +7,7 @@ import {
 import {
   DEFAULT_AGMO_LAUNCH_POLICY,
   DEFAULT_AGMO_SESSION_START_POLICY,
+  DEFAULT_AGMO_WIKI_CONTEXT_POLICY,
   DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY,
 } from "./runtime.js";
 
@@ -56,6 +57,14 @@ export function buildAgmoRuntimeConfig(
       mode: DEFAULT_AGMO_SESSION_START_POLICY.mode,
       show_launch_policy_source:
         DEFAULT_AGMO_SESSION_START_POLICY.show_launch_policy_source,
+    },
+    wiki: {
+      context_mode: DEFAULT_AGMO_WIKI_CONTEXT_POLICY.context_mode,
+      context_budget_chars:
+        DEFAULT_AGMO_WIKI_CONTEXT_POLICY.context_budget_chars,
+      manifest_budget_chars:
+        DEFAULT_AGMO_WIKI_CONTEXT_POLICY.manifest_budget_chars,
+      manifest_health: DEFAULT_AGMO_WIKI_CONTEXT_POLICY.manifest_health,
     },
     vault_autosave: {
       enabled: DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY.enabled,

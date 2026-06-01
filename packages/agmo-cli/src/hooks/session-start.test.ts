@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { buildSessionStartContext } from "./session-start.js";
 import { startTeamRuntime } from "../team/runtime.js";
@@ -102,9 +102,23 @@ test("buildSessionStartContext hides unrelated active team names when no current
   });
 });
 
-test("buildSessionStartContext merges global and project wisdom into Agmo bootstrap output", async () => {
+test("buildSessionStartContext includes wiki manifest by default and omits raw wisdom excerpts", async () => {
   await withTempHome(async () => {
     const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-session-start-wisdom-"));
+    const project = basename(tempRoot);
+    const vault = join(tempRoot, "vault");
+    const captures = join(vault, ".agmo", "llm-wiki", "projects", project, "captures");
+    await mkdir(captures, { recursive: true });
+    await mkdir(join(tempRoot, ".agmo"), { recursive: true });
+    await writeFile(join(tempRoot, ".agmo", "config.json"), JSON.stringify({ vault_root: vault }, null, 2));
+    await writeFile(
+      join(vault, ".agmo", "llm-wiki", "projects", `${project}.md`),
+      "---\nupdated: 2026-05-31\n---\n# Project Capsule\n"
+    );
+    await writeFile(
+      join(captures, "capture.md"),
+      "---\ntitle: Startup Manifest Capture\n---\n# Capture\nFull body should stay lazy\n"
+    );
 
     await addWisdomEntry({
       scope: "user",
@@ -127,10 +141,67 @@ test("buildSessionStartContext merges global and project wisdom into Agmo bootst
 
     const context = await buildSessionStartContext(tempRoot);
 
-    assert.match(context, /Wisdom memory: loaded 3 entries \(global=1, project=2\)\./);
-    assert.match(context, /decisions: \[project\] Project decision: Agmo owns startup wisdom context\./);
-    assert.match(context, /issues: \[project\] Current issue: remove remaining startup dependency\./);
-    assert.match(context, /learns: \[global\] Global learn: prefer compact JSON CLI outputs\./);
+    assert.match(context, /LLM Wiki Manifest/);
+    assert.match(context, /Startup Manifest Capture/);
+    assert.doesNotMatch(context, /Full body should stay lazy/);
+    assert.doesNotMatch(context, /Project decision: Agmo owns startup wisdom context\./);
+    assert.doesNotMatch(context, /Current issue: remove remaining startup dependency\./);
+    assert.doesNotMatch(context, /Global learn: prefer compact JSON CLI outputs\./);
+  });
+});
+
+test("buildSessionStartContext injects bounded full wiki context only when AGMO_CONTEXT_MODE=full", async () => {
+  await withTempHome(async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-session-start-wiki-full-"));
+    const project = basename(tempRoot);
+    const vault = join(tempRoot, "vault");
+    const captures = join(vault, ".agmo", "llm-wiki", "projects", project, "captures");
+    await mkdir(captures, { recursive: true });
+    await mkdir(join(tempRoot, ".agmo"), { recursive: true });
+    await writeFile(
+      join(tempRoot, ".agmo", "config.json"),
+      JSON.stringify({ vault_root: vault, session_start: { mode: "debug" } }, null, 2)
+    );
+    await writeFile(
+      join(captures, "capture.md"),
+      "---\ntitle: Full Capture\n---\n# Capture\nFull wiki body is available\n"
+    );
+
+    const debugManifest = await buildSessionStartContext(tempRoot, {});
+    assert.match(debugManifest, /LLM Wiki Manifest/);
+    assert.doesNotMatch(debugManifest, /Full wiki body is available/);
+
+    const full = await buildSessionStartContext(tempRoot, {
+      AGMO_CONTEXT_MODE: "full",
+      AGMO_CONTEXT_BUDGET_CHARS: "12000"
+    });
+    assert.match(full, /LLM Wiki Context/);
+    assert.match(full, /Full wiki body is available/);
+  });
+});
+
+test("buildSessionStartContext falls back to manifest with warning on invalid wiki budget env", async () => {
+  await withTempHome(async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-session-start-wiki-invalid-"));
+    const project = basename(tempRoot);
+    const vault = join(tempRoot, "vault");
+    const captures = join(vault, ".agmo", "llm-wiki", "projects", project, "captures");
+    await mkdir(captures, { recursive: true });
+    await mkdir(join(tempRoot, ".agmo"), { recursive: true });
+    await writeFile(join(tempRoot, ".agmo", "config.json"), JSON.stringify({ vault_root: vault }, null, 2));
+    await writeFile(
+      join(captures, "capture.md"),
+      "---\ntitle: Invalid Budget Capture\n---\n# Capture\nInvalid budget body\n"
+    );
+
+    const context = await buildSessionStartContext(tempRoot, {
+      AGMO_CONTEXT_MODE: "full",
+      AGMO_CONTEXT_BUDGET_CHARS: "0"
+    });
+
+    assert.match(context, /Wiki context warning: Ignoring invalid AGMO_CONTEXT_BUDGET_CHARS/);
+    assert.match(context, /LLM Wiki Manifest/);
+    assert.doesNotMatch(context, /Invalid budget body/);
   });
 });
 
