@@ -69,4 +69,11 @@ export type AgmoTeamMonitorSnapshot = {
     retry_manual_required: number;
     orphan_warnings: string[];
   };
+  worktree_diagnostics?: {
+    dirty: number;
+    manual: number;
+    cleanup: number;
+    inspect: number;
+    missing: number;
+  };
 };

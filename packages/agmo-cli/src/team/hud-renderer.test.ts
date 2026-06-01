@@ -460,6 +460,25 @@ test("renderTeamHud sidecar healthy baseline has no inspect hints", () => {
   assert.doesNotMatch(rendered, /^inspect\b/m);
 });
 
+test("renderTeamHud sidecar surfaces compact worktree diagnostics and inspect hint", () => {
+  const testContext = context();
+  testContext.snapshot.worktree_diagnostics = {
+    dirty: 1,
+    manual: 1,
+    cleanup: 2,
+    inspect: 0,
+    missing: 0
+  };
+  testContext.pendingDispatch = 0;
+  testContext.topActions = [];
+
+  const rendered = renderSidecar(testContext, { maxWidth: 150, maxLines: 7 });
+
+  assert.match(rendered, /worktrees dirty=1 manual=1 cleanup=2/);
+  assert.match(rendered, /worktree inspect demo\?team/);
+  assertInspectHintIsReadOnly(rendered);
+});
+
 test("renderTeamHud sidecar shows read-only worker status inspect hints", () => {
   const cases: Array<{
     name: string;

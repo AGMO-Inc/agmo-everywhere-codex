@@ -36,6 +36,12 @@ import {
   assertCanonicalTeamName,
   resolveTeamMonitorPolicyPath
 } from "../team/state/index.js";
+import {
+  archiveTeamWorktree,
+  discardTeamWorktree,
+  inspectTeamWorktrees,
+  promoteTeamWorktree
+} from "../team/worktree.js";
 import { parseScopeFlag } from "../utils/args.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 import { writeJsonFile } from "../utils/fs.js";
@@ -517,6 +523,151 @@ export async function runTeamCommand(args: string[]): Promise<void> {
         roleOverrides
       }, cwd);
       printTeamMachineJson("team start", result);
+      return;
+    }
+    case "worktrees": {
+      const diagnostics = await inspectTeamWorktrees(cwd);
+      printTeamMachineJson("team worktrees", {
+        recommended_actions: uniqueRecommendedActions(
+          diagnostics.teams.flatMap((team) => team.recommended_actions)
+        ),
+        diagnostics
+      });
+      return;
+    }
+    case "worktree": {
+      const operation = args[1];
+      if (!operation || !["inspect", "archive", "discard", "promote"].includes(operation)) {
+        throw new Error(
+          "usage: agmo team worktree <inspect|archive|discard|promote> <team> [worker] [--dry-run]"
+        );
+      }
+      const teamName = args[2];
+      const workerName = args[3]?.startsWith("--") ? undefined : args[3];
+      const optionArgs = args.slice(workerName ? 4 : 3);
+      if (!teamName) {
+        throw new Error(
+          operation === "promote"
+            ? "usage: agmo team worktree promote <team> <worker> [--branch <name>] [--dry-run]"
+            : `usage: agmo team worktree ${operation} <team> [worker] [--dry-run]`
+        );
+      }
+
+      if (operation === "archive") {
+        const result = await archiveTeamWorktree(
+          teamName,
+          {
+            workerName,
+            dryRun: optionArgs.includes("--dry-run")
+          },
+          cwd
+        );
+        const ok =
+          result.status !== "failed" &&
+          result.failed === 0 &&
+          !(result.archived === 0 && result.skipped > 0);
+        printTeamMachineJson("team worktree archive", {
+          recommended_actions: result.status === "failed" ? [`team worktree inspect ${teamName}`] : [],
+          ...result
+        }, { ok });
+        if (result.status === "failed" || result.failed > 0 || (result.archived === 0 && result.skipped > 0)) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      if (operation === "discard") {
+        const result = await discardTeamWorktree(
+          teamName,
+          {
+            workerName,
+            dryRun: optionArgs.includes("--dry-run"),
+            force: optionArgs.includes("--force"),
+            archive: optionArgs.includes("--archive")
+          },
+          cwd
+        );
+        printTeamMachineJson("team worktree discard", {
+          recommended_actions: result.status === "refused" || result.status === "failed"
+            ? [`team worktree inspect ${teamName}${workerName ? ` ${workerName}` : ""}`]
+            : [],
+          ...result
+        }, { ok: result.failed === 0 && result.refused === 0 });
+        if (result.failed > 0 || result.refused > 0) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      if (operation === "promote") {
+        if (!workerName) {
+          throw new Error("usage: agmo team worktree promote <team> <worker> [--branch <name>] [--dry-run]");
+        }
+        const result = await promoteTeamWorktree(
+          teamName,
+          workerName,
+          {
+            branchName: parseOption(optionArgs, "--branch"),
+            dryRun: optionArgs.includes("--dry-run")
+          },
+          cwd
+        );
+        printTeamMachineJson("team worktree promote", result, {
+          ok: result.status === "promoted" || result.status === "would_promote" || result.status === "already_exists"
+        });
+        if (result.status === "failed" || result.status === "refused") {
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      const diagnostics = await inspectTeamWorktrees(cwd);
+      const team = diagnostics.teams.find((entry) => entry.team_name === teamName);
+      if (!team) {
+        printTeamMachineJson(
+          "team worktree inspect",
+          {
+            team_name: teamName,
+            worker_name: workerName ?? null,
+            found: false,
+            reason: "team_not_found",
+            recommended_actions: ["team worktrees"],
+            diagnostics: null
+          },
+          { ok: false }
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      const worker = workerName
+        ? team.workers.find((entry) => entry.worker_name === workerName)
+        : undefined;
+      if (workerName && !worker) {
+        printTeamMachineJson(
+          "team worktree inspect",
+          {
+            team_name: teamName,
+            worker_name: workerName,
+            found: false,
+            reason: "worker_not_found",
+            recommended_actions: [`team worktree inspect ${teamName}`],
+            diagnostics: team
+          },
+          { ok: false }
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      printTeamMachineJson("team worktree inspect", {
+        team_name: teamName,
+        worker_name: workerName ?? null,
+        found: true,
+        classification: worker?.classification ?? team.classification,
+        recommended_actions: worker?.recommended_actions ?? team.recommended_actions,
+        diagnostics: worker ?? team
+      });
       return;
     }
     case "status": {
@@ -1333,6 +1484,11 @@ export async function runTeamCommand(args: string[]): Promise<void> {
       console.log(`Usage:
   agmo team start <workers> "<task>" [--name <team-name>] [--allocation-intent implementation|verification|planning|knowledge] [--role-map worker-1=agmo-planner,...] [--hud] [--hud-refresh-ms <ms>] [--hud-clear|--hud-no-clear]
   agmo team api <${TEAM_API_OPERATION_USAGE}> --input '<json>' --json
+  agmo team worktrees
+  agmo team worktree inspect <team> [worker]
+  agmo team worktree archive <team> [worker] [--dry-run]
+  agmo team worktree discard <team> [worker] [--dry-run] [--force] [--archive]
+  agmo team worktree promote <team> <worker> [--branch <name>] [--dry-run]
   agmo team status <team-name>
   agmo team shutdown <team-name> [--grace-ms <ms>]
   agmo team delete <team> [--force] [--dry-run] [--keep-worktrees|--remove-worktrees]

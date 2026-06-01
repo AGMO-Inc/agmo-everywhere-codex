@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import os from "node:os";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { appendTeamApiEvent, readTeamStatus, shutdownTeamRuntime, startTeamRuntime } from "../team/runtime.js";
 import {
@@ -17,7 +18,7 @@ import {
   resolveWorkerIdentityPath,
   resolveWorkerInboxPath,
 } from "../team/state/index.js";
-import { resolveTeamWorktreeRoot } from "../team/worktree.js";
+import { resolveTeamWorktreeRoot, writeTeamWorktreeManifest } from "../team/worktree.js";
 import { runTeamCommand, runTeamHudWatchLoop } from "./team.js";
 
 async function captureTeamCommand(
@@ -2584,6 +2585,215 @@ test("runTeamCommand cleanup-stale prints additive machine JSON envelope", async
   assert.equal(output.team_count, 0);
   assert.equal(output.active_team_count, 0);
   assert.ok(Array.isArray(output.cleaned));
+});
+
+test("runTeamCommand worktrees prints all worktree diagnostics as machine JSON", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-worktrees-"));
+  const teamName = "cli-worktrees-team";
+  const workerPath = join(resolveTeamWorktreeRoot(teamName, tempRoot), "worker-1");
+  await mkdir(workerPath, { recursive: true });
+  await writeTeamWorktreeManifest(
+    teamName,
+    [
+      {
+        worker_name: "worker-1",
+        path: workerPath,
+        git_enabled: false,
+        repo_root: resolve(tempRoot),
+        base_ref: "filesystem",
+        status: "existing",
+      },
+    ],
+    {
+      createdAt: new Date().toISOString(),
+      cwd: tempRoot,
+    },
+  );
+
+  const output = await captureTeamCommand(["worktrees"], tempRoot);
+
+  assertMachineEnvelope(output, "team.worktrees");
+  assert.equal(output.command, "team worktrees");
+  assert.deepEqual(output.recommended_actions, [
+    `team delete ${teamName} --dry-run --remove-worktrees`,
+  ]);
+  const diagnostics = output.diagnostics as {
+    counts?: { teams?: number; safe_to_delete_candidates?: number };
+    teams?: Array<{ team_name?: string; classification?: string; recommended_actions?: string[] }>;
+  };
+  assert.equal(diagnostics.counts?.teams, 1);
+  assert.equal(diagnostics.counts?.safe_to_delete_candidates, 1);
+  assert.equal(diagnostics.teams?.[0]?.team_name, teamName);
+  assert.equal(diagnostics.teams?.[0]?.classification, "cleanup_candidate");
+});
+
+test("runTeamCommand worktree inspect prints one worker with git summary", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-worktree-inspect-"));
+  execFileSync("git", ["init"], { cwd: tempRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "agmo@example.test"], {
+    cwd: tempRoot,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["config", "user.name", "Agmo Test"], {
+    cwd: tempRoot,
+    stdio: "ignore",
+  });
+  await writeFile(join(tempRoot, "tracked.txt"), "tracked\n");
+  execFileSync("git", ["add", "tracked.txt"], { cwd: tempRoot, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: tempRoot, stdio: "ignore" });
+
+  const teamName = "cli-inspect-git-team";
+  const workerPath = join(resolveTeamWorktreeRoot(teamName, tempRoot), "worker-1");
+  execFileSync("git", ["worktree", "add", "-b", `agmo/${teamName}/worker-1`, workerPath, "HEAD"], {
+    cwd: tempRoot,
+    stdio: "ignore",
+  });
+  await writeFile(join(workerPath, "tracked.txt"), "changed\n");
+  await writeTeamWorktreeManifest(
+    teamName,
+    [
+      {
+        worker_name: "worker-1",
+        path: workerPath,
+        git_enabled: true,
+        repo_root: tempRoot,
+        base_ref: "HEAD",
+        branch_name: `agmo/${teamName}/worker-1`,
+        status: "created",
+      },
+    ],
+    {
+      createdAt: new Date().toISOString(),
+      cwd: tempRoot,
+    },
+  );
+
+  const output = await captureTeamCommand(
+    ["worktree", "inspect", teamName, "worker-1"],
+    tempRoot,
+  );
+
+  assertMachineEnvelope(output, "team.worktree.inspect");
+  assert.equal(output.command, "team worktree inspect");
+  assert.equal(output.found, true);
+  assert.equal(output.team_name, teamName);
+  assert.equal(output.worker_name, "worker-1");
+  assert.equal(output.classification, "manual_review_required");
+  assert.ok(
+    (output.recommended_actions as string[]).includes(
+      `git -C ${workerPath} status --short`,
+    ),
+  );
+  const diagnostics = output.diagnostics as {
+    worker_name?: string;
+    git_summary?: {
+      branch?: string | null;
+      head?: string | null;
+      status_porcelain?: { count?: number; entries?: string[] };
+      diff_numstat?: { count?: number; files?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      head_merged_into_repo_head?: boolean | null;
+    };
+  };
+  assert.equal(diagnostics.worker_name, "worker-1");
+  assert.equal(diagnostics.git_summary?.branch, `agmo/${teamName}/worker-1`);
+  assert.match(diagnostics.git_summary?.head ?? "", /^[0-9a-f]{40}$/);
+  assert.equal(diagnostics.git_summary?.status_porcelain?.count, 1);
+  assert.deepEqual(diagnostics.git_summary?.status_porcelain?.entries, [" M tracked.txt"]);
+  assert.equal(diagnostics.git_summary?.diff_numstat?.count, 1);
+  assert.deepEqual(diagnostics.git_summary?.diff_numstat?.files?.[0], {
+    path: "tracked.txt",
+    additions: 1,
+    deletions: 1,
+    binary: false,
+  });
+  assert.equal(diagnostics.git_summary?.head_merged_into_repo_head, true);
+});
+
+test("runTeamCommand worktree inspect reports missing teams and workers with exit code 1", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-worktree-missing-"));
+  const missingTeam = await captureTeamCommandOutput(
+    ["worktree", "inspect", "missing-team"],
+    tempRoot,
+  );
+  const missingTeamOutput = JSON.parse(missingTeam.stdout) as Record<string, unknown>;
+  assert.equal(missingTeam.exitCode, 1);
+  assertMachineEnvelope(missingTeamOutput, "team.worktree.inspect", false);
+  assert.equal(missingTeamOutput.reason, "team_not_found");
+
+  const teamName = "cli-missing-worker-team";
+  const workerPath = join(resolveTeamWorktreeRoot(teamName, tempRoot), "worker-1");
+  await mkdir(workerPath, { recursive: true });
+  await writeTeamWorktreeManifest(
+    teamName,
+    [
+      {
+        worker_name: "worker-1",
+        path: workerPath,
+        git_enabled: false,
+        repo_root: resolve(tempRoot),
+        base_ref: "filesystem",
+        status: "existing",
+      },
+    ],
+    {
+      createdAt: new Date().toISOString(),
+      cwd: tempRoot,
+    },
+  );
+
+  const missingWorker = await captureTeamCommandOutput(
+    ["worktree", "inspect", teamName, "worker-2"],
+    tempRoot,
+  );
+  const missingWorkerOutput = JSON.parse(missingWorker.stdout) as Record<string, unknown>;
+  assert.equal(missingWorker.exitCode, 1);
+  assertMachineEnvelope(missingWorkerOutput, "team.worktree.inspect", false);
+  assert.equal(missingWorkerOutput.reason, "worker_not_found");
+  assert.equal(missingWorkerOutput.team_name, teamName);
+  assert.equal(missingWorkerOutput.worker_name, "worker-2");
+});
+
+test("runTeamCommand worktree archive and discard use machine JSON envelopes", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-team-cli-worktree-ops-"));
+  const teamName = "cli-worktree-ops-team";
+  const workerPath = join(resolveTeamWorktreeRoot(teamName, tempRoot), "worker-1");
+  await mkdir(workerPath, { recursive: true });
+  await writeTeamWorktreeManifest(
+    teamName,
+    [
+      {
+        worker_name: "worker-1",
+        path: workerPath,
+        git_enabled: false,
+        repo_root: resolve(tempRoot),
+        base_ref: "filesystem",
+        status: "existing",
+      },
+    ],
+    {
+      createdAt: new Date().toISOString(),
+      cwd: tempRoot,
+    },
+  );
+
+  const archive = await captureTeamCommand(
+    ["worktree", "archive", teamName, "worker-1", "--dry-run"],
+    tempRoot,
+  );
+  assertMachineEnvelope(archive, "team.worktree.archive");
+  assert.equal(archive.command, "team worktree archive");
+  assert.equal(archive.status, "would_archive");
+  assert.equal(archive.dry_run, true);
+
+  const discard = await captureTeamCommand(
+    ["worktree", "discard", teamName, "worker-1"],
+    tempRoot,
+  );
+  assertMachineEnvelope(discard, "team.worktree.discard");
+  assert.equal(discard.command, "team worktree discard");
+  assert.equal(discard.status, "would_remove");
+  assert.equal(discard.dry_run, true);
+  assert.equal(existsSync(workerPath), true);
 });
 
 test("runTeamCommand shutdown-ack prints current ad hoc JSON shape after shutdown request", async () => {
