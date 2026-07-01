@@ -45,10 +45,12 @@ Before asking about internals, inspect the repo first and ask evidence-backed qu
 
 By the end of the brainstorming pass, try to provide:
 
-1. 2-3 viable approaches with tradeoffs
+1. 2-3 viable approaches with tradeoffs, starting with the smallest viable approach
 2. a recommended direction
 3. the main risks or tensions
 4. the next likely workflow transition
+
+When defining options and scope boundaries, use the same laziness ladder that guides execution: avoid building it if it is not needed, then prefer existing code, standard library behavior, native platform/framework features, existing dependencies, one-line local changes, and only then minimal new code. Use that ladder to say what stays out of scope and why.
 
 ## Artifact save body
 
