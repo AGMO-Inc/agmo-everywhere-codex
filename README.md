@@ -9,11 +9,11 @@
 
 Codex-native Agmo runtime and plugin for planning, execution, verification, GitHub workflows, vault persistence, and tmux-backed team orchestration.
 
-[![Version](https://img.shields.io/badge/version-0.1.3-1f2937.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.1.4-1f2937.svg)](package.json)
 [![CLI](https://img.shields.io/badge/runtime-agmo%20CLI-0f766e.svg)](packages/agmo-cli)
 [![Plugin](https://img.shields.io/badge/plugin-Codex%20native-1d4ed8.svg)](packages/agmo-plugin)
 [![Agents](https://img.shields.io/badge/agents-7-14532d.svg)](#managed-native-agent-roster)
-[![Skills](https://img.shields.io/badge/skills-15-b45309.svg)](#skill-surface)
+[![Skills](https://img.shields.io/badge/skills-18-b45309.svg)](#skill-surface)
 [![License](https://img.shields.io/badge/license-MIT-6b7280.svg)](LICENSE)
 
 </div>
@@ -206,10 +206,13 @@ Agmo keeps a small pinned roster under `.codex/agents/*.toml`.
 - `wisdom`
 - `vault-search`
 - `save-note`
+- `wiki-maintain`
+- `debt`
 
-### Verification and GitHub skills
+### Verification, review, and GitHub skills
 
 - `verify`
+- `code-review`
 - `git-workflow`
 - `create-issue`
 - `note-to-issue`
@@ -221,6 +224,12 @@ These three are modeled after the Claude Code plugin project, but adapted for Co
 - `git-workflow`: commit, push, PR, and branch operations
 - `create-issue`: create GitHub issues from conversation or repo context
 - `note-to-issue`: convert an existing vault or markdown note into a GitHub issue
+
+### Review and debt additions
+
+- `code-review`: run Codex-native staged review through `agmo-critic` and `agmo-verifier` where proof is needed
+- `debt`: harvest `debt:` markers into a read-only ledger and hand selected rows to `plan` only after confirmation
+- `wiki-maintain`: audit and maintain the vault-backed llm-wiki knowledge base
 
 ## Architecture
 
