@@ -8,6 +8,7 @@ import {
   DEFAULT_AGMO_LAUNCH_POLICY,
   DEFAULT_AGMO_SESSION_START_POLICY,
   DEFAULT_AGMO_WIKI_CONTEXT_POLICY,
+  DEFAULT_AGMO_CLEANUP_POLICY,
   DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY,
 } from "./runtime.js";
 
@@ -65,6 +66,9 @@ export function buildAgmoRuntimeConfig(
       manifest_budget_chars:
         DEFAULT_AGMO_WIKI_CONTEXT_POLICY.manifest_budget_chars,
       manifest_health: DEFAULT_AGMO_WIKI_CONTEXT_POLICY.manifest_health,
+    },
+    cleanup: {
+      ...DEFAULT_AGMO_CLEANUP_POLICY,
     },
     vault_autosave: {
       enabled: DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY.enabled,

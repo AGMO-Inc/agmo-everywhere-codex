@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { runAgentsCommand } from "./agents.js";
+import { runCleanupCommand } from "./cleanup.js";
 import { runConfigCommand } from "./config.js";
 import { runDoctorCommand } from "./doctor.js";
 import { runHooksCommand } from "./hooks.js";
@@ -26,6 +27,9 @@ async function main(): Promise<void> {
       return;
     case "config":
       await runConfigCommand(args.slice(1));
+      return;
+    case "cleanup":
+      await runCleanupCommand(args.slice(1));
       return;
     case "launch":
       await runLaunchCommand(args.slice(1));
@@ -88,9 +92,11 @@ Setup:
 Usage:
   agmo setup [--scope user|project] [--force]
   agmo doctor
+  agmo cleanup inspect [--json] [--verbose]
   agmo config show [--scope user|project]
   agmo config vault <show|set-root> ...
   agmo config vault-autosave <show|set|unset|reset> ...
+  agmo config cleanup <show|set|unset|reset> ...
   agmo config launch <show|set|unset|reset> ...
   agmo config session-start <show|set|unset|reset> ...
   agmo launch [codex args...]
