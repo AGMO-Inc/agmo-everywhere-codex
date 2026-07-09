@@ -1,5 +1,6 @@
 import { collectCleanupInventory } from "../cleanup/inventory.js";
 import { createCleanupPlan } from "../cleanup/plan.js";
+import { runCleanup } from "../cleanup/run.js";
 import { machineJsonEnvelope } from "../utils/machine-json.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
 
@@ -9,8 +10,9 @@ function printCleanupHelp(): void {
 Usage:
   agmo cleanup inspect [--json] [--verbose]
   agmo cleanup plan [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
+  agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
 
-Cleanup inspect and plan are non-mutating. Confirmed cleanup run is not implemented in this slice.
+Cleanup inspect and plan are non-mutating. Cleanup run is project-local and requires --confirm.
 `);
 }
 
@@ -66,6 +68,49 @@ function parsePlanArgs(args: string[]): {
   return parsed;
 }
 
+function parseRunArgs(args: string[]): {
+  json: boolean;
+  confirm: boolean;
+  olderThanDays?: number;
+  maxBytes?: number;
+} {
+  const parsed: { json: boolean; confirm: boolean; olderThanDays?: number; maxBytes?: number } = {
+    json: false,
+    confirm: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--json") {
+      parsed.json = true;
+      continue;
+    }
+    if (arg === "--confirm") {
+      parsed.confirm = true;
+      continue;
+    }
+    if (arg === "--older-than-days") {
+      parsed.olderThanDays = parseNonNegativeInteger(args[index + 1], "--older-than-days");
+      index += 1;
+      continue;
+    }
+    if (arg === "--max-bytes") {
+      parsed.maxBytes = parseNonNegativeInteger(args[index + 1], "--max-bytes");
+      index += 1;
+      continue;
+    }
+    throw new Error(
+      "usage: agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]"
+    );
+  }
+
+  if (!parsed.confirm) {
+    throw new Error("cleanup run requires --confirm");
+  }
+
+  return parsed;
+}
+
 export async function runCleanupCommand(args: string[]): Promise<void> {
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
     printCleanupHelp();
@@ -73,16 +118,43 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
   }
 
   const subcommand = args[0] ?? "inspect";
-  if (subcommand === "run") {
-    throw new Error("cleanup run is not implemented; use agmo cleanup plan --json for a non-mutating plan");
-  }
-  if (subcommand !== "inspect" && subcommand !== "plan") {
+  if (subcommand !== "inspect" && subcommand !== "plan" && subcommand !== "run") {
     throw new Error(
-      "usage: agmo cleanup <inspect|plan> [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]"
+      "usage: agmo cleanup <inspect|plan|run> [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]"
     );
   }
 
   const projectRoot = resolveRuntimeRoot();
+  if (subcommand === "run") {
+    const runArgs = parseRunArgs(args.slice(1));
+    const result = await runCleanup(projectRoot, {
+      olderThanDays: runArgs.olderThanDays,
+      maxBytes: runArgs.maxBytes
+    });
+
+    console.log(
+      JSON.stringify(
+        machineJsonEnvelope("cleanup.run", result.run.failures.length === 0, {
+          command: "cleanup run",
+          project_root: result.project_root,
+          agmo_dir: result.agmo_dir,
+          policy: result.policy,
+          options: result.options,
+          totals: result.totals,
+          would_delete: result.would_delete,
+          kept: result.kept,
+          removed: result.run.removed,
+          skipped: result.run.skipped,
+          failures: result.run.failures,
+          run_totals: result.run.totals
+        }),
+        null,
+        2
+      )
+    );
+    return;
+  }
+
   if (subcommand === "plan") {
     const planArgs = parsePlanArgs(args.slice(1));
     const plan = await createCleanupPlan(projectRoot, {

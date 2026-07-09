@@ -93,6 +93,8 @@ Usage:
   agmo setup [--scope user|project] [--force]
   agmo doctor
   agmo cleanup inspect [--json] [--verbose]
+  agmo cleanup plan [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
+  agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
   agmo config show [--scope user|project]
   agmo config vault <show|set-root> ...
   agmo config vault-autosave <show|set|unset|reset> ...
