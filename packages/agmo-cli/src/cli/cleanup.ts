@@ -1,5 +1,10 @@
 import { collectCleanupInventory } from "../cleanup/inventory.js";
 import { createCleanupPlan } from "../cleanup/plan.js";
+import {
+  discoverCleanupProjects,
+  inspectAllCleanupProjects,
+  listCleanupProjects
+} from "../cleanup/projects.js";
 import { runCleanup } from "../cleanup/run.js";
 import { machineJsonEnvelope } from "../utils/machine-json.js";
 import { resolveRuntimeRoot } from "../utils/paths.js";
@@ -9,6 +14,9 @@ function printCleanupHelp(): void {
 
 Usage:
   agmo cleanup inspect [--json] [--verbose]
+  agmo cleanup inspect --all-projects [--json] [--verbose]
+  agmo cleanup projects [--json]
+  agmo cleanup projects discover --root <path> [--json] [--max-depth <n>]
   agmo cleanup plan [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
   agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
 
@@ -42,6 +50,9 @@ function parsePlanArgs(args: string[]): {
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
+    if (arg === "--all-projects") {
+      throw new Error("cleanup plan --all-projects is not implemented; use cleanup inspect --all-projects");
+    }
     if (arg === "--json") {
       parsed.json = true;
       continue;
@@ -81,6 +92,9 @@ function parseRunArgs(args: string[]): {
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
+    if (arg === "--all-projects") {
+      throw new Error("cleanup run --all-projects is not implemented; use cleanup inspect --all-projects");
+    }
     if (arg === "--json") {
       parsed.json = true;
       continue;
@@ -111,6 +125,94 @@ function parseRunArgs(args: string[]): {
   return parsed;
 }
 
+function parseProjectsDiscoverArgs(args: string[]): {
+  json: boolean;
+  root?: string;
+  maxDepth?: number;
+} {
+  const parsed: { json: boolean; root?: string; maxDepth?: number } = {
+    json: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--json") {
+      parsed.json = true;
+      continue;
+    }
+    if (arg === "--root") {
+      parsed.root = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg === "--max-depth") {
+      parsed.maxDepth = parseNonNegativeInteger(args[index + 1], "--max-depth");
+      index += 1;
+      continue;
+    }
+    throw new Error("usage: agmo cleanup projects discover --root <path> [--json] [--max-depth <n>]");
+  }
+
+  if (!parsed.root) {
+    throw new Error("cleanup projects discover requires --root <path>");
+  }
+
+  return parsed;
+}
+
+async function runCleanupProjectsCommand(args: string[], projectRoot: string): Promise<void> {
+  const action = args[0];
+  if (action === undefined || action === "--json") {
+    if (args.length > 1) {
+      throw new Error("usage: agmo cleanup projects [--json]");
+    }
+    const projects = await listCleanupProjects(projectRoot);
+    console.log(
+      JSON.stringify(
+        machineJsonEnvelope("cleanup.projects", true, {
+          command: "cleanup projects",
+          registry_path: projects.registry_path,
+          projects: projects.projects
+        }),
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (action === "discover") {
+    const parsed = parseProjectsDiscoverArgs(args.slice(1));
+    const root = parsed.root;
+    if (!root) {
+      throw new Error("cleanup projects discover requires --root <path>");
+    }
+    const result = await discoverCleanupProjects({
+      root,
+      maxDepth: parsed.maxDepth ?? 5,
+      cwd: projectRoot
+    });
+    console.log(
+      JSON.stringify(
+        machineJsonEnvelope("cleanup.projects.discover", true, {
+          command: "cleanup projects discover",
+          registry_path: result.registry_path,
+          root: result.root,
+          max_depth: result.max_depth,
+          discovered: result.discovered,
+          skipped: result.skipped,
+          registry: result.registry
+        }),
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  throw new Error("usage: agmo cleanup projects [--json] | projects discover --root <path> [--json] [--max-depth <n>]");
+}
+
 export async function runCleanupCommand(args: string[]): Promise<void> {
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
     printCleanupHelp();
@@ -118,13 +220,18 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
   }
 
   const subcommand = args[0] ?? "inspect";
-  if (subcommand !== "inspect" && subcommand !== "plan" && subcommand !== "run") {
+  if (subcommand !== "inspect" && subcommand !== "projects" && subcommand !== "plan" && subcommand !== "run") {
     throw new Error(
-      "usage: agmo cleanup <inspect|plan|run> [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]"
+      "usage: agmo cleanup <inspect|projects|plan|run> [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]"
     );
   }
 
   const projectRoot = resolveRuntimeRoot();
+  if (subcommand === "projects") {
+    await runCleanupProjectsCommand(args.slice(1), projectRoot);
+    return;
+  }
+
   if (subcommand === "run") {
     const runArgs = parseRunArgs(args.slice(1));
     const result = await runCleanup(projectRoot, {
@@ -182,12 +289,31 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
   }
 
   const inspectArgs = args.slice(1);
-  const inspectAllowed = new Set(["--json", "--verbose"]);
+  const inspectAllowed = new Set(["--all-projects", "--json", "--verbose"]);
   const unknownInspectArg = inspectArgs.find((arg) => !inspectAllowed.has(arg));
   if (unknownInspectArg) {
-    throw new Error("usage: agmo cleanup inspect [--json] [--verbose]");
+    throw new Error("usage: agmo cleanup inspect [--json] [--verbose] [--all-projects]");
   }
   const verbose = args.includes("--verbose");
+  if (args.includes("--all-projects")) {
+    const result = await inspectAllCleanupProjects({ cwd: projectRoot, verbose });
+    console.log(
+      JSON.stringify(
+        machineJsonEnvelope("cleanup.inspect.all-projects", true, {
+          command: "cleanup inspect --all-projects",
+          registry_path: result.registry_path,
+          totals: result.totals,
+          categories: result.categories,
+          projects: result.projects,
+          skipped: result.skipped
+        }),
+        null,
+        2
+      )
+    );
+    return;
+  }
+
   const inventory = await collectCleanupInventory(projectRoot);
   const entries = verbose
     ? inventory.entries

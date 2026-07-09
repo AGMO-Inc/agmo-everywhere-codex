@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,11 +9,19 @@ import { createCleanupPlan } from "../cleanup/plan.js";
 import { runCleanupPlan } from "../cleanup/run.js";
 import { runCleanupCommand } from "./cleanup.js";
 
-async function captureCleanupCommand(args: string[], cwd: string): Promise<Record<string, unknown>> {
+async function captureCleanupCommand(
+  args: string[],
+  cwd: string,
+  options: { home?: string } = {}
+): Promise<Record<string, unknown>> {
   const originalCwd = process.cwd();
+  const originalHome = process.env.HOME;
   const stdoutChunks: string[] = [];
   const originalWrite = process.stdout.write.bind(process.stdout);
 
+  if (options.home) {
+    process.env.HOME = options.home;
+  }
   process.chdir(cwd);
   process.stdout.write = ((chunk: string | Uint8Array) => {
     stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -25,9 +33,25 @@ async function captureCleanupCommand(args: string[], cwd: string): Promise<Recor
   } finally {
     process.stdout.write = originalWrite;
     process.chdir(originalCwd);
+    if (options.home) {
+      if (originalHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = originalHome;
+      }
+    }
   }
 
   return JSON.parse(stdoutChunks.join("")) as Record<string, unknown>;
+}
+
+async function createCleanupProject(root: string, name: string, logBytes: number): Promise<string> {
+  const projectRoot = join(root, name);
+  await mkdir(join(projectRoot, ".agmo", "state", "sessions"), { recursive: true });
+  await mkdir(join(projectRoot, ".agmo", "logs"), { recursive: true });
+  await writeFile(join(projectRoot, ".agmo", "state", "sessions", "session.json"), "{\"active\":false}\n", "utf8");
+  await writeFile(join(projectRoot, ".agmo", "logs", "usage.log"), "x".repeat(logBytes), "utf8");
+  return projectRoot;
 }
 
 test("runCleanupCommand inspect prints read-only machine JSON", async () => {
@@ -50,6 +74,112 @@ test("runCleanupCommand inspect prints read-only machine JSON", async () => {
   assert.equal(totals.cleanup_candidate_entries, 0);
   assert.ok(categories.some((entry) => entry.category === "state/sessions" && entry.entries === 1));
   assert.equal(existsSync(sessionPath), true);
+});
+
+test("runCleanupCommand projects discover registers projects and inspect all-projects aggregates usage", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-projects-"));
+  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-projects-home-"));
+  const smallProject = await createCleanupProject(tempRoot, "small", 10);
+  const bigProject = await createCleanupProject(tempRoot, "big", 5000);
+  const realSmall = await realpath(smallProject);
+  const realBig = await realpath(bigProject);
+
+  const discover = await captureCleanupCommand(
+    ["projects", "discover", "--root", tempRoot, "--json", "--max-depth", "2"],
+    tempRoot,
+    { home: tempHome }
+  );
+  const discovered = discover.discovered as Array<{ project_root?: string }>;
+
+  assert.equal(discover.operation, "cleanup.projects.discover");
+  assert.deepEqual(discovered.map((entry) => entry.project_root).sort(), [realBig, realSmall].sort());
+
+  const projectsOutput = await captureCleanupCommand(["projects", "--json"], tempRoot, { home: tempHome });
+  const projects = projectsOutput.projects as Array<{ project_root?: string; status?: string }>;
+  assert.equal(projectsOutput.operation, "cleanup.projects");
+  assert.deepEqual(
+    projects.map((entry) => ({ project_root: entry.project_root, status: entry.status })),
+    [
+      { project_root: realBig, status: "available" },
+      { project_root: realSmall, status: "available" }
+    ].sort((left, right) => left.project_root.localeCompare(right.project_root))
+  );
+
+  const inspect = await captureCleanupCommand(["inspect", "--all-projects", "--json"], tempRoot, { home: tempHome });
+  const totals = inspect.totals as { projects?: number; skipped_projects?: number; bytes?: number };
+  const inspectedProjects = inspect.projects as Array<{ project_root?: string; totals?: { bytes?: number } }>;
+
+  assert.equal(inspect.operation, "cleanup.inspect.all-projects");
+  assert.equal(totals.projects, 2);
+  assert.equal(totals.skipped_projects, 0);
+  assert.ok((totals.bytes ?? 0) > 0);
+  assert.equal(inspectedProjects[0]?.project_root, realBig);
+  assert.ok((inspectedProjects[0]?.totals?.bytes ?? 0) > (inspectedProjects[1]?.totals?.bytes ?? 0));
+});
+
+test("runCleanupCommand inspect all-projects reports missing registered projects as skipped", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-projects-missing-"));
+  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-projects-missing-home-"));
+  const projectRoot = await createCleanupProject(tempRoot, "gone", 10);
+  const realProjectRoot = await realpath(projectRoot);
+
+  await captureCleanupCommand(["projects", "discover", "--root", tempRoot, "--json"], tempRoot, {
+    home: tempHome
+  });
+  await rm(projectRoot, { recursive: true, force: true });
+
+  const inspect = await captureCleanupCommand(["inspect", "--all-projects", "--json"], tempRoot, { home: tempHome });
+  const totals = inspect.totals as { projects?: number; skipped_projects?: number };
+  const skipped = inspect.skipped as Array<{ project_root?: string; reason?: string }>;
+
+  assert.equal(totals.projects, 0);
+  assert.equal(totals.skipped_projects, 1);
+  assert.deepEqual(skipped, [{ project_root: realProjectRoot, agmo_dir: join(realProjectRoot, ".agmo"), reason: "project root missing" }]);
+});
+
+test("runCleanupCommand projects discover skips symlinks and ignored directories", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-projects-symlink-"));
+  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-projects-symlink-home-"));
+  const projectRoot = await createCleanupProject(tempRoot, "project", 10);
+  const realProjectRoot = await realpath(projectRoot);
+  const linkPath = join(tempRoot, "project-link");
+  await symlink(projectRoot, linkPath);
+  await createCleanupProject(join(tempRoot, "node_modules"), "ignored", 2000);
+  await createCleanupProject(join(tempRoot, "cache"), "ignored-cache", 2000);
+  await createCleanupProject(join(tempRoot, "_cacache"), "ignored-cacache", 2000);
+
+  const discover = await captureCleanupCommand(
+    ["projects", "discover", "--root", tempRoot, "--json", "--max-depth", "3"],
+    tempRoot,
+    { home: tempHome }
+  );
+  const discovered = discover.discovered as Array<{ project_root?: string }>;
+  const skipped = discover.skipped as Array<{ path?: string; reason?: string }>;
+
+  assert.deepEqual(discovered.map((entry) => entry.project_root), [realProjectRoot]);
+  assert.ok(skipped.some((entry) => entry.path?.endsWith("/project-link") && entry.reason === "symlink skipped"));
+  assert.equal(
+    discovered.some(
+      (entry) =>
+        entry.project_root?.includes("node_modules") ||
+        entry.project_root?.includes("/cache/") ||
+        entry.project_root?.includes("_cacache")
+    ),
+    false
+  );
+});
+
+test("runCleanupCommand rejects all-project mutating commands", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-reject-"));
+
+  await assert.rejects(
+    () => captureCleanupCommand(["plan", "--all-projects", "--json"], tempRoot),
+    /cleanup plan --all-projects is not implemented/
+  );
+  await assert.rejects(
+    () => captureCleanupCommand(["run", "--all-projects", "--confirm", "--json"], tempRoot),
+    /cleanup run --all-projects is not implemented/
+  );
 });
 
 test("runCleanupCommand rejects cleanup run without confirm and does not delete", async () => {
