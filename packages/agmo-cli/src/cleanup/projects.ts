@@ -158,7 +158,7 @@ function isRegistryEntry(value: unknown): value is CleanupProjectRegistryEntry {
   );
 }
 
-async function validateProjectRoot(projectRoot: string): Promise<
+export async function validateCleanupProjectRoot(projectRoot: string): Promise<
   | { ok: true; project_root: string; agmo_dir: string }
   | { ok: false; project_root: string; agmo_dir: string; reason: string }
 > {
@@ -230,7 +230,7 @@ export async function listCleanupProjects(cwd = process.cwd()): Promise<{
   const { path, registry } = await readCleanupProjectRegistry(cwd);
   const projects = await Promise.all(
     registry.projects.map(async (entry) => {
-      const validated = await validateProjectRoot(entry.project_root);
+      const validated = await validateCleanupProjectRoot(entry.project_root);
       if (!validated.ok) {
         return { ...entry, status: "skipped" as const, skip_reason: validated.reason };
       }
@@ -292,7 +292,7 @@ export async function discoverCleanupProjects(args: {
     seenDirs.add(realDir);
 
     if (await isCandidateProjectRoot(realDir)) {
-      const validated = await validateProjectRoot(realDir);
+      const validated = await validateCleanupProjectRoot(realDir);
       if (validated.ok) {
         const previous = existing.get(validated.project_root);
         discovered.set(validated.project_root, {
@@ -385,7 +385,7 @@ export async function inspectAllCleanupProjects(args: {
   const categoryTotals = new Map(emptyCategoryTotals().map((entry) => [entry.category, { ...entry }]));
 
   for (const entry of registry.projects) {
-    const validated = await validateProjectRoot(entry.project_root);
+    const validated = await validateCleanupProjectRoot(entry.project_root);
     if (!validated.ok) {
       skipped.push({
         project_root: validated.project_root,

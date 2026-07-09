@@ -1,3 +1,7 @@
+import {
+  createAllProjectsCleanupPlan,
+  runAllProjectsCleanup
+} from "../cleanup/all-projects.js";
 import { collectCleanupInventory } from "../cleanup/inventory.js";
 import { createCleanupPlan } from "../cleanup/plan.js";
 import {
@@ -17,10 +21,10 @@ Usage:
   agmo cleanup inspect --all-projects [--json] [--verbose]
   agmo cleanup projects [--json]
   agmo cleanup projects discover --root <path> [--json] [--max-depth <n>]
-  agmo cleanup plan [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
-  agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
+  agmo cleanup plan [--all-projects] [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
+  agmo cleanup run [--all-projects] --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
 
-Cleanup inspect and plan are non-mutating. Cleanup run is project-local and requires --confirm.
+Cleanup inspect and plan are non-mutating. Cleanup run requires --confirm.
 `);
 }
 
@@ -40,18 +44,27 @@ function parseNonNegativeInteger(value: string | undefined, flag: string): numbe
 function parsePlanArgs(args: string[]): {
   json: boolean;
   verbose: boolean;
+  allProjects: boolean;
   olderThanDays?: number;
   maxBytes?: number;
 } {
-  const parsed: { json: boolean; verbose: boolean; olderThanDays?: number; maxBytes?: number } = {
+  const parsed: {
+    json: boolean;
+    verbose: boolean;
+    allProjects: boolean;
+    olderThanDays?: number;
+    maxBytes?: number;
+  } = {
     json: false,
-    verbose: false
+    verbose: false,
+    allProjects: false
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--all-projects") {
-      throw new Error("cleanup plan --all-projects is not implemented; use cleanup inspect --all-projects");
+      parsed.allProjects = true;
+      continue;
     }
     if (arg === "--json") {
       parsed.json = true;
@@ -72,7 +85,7 @@ function parsePlanArgs(args: string[]): {
       continue;
     }
     throw new Error(
-      "usage: agmo cleanup plan [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]"
+      "usage: agmo cleanup plan [--all-projects] [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]"
     );
   }
 
@@ -82,18 +95,27 @@ function parsePlanArgs(args: string[]): {
 function parseRunArgs(args: string[]): {
   json: boolean;
   confirm: boolean;
+  allProjects: boolean;
   olderThanDays?: number;
   maxBytes?: number;
 } {
-  const parsed: { json: boolean; confirm: boolean; olderThanDays?: number; maxBytes?: number } = {
+  const parsed: {
+    json: boolean;
+    confirm: boolean;
+    allProjects: boolean;
+    olderThanDays?: number;
+    maxBytes?: number;
+  } = {
     json: false,
-    confirm: false
+    confirm: false,
+    allProjects: false
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--all-projects") {
-      throw new Error("cleanup run --all-projects is not implemented; use cleanup inspect --all-projects");
+      parsed.allProjects = true;
+      continue;
     }
     if (arg === "--json") {
       parsed.json = true;
@@ -114,7 +136,7 @@ function parseRunArgs(args: string[]): {
       continue;
     }
     throw new Error(
-      "usage: agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]"
+      "usage: agmo cleanup run [--all-projects] --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]"
     );
   }
 
@@ -234,6 +256,30 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
 
   if (subcommand === "run") {
     const runArgs = parseRunArgs(args.slice(1));
+    if (runArgs.allProjects) {
+      const result = await runAllProjectsCleanup({
+        cwd: projectRoot,
+        olderThanDays: runArgs.olderThanDays,
+        maxBytes: runArgs.maxBytes
+      });
+
+      console.log(
+        JSON.stringify(
+          machineJsonEnvelope("cleanup.run.all-projects", result.totals.failure_entries === 0, {
+            command: "cleanup run --all-projects",
+            registry_path: result.registry_path,
+            options: result.options,
+            totals: result.totals,
+            projects: result.projects,
+            skipped_projects: result.skipped_projects
+          }),
+          null,
+          2
+        )
+      );
+      return;
+    }
+
     const result = await runCleanup(projectRoot, {
       olderThanDays: runArgs.olderThanDays,
       maxBytes: runArgs.maxBytes
@@ -264,6 +310,30 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
 
   if (subcommand === "plan") {
     const planArgs = parsePlanArgs(args.slice(1));
+    if (planArgs.allProjects) {
+      const result = await createAllProjectsCleanupPlan({
+        cwd: projectRoot,
+        olderThanDays: planArgs.olderThanDays,
+        maxBytes: planArgs.maxBytes
+      });
+
+      console.log(
+        JSON.stringify(
+          machineJsonEnvelope("cleanup.plan.all-projects", true, {
+            command: "cleanup plan --all-projects",
+            registry_path: result.registry_path,
+            options: result.options,
+            totals: result.totals,
+            projects: result.projects,
+            skipped_projects: result.skipped_projects
+          }),
+          null,
+          2
+        )
+      );
+      return;
+    }
+
     const plan = await createCleanupPlan(projectRoot, {
       olderThanDays: planArgs.olderThanDays,
       maxBytes: planArgs.maxBytes

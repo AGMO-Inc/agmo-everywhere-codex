@@ -96,8 +96,8 @@ Usage:
   agmo cleanup inspect --all-projects [--json] [--verbose]
   agmo cleanup projects [--json]
   agmo cleanup projects discover --root <path> [--json] [--max-depth <n>]
-  agmo cleanup plan [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
-  agmo cleanup run --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
+  agmo cleanup plan [--all-projects] [--json] [--verbose] [--older-than-days <n>] [--max-bytes <n>]
+  agmo cleanup run [--all-projects] --confirm [--json] [--older-than-days <n>] [--max-bytes <n>]
   agmo config show [--scope user|project]
   agmo config vault <show|set-root> ...
   agmo config vault-autosave <show|set|unset|reset> ...

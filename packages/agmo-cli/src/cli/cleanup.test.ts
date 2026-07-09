@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -52,6 +52,11 @@ async function createCleanupProject(root: string, name: string, logBytes: number
   await writeFile(join(projectRoot, ".agmo", "state", "sessions", "session.json"), "{\"active\":false}\n", "utf8");
   await writeFile(join(projectRoot, ".agmo", "logs", "usage.log"), "x".repeat(logBytes), "utf8");
   return projectRoot;
+}
+
+async function fileSnapshot(path: string): Promise<{ size: number; mtimeMs: number; content: Buffer }> {
+  const stats = statSync(path);
+  return { size: stats.size, mtimeMs: stats.mtimeMs, content: await readFile(path) };
 }
 
 test("runCleanupCommand inspect prints read-only machine JSON", async () => {
@@ -169,17 +174,98 @@ test("runCleanupCommand projects discover skips symlinks and ignored directories
   );
 });
 
-test("runCleanupCommand rejects all-project mutating commands", async () => {
-  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-reject-"));
+test("runCleanupCommand plan and run all-projects emit aggregate machine JSON", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-cli-"));
+  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-cli-home-"));
+  const projectRoot = await createCleanupProject(tempRoot, "registered", 10);
+  const logPath = join(projectRoot, ".agmo", "logs", "usage.log");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(logPath, oldDate, oldDate);
+  await captureCleanupCommand(["projects", "discover", "--root", tempRoot, "--json"], tempRoot, {
+    home: tempHome
+  });
 
-  await assert.rejects(
-    () => captureCleanupCommand(["plan", "--all-projects", "--json"], tempRoot),
-    /cleanup plan --all-projects is not implemented/
+  const plan = await captureCleanupCommand(
+    ["plan", "--all-projects", "--json", "--older-than-days", "1"],
+    tempRoot,
+    { home: tempHome }
   );
-  await assert.rejects(
-    () => captureCleanupCommand(["run", "--all-projects", "--confirm", "--json"], tempRoot),
-    /cleanup run --all-projects is not implemented/
+  const planTotals = plan.totals as { projects?: number; would_delete_entries?: number };
+  const planProjects = plan.projects as Array<{ project_root?: string; totals?: { would_delete_entries?: number } }>;
+
+  assert.equal(plan.operation, "cleanup.plan.all-projects");
+  assert.equal(plan.ok, true);
+  assert.equal(plan.command, "cleanup plan --all-projects");
+  assert.equal(planTotals.projects, 1);
+  assert.equal(planTotals.would_delete_entries, 1);
+  assert.equal(planProjects[0]?.totals?.would_delete_entries, 1);
+  assert.equal(existsSync(logPath), true);
+
+  const run = await captureCleanupCommand(
+    ["run", "--all-projects", "--confirm", "--json", "--older-than-days", "1"],
+    tempRoot,
+    { home: tempHome }
   );
+  const runTotals = run.totals as { projects?: number; removed_entries?: number; failure_entries?: number };
+  const runProjects = run.projects as Array<{
+    removed?: Array<{ relative_path?: string }>;
+    run_totals?: { removed_entries?: number };
+  }>;
+
+  assert.equal(run.operation, "cleanup.run.all-projects");
+  assert.equal(run.ok, true);
+  assert.equal(run.command, "cleanup run --all-projects");
+  assert.equal(runTotals.projects, 1);
+  assert.equal(runTotals.removed_entries, 1);
+  assert.equal(runTotals.failure_entries, 0);
+  assert.deepEqual(runProjects[0]?.removed?.map((entry) => entry.relative_path), [".agmo/logs/usage.log"]);
+  assert.equal(runProjects[0]?.run_totals?.removed_entries, 1);
+  assert.equal(existsSync(logPath), false);
+});
+
+test("runCleanupCommand run all-projects reports ok false on deletion failure and continues", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX directory permissions are required for this deletion failure fixture");
+    return;
+  }
+
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-cli-failure-"));
+  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-cli-failure-home-"));
+  const failingProject = await createCleanupProject(tempRoot, "a-failing", 10);
+  const laterProject = await createCleanupProject(tempRoot, "b-later", 10);
+  const failingLog = join(failingProject, ".agmo", "logs", "usage.log");
+  const laterLog = join(laterProject, ".agmo", "logs", "usage.log");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(failingLog, oldDate, oldDate);
+  await utimes(laterLog, oldDate, oldDate);
+  await captureCleanupCommand(["projects", "discover", "--root", tempRoot, "--json"], tempRoot, {
+    home: tempHome
+  });
+
+  await chmod(join(failingProject, ".agmo", "logs"), 0o555);
+  try {
+    const output = await captureCleanupCommand(
+      ["run", "--all-projects", "--confirm", "--json", "--older-than-days", "1"],
+      tempRoot,
+      { home: tempHome }
+    );
+    const totals = output.totals as { removed_entries?: number; failure_entries?: number };
+    const projects = output.projects as Array<{
+      project_root?: string;
+      removed?: unknown[];
+      failures?: unknown[];
+    }>;
+
+    assert.equal(output.operation, "cleanup.run.all-projects");
+    assert.equal(output.ok, false);
+    assert.equal(totals.failure_entries, 1);
+    assert.equal(totals.removed_entries, 1);
+    assert.equal(projects.find((project) => project.project_root?.endsWith("a-failing"))?.failures?.length, 1);
+    assert.equal(projects.find((project) => project.project_root?.endsWith("b-later"))?.removed?.length, 1);
+    assert.equal(existsSync(laterLog), false);
+  } finally {
+    await chmod(join(failingProject, ".agmo", "logs"), 0o755).catch(() => undefined);
+  }
 });
 
 test("runCleanupCommand rejects cleanup run without confirm and does not delete", async () => {
@@ -193,6 +279,32 @@ test("runCleanupCommand rejects cleanup run without confirm and does not delete"
     /cleanup run requires --confirm/
   );
   assert.equal(existsSync(logPath), true);
+});
+
+test("runCleanupCommand rejects all-project cleanup run without confirm before deleting", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-confirm-"));
+  const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-all-projects-confirm-home-"));
+  const projectRoot = await createCleanupProject(tempRoot, "registered", 10);
+  const logPath = join(projectRoot, ".agmo", "logs", "usage.log");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(logPath, oldDate, oldDate);
+  await captureCleanupCommand(["projects", "discover", "--root", tempRoot, "--json"], tempRoot, {
+    home: tempHome
+  });
+  const registryPath = join(tempHome, ".agmo", "state", "cleanup", "projects.json");
+  const beforeCandidate = await fileSnapshot(logPath);
+  const beforeRegistry = await fileSnapshot(registryPath);
+
+  await assert.rejects(
+    () => captureCleanupCommand(["run", "--all-projects", "--json", "--older-than-days", "1"], tempRoot, {
+      home: tempHome
+    }),
+    /cleanup run requires --confirm/
+  );
+  assert.equal(existsSync(logPath), true);
+  assert.equal(existsSync(registryPath), true);
+  assert.deepEqual(await fileSnapshot(logPath), beforeCandidate);
+  assert.deepEqual(await fileSnapshot(registryPath), beforeRegistry);
 });
 
 test("runCleanupCommand plan prints non-mutating machine JSON", async () => {
