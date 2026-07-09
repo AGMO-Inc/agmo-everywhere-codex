@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -54,6 +55,402 @@ test("runCleanupCommand rejects mutating subcommands in slice 1", async () => {
 
   await assert.rejects(
     () => captureCleanupCommand(["run", "--confirm"], tempRoot),
-    /usage: agmo cleanup inspect/
+    /cleanup run is not implemented/
   );
+});
+
+test("runCleanupCommand plan prints non-mutating machine JSON", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-"));
+  const logPath = join(tempRoot, ".agmo", "logs", "old.log");
+  await mkdir(join(tempRoot, ".agmo", "logs"), { recursive: true });
+  await writeFile(logPath, "old log\n", "utf8");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(logPath, oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const totals = output.totals as { would_delete_entries?: number; would_delete_bytes?: number };
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(output.schema_version, "1.0");
+  assert.equal(output.operation, "cleanup.plan");
+  assert.equal(output.ok, true);
+  assert.equal(output.command, "cleanup plan");
+  assert.equal(totals.would_delete_entries, 1);
+  assert.ok((totals.would_delete_bytes ?? 0) > 0);
+  assert.deepEqual(wouldDelete.map((entry) => entry.relative_path), [".agmo/logs/old.log"]);
+  assert.equal(wouldDelete[0]?.reason, "Agmo log older than retention threshold");
+  assert.equal(existsSync(logPath), true);
+});
+
+test("runCleanupCommand plan keeps dirty launch workspaces", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-dirty-"));
+  const workspaceRoot = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "workspace");
+  const metadataPath = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "metadata.json");
+  const sessionInstructionsPath = join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md");
+  await mkdir(workspaceRoot, { recursive: true });
+  await mkdir(join(tempRoot, ".agmo", "cache", "session-instructions", "session-1"), { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(join(workspaceRoot, "draft.txt"), "dirty\n", "utf8");
+  await writeFile(sessionInstructionsPath, "instructions\n", "utf8");
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1"), oldDate, oldDate);
+  await utimes(sessionInstructionsPath, oldDate, oldDate);
+  await utimes(join(tempRoot, ".agmo", "cache", "session-instructions", "session-1"), oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(
+    wouldDelete.some((entry) => entry.relative_path === ".agmo/cache/launch-workspaces/session-1"),
+    false
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/cache/launch-workspaces/session-1" &&
+        entry.reason === "dirty launch workspace"
+    )
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/cache/session-instructions/session-1" &&
+        entry.reason === "session instructions referenced by protected launch workspace"
+    )
+  );
+  assert.equal(existsSync(join(workspaceRoot, "draft.txt")), true);
+  assert.equal(existsSync(sessionInstructionsPath), true);
+});
+
+test("runCleanupCommand plan protects session instructions by composed agents path", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-composed-path-"));
+  const workspaceRoot = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "workspace");
+  const metadataPath = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "metadata.json");
+  const sessionInstructionsPath = join(tempRoot, ".agmo", "cache", "session-instructions", "other", "AGENTS.md");
+  await mkdir(workspaceRoot, { recursive: true });
+  await mkdir(join(tempRoot, ".agmo", "cache", "session-instructions", "other"), { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(join(workspaceRoot, "draft.txt"), "dirty\n", "utf8");
+  await writeFile(sessionInstructionsPath, "instructions\n", "utf8");
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: sessionInstructionsPath,
+        created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1"), oldDate, oldDate);
+  await utimes(join(tempRoot, ".agmo", "cache", "session-instructions", "other"), oldDate, oldDate);
+  await utimes(sessionInstructionsPath, oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(
+    wouldDelete.some((entry) => entry.relative_path === ".agmo/cache/session-instructions/other"),
+    false
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/cache/session-instructions/other" &&
+        entry.reason === "session instructions referenced by protected launch workspace"
+    )
+  );
+  assert.equal(existsSync(sessionInstructionsPath), true);
+});
+
+test("runCleanupCommand plan output ordering is deterministic", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-order-"));
+  const logB = join(tempRoot, ".agmo", "logs", "b.log");
+  const logA = join(tempRoot, ".agmo", "logs", "a.log");
+  const sessionB = join(tempRoot, ".agmo", "cache", "session-instructions", "b", "AGENTS.md");
+  const sessionA = join(tempRoot, ".agmo", "cache", "session-instructions", "a", "AGENTS.md");
+  await mkdir(join(tempRoot, ".agmo", "logs"), { recursive: true });
+  await mkdir(join(tempRoot, ".agmo", "cache", "session-instructions", "a"), { recursive: true });
+  await mkdir(join(tempRoot, ".agmo", "cache", "session-instructions", "b"), { recursive: true });
+  await writeFile(logB, "b\n", "utf8");
+  await writeFile(logA, "a\n", "utf8");
+  await writeFile(sessionB, "b\n", "utf8");
+  await writeFile(sessionA, "a\n", "utf8");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  for (const path of [
+    logB,
+    logA,
+    sessionB,
+    sessionA,
+    join(tempRoot, ".agmo", "cache", "session-instructions", "a"),
+    join(tempRoot, ".agmo", "cache", "session-instructions", "b")
+  ]) {
+    await utimes(path, oldDate, oldDate);
+  }
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+
+  assert.deepEqual(
+    wouldDelete.map((entry) => entry.relative_path),
+    [
+      ".agmo/cache/session-instructions/a",
+      ".agmo/cache/session-instructions/b",
+      ".agmo/logs/a.log",
+      ".agmo/logs/b.log"
+    ]
+  );
+});
+
+test("runCleanupCommand plan older-than override changes safe eligibility", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-ttl-"));
+  const logPath = join(tempRoot, ".agmo", "logs", "two-days.log");
+  await mkdir(join(tempRoot, ".agmo", "logs"), { recursive: true });
+  await writeFile(logPath, "ttl\n", "utf8");
+  const oldDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  await utimes(logPath, oldDate, oldDate);
+
+  const keptOutput = await captureCleanupCommand(["plan", "--json", "--older-than-days", "3"], tempRoot);
+  const deleteOutput = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+
+  assert.deepEqual(keptOutput.would_delete, []);
+  assert.deepEqual(
+    (deleteOutput.would_delete as Array<{ relative_path?: string }>).map((entry) => entry.relative_path),
+    [".agmo/logs/two-days.log"]
+  );
+  assert.equal(existsSync(logPath), true);
+});
+
+test("runCleanupCommand plan max-bytes selects safe kept entries without deleting", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-size-"));
+  const logPath = join(tempRoot, ".agmo", "logs", "new.log");
+  const memoryPath = join(tempRoot, ".agmo", "memory", "wisdom.json");
+  await mkdir(join(tempRoot, ".agmo", "logs"), { recursive: true });
+  await mkdir(join(tempRoot, ".agmo", "memory"), { recursive: true });
+  await writeFile(logPath, "1234567890\n", "utf8");
+  await writeFile(memoryPath, "memory\n", "utf8");
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "30", "--max-bytes", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string; reason?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.ok(
+    wouldDelete.some(
+      (entry) => entry.relative_path === ".agmo/logs/new.log" && entry.reason === "selected by project size cap"
+    )
+  );
+  assert.ok(
+    kept.some(
+      (entry) => entry.relative_path === ".agmo/memory/wisdom.json" && entry.reason === "memory is inspect-only"
+    )
+  );
+  assert.equal(existsSync(logPath), true);
+  assert.equal(existsSync(memoryPath), true);
+});
+
+test("runCleanupCommand plan max-bytes preserves protected entries", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-size-keep-"));
+  const workspaceRoot = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "workspace");
+  const metadataPath = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "metadata.json");
+  const sessionInstructionsDir = join(tempRoot, ".agmo", "cache", "session-instructions", "session-1");
+  const sessionInstructionsPath = join(sessionInstructionsDir, "AGENTS.md");
+  const latestBackup = join(tempRoot, ".agmo", "backups", "setup", "2026-01-02T00-00-00.000Z");
+  await mkdir(workspaceRoot, { recursive: true });
+  await mkdir(sessionInstructionsDir, { recursive: true });
+  await mkdir(latestBackup, { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(join(workspaceRoot, "draft.txt"), "dirty\n", "utf8");
+  await writeFile(sessionInstructionsPath, "protected instructions\n", "utf8");
+  await writeFile(join(latestBackup, "AGENTS.md.bak"), "latest backup\n", "utf8");
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: sessionInstructionsPath,
+        created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const output = await captureCleanupCommand(["plan", "--json", "--max-bytes", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(
+    wouldDelete.some(
+      (entry) =>
+        entry.relative_path === ".agmo/cache/session-instructions/session-1" ||
+        entry.relative_path === ".agmo/backups/setup/2026-01-02T00-00-00.000Z"
+    ),
+    false
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/cache/session-instructions/session-1" &&
+        entry.reason === "session instructions referenced by protected launch workspace"
+    )
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/backups/setup/2026-01-02T00-00-00.000Z" &&
+        entry.reason === "latest setup backup kept"
+    )
+  );
+  assert.equal(existsSync(sessionInstructionsPath), true);
+  assert.equal(existsSync(join(latestBackup, "AGENTS.md.bak")), true);
+});
+
+test("runCleanupCommand plan keeps latest setup backup", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-backup-"));
+  const oldBackup = join(tempRoot, ".agmo", "backups", "setup", "2026-01-01T00-00-00.000Z");
+  const newBackup = join(tempRoot, ".agmo", "backups", "setup", "2026-01-02T00-00-00.000Z");
+  await mkdir(oldBackup, { recursive: true });
+  await mkdir(newBackup, { recursive: true });
+  await writeFile(join(oldBackup, "AGENTS.md.bak"), "old\n", "utf8");
+  await writeFile(join(newBackup, "AGENTS.md.bak"), "new\n", "utf8");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  const newerDate = new Date(Date.now() - 9 * 24 * 60 * 60 * 1000);
+  await utimes(join(oldBackup, "AGENTS.md.bak"), oldDate, oldDate);
+  await utimes(oldBackup, oldDate, oldDate);
+  await utimes(join(newBackup, "AGENTS.md.bak"), newerDate, newerDate);
+  await utimes(newBackup, newerDate, newerDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.deepEqual(
+    wouldDelete.map((entry) => entry.relative_path),
+    [".agmo/backups/setup/2026-01-01T00-00-00.000Z"]
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/backups/setup/2026-01-02T00-00-00.000Z" &&
+        entry.reason === "latest setup backup kept"
+    )
+  );
+  assert.equal(existsSync(join(oldBackup, "AGENTS.md.bak")), true);
+  assert.equal(existsSync(join(newBackup, "AGENTS.md.bak")), true);
+});
+
+test("runCleanupCommand plan keeps malformed state files", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-malformed-"));
+  const statePath = join(tempRoot, ".agmo", "state", "sessions", "broken.json");
+  await mkdir(join(tempRoot, ".agmo", "state", "sessions"), { recursive: true });
+  await writeFile(statePath, "{not json\n", "utf8");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(statePath, oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(
+    wouldDelete.some((entry) => entry.relative_path === ".agmo/state/sessions/broken.json"),
+    false
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/state/sessions/broken.json" &&
+        entry.reason === "malformed state file kept for manual review"
+    )
+  );
+  assert.equal(existsSync(statePath), true);
+});
+
+test("runCleanupCommand plan keeps state files without Agmo runtime shape evidence", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-state-unknown-"));
+  const statePath = join(tempRoot, ".agmo", "state", "sessions", "unknown.json");
+  await mkdir(join(tempRoot, ".agmo", "state", "sessions"), { recursive: true });
+  await writeFile(statePath, "{\"active\":false}\n", "utf8");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(statePath, oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(
+    wouldDelete.some((entry) => entry.relative_path === ".agmo/state/sessions/unknown.json"),
+    false
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/state/sessions/unknown.json" &&
+        entry.reason === "state file lacks Agmo runtime shape evidence"
+    )
+  );
+  assert.equal(existsSync(statePath), true);
+});
+
+test("runCleanupCommand plan can select old inactive Agmo state files", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-state-inactive-"));
+  const statePath = join(tempRoot, ".agmo", "state", "sessions", "session-1.json");
+  await mkdir(join(tempRoot, ".agmo", "state", "sessions"), { recursive: true });
+  await writeFile(
+    statePath,
+    `${JSON.stringify(
+      {
+        version: 1,
+        session_id: "session-1",
+        active: false,
+        last_event: "Stop",
+        updated_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString()
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(statePath, oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.ok(
+    wouldDelete.some(
+      (entry) =>
+        entry.relative_path === ".agmo/state/sessions/session-1.json" &&
+        entry.reason === "inactive state file older than retention threshold"
+    )
+  );
+  assert.equal(existsSync(statePath), true);
 });
