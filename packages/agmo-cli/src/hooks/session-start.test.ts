@@ -222,8 +222,11 @@ test("buildSessionStartContext hides stale older workflow snapshots using launch
       `${JSON.stringify(
         {
           version: 1,
+          kind: "workflow_state_ref",
           session_id: "fresh-session",
+          session_state_ref: "../sessions/fresh-session.json",
           active: true,
+          status: "active",
           workflow: "fresh-workflow",
           last_event: "PostToolUse",
           updated_at: new Date(now - 5_000).toISOString()
@@ -237,8 +240,11 @@ test("buildSessionStartContext hides stale older workflow snapshots using launch
       `${JSON.stringify(
         {
           version: 1,
+          kind: "workflow_state_ref",
           session_id: "stale-session",
+          session_state_ref: "../sessions/stale-session.json",
           active: true,
+          status: "active",
           workflow: "stale-workflow",
           last_event: "PostToolUse",
           updated_at: new Date(now - 5 * 60_000).toISOString()

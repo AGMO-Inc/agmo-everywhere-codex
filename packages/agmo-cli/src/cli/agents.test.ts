@@ -5,6 +5,10 @@ import os from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
+  renderManagedAgentsFile,
+  syncManagedAgentsMd,
+} from "../agents/agents-md.js";
+import {
   MANAGED_PROMPT_MIRROR_FILES,
   buildInitialAgentTomlMap,
   listManagedSkillMirrorNames,
@@ -310,4 +314,86 @@ test("runtime config publishes the managed prompt and skill directories", () => 
     join(tempProject, ".codex", "prompts"),
   );
   assert.equal(runtimePaths.skills_dir, join(tempProject, ".codex", "skills"));
+});
+
+test("syncManagedAgentsMd treats compact workflow refs as active sessions without duplicate ids", async () => {
+  const tempProject = await mkdtemp(join(os.tmpdir(), "agmo-agents-md-compact-"));
+  const paths = resolveInstallPaths("project", tempProject);
+  await mkdir(paths.agmoDir, { recursive: true });
+  await mkdir(paths.sessionsStateDir, { recursive: true });
+  await mkdir(paths.workflowsStateDir, { recursive: true });
+  await writeFile(
+    paths.agentsMdFile,
+    renderManagedAgentsFile({
+      generatedBody: "old generated body",
+      manualBody: "manual body"
+    }),
+    "utf8"
+  );
+  const updatedAt = new Date().toISOString();
+  await writeFile(
+    join(paths.sessionsStateDir, "session-a.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        session_id: "session-a",
+        active: true,
+        last_event: "PostToolUse",
+        updated_at: updatedAt
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeFile(
+    join(paths.workflowsStateDir, "session-a.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        kind: "workflow_state_ref",
+        session_id: "session-a",
+        session_state_ref: "../sessions/session-a.json",
+        active: true,
+        status: "active",
+        last_event: "PostToolUse",
+        updated_at: updatedAt
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeFile(
+    join(paths.workflowsStateDir, "session-b.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        kind: "workflow_state_ref",
+        session_id: "session-b",
+        session_state_ref: "../sessions/session-b.json",
+        active: true,
+        status: "active",
+        last_event: "PostToolUse",
+        updated_at: updatedAt
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = await syncManagedAgentsMd({
+    scope: "project",
+    force: false,
+    agentsTemplate: "new generated body",
+    agentsMdFile: paths.agentsMdFile,
+    agmoDir: paths.agmoDir,
+    sessionsStateDir: paths.sessionsStateDir,
+    workflowsStateDir: paths.workflowsStateDir
+  });
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.guard?.skipped_for_active_session, true);
+  assert.deepEqual(result.guard?.active_sessions_detected, ["session-a", "session-b"]);
 });

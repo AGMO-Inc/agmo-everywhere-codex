@@ -970,3 +970,99 @@ test("runCleanupCommand plan can select old inactive Agmo state files", async ()
   );
   assert.equal(existsSync(statePath), true);
 });
+
+test("runCleanupCommand plan handles active, inactive, and malformed compact workflow refs", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-plan-compact-state-"));
+  const workflowsDir = join(tempRoot, ".agmo", "state", "workflows");
+  const activePath = join(workflowsDir, "active-compact.json");
+  const inactivePath = join(workflowsDir, "inactive-compact.json");
+  const malformedPath = join(workflowsDir, "malformed-compact.json");
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await mkdir(workflowsDir, { recursive: true });
+  await writeFile(
+    activePath,
+    `${JSON.stringify(
+      {
+        version: 1,
+        kind: "workflow_state_ref",
+        session_id: "active-compact",
+        session_state_ref: "../sessions/active-compact.json",
+        active: true,
+        status: "active",
+        last_event: "PostToolUse",
+        workflow: "execute",
+        updated_at: oldDate.toISOString()
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeFile(
+    inactivePath,
+    `${JSON.stringify(
+      {
+        version: 1,
+        kind: "workflow_state_ref",
+        session_id: "inactive-compact",
+        session_state_ref: "../sessions/inactive-compact.json",
+        active: false,
+        status: "inactive",
+        last_event: "Stop",
+        workflow: "execute",
+        updated_at: oldDate.toISOString()
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeFile(
+    malformedPath,
+    `${JSON.stringify(
+      {
+        version: 1,
+        kind: "workflow_state_ref",
+        session_id: "malformed-compact",
+        session_state_ref: "../sessions/malformed-compact.json",
+        active: false,
+        status: "inactive",
+        updated_at: oldDate.toISOString()
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await Promise.all([
+    utimes(activePath, oldDate, oldDate),
+    utimes(inactivePath, oldDate, oldDate),
+    utimes(malformedPath, oldDate, oldDate)
+  ]);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string; reason?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/state/workflows/active-compact.json" &&
+        entry.reason === "state file lacks explicit inactive evidence"
+    )
+  );
+  assert.ok(
+    wouldDelete.some(
+      (entry) =>
+        entry.relative_path === ".agmo/state/workflows/inactive-compact.json" &&
+        entry.reason === "inactive state file older than retention threshold"
+    )
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/state/workflows/malformed-compact.json" &&
+        entry.reason === "state file lacks Agmo runtime shape evidence"
+    )
+  );
+});

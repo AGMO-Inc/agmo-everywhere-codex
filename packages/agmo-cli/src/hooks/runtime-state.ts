@@ -82,6 +82,20 @@ export type SessionState = {
   completed_at?: string;
 };
 
+export type WorkflowStateRef = {
+  version: 1;
+  kind: "workflow_state_ref";
+  session_id: string;
+  session_state_ref: string;
+  active: boolean;
+  status: "active" | "inactive";
+  last_event: string;
+  workflow?: string;
+  updated_at: string;
+  started_at?: string;
+  completed_at?: string;
+};
+
 function safeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -153,26 +167,110 @@ async function writeSessionState(
   await writeJsonFile(join(sessionsStateDir, `${safeFileStem(sessionId)}.json`), state);
 }
 
+function renderWorkflowStateRef(sessionId: string, state: SessionState): WorkflowStateRef {
+  return {
+    version: 1,
+    kind: "workflow_state_ref",
+    session_id: sessionId,
+    session_state_ref: `../sessions/${safeFileStem(sessionId)}.json`,
+    active: state.active,
+    status: state.active ? "active" : "inactive",
+    last_event: state.last_event,
+    ...(state.workflow ? { workflow: state.workflow } : {}),
+    updated_at: state.updated_at,
+    ...(state.started_at ? { started_at: state.started_at } : {}),
+    ...(state.completed_at ? { completed_at: state.completed_at } : {})
+  };
+}
+
 async function writeWorkflowState(
   cwd: string,
   sessionId: string,
-  state: SessionState
+  state: WorkflowStateRef
 ): Promise<void> {
   const { workflowsStateDir } = resolveInstallPaths("project", cwd);
   await writeJsonFile(join(workflowsStateDir, `${safeFileStem(sessionId)}.json`), state);
 }
 
-async function readStateFile(path: string): Promise<SessionState | null> {
+async function persistSessionState(args: {
+  cwd: string;
+  sessionId: string;
+  state: SessionState;
+}): Promise<void> {
+  await writeSessionState(args.cwd, args.sessionId, args.state);
+  await writeWorkflowState(args.cwd, args.sessionId, renderWorkflowStateRef(args.sessionId, args.state));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function isSessionState(value: unknown): value is SessionState {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    value.version === 1 &&
+    value.kind !== "workflow_state_ref" &&
+    typeof value.session_id === "string" &&
+    value.session_id.trim().length > 0 &&
+    typeof value.active === "boolean" &&
+    typeof value.last_event === "string" &&
+    value.last_event.trim().length > 0 &&
+    typeof value.updated_at === "string" &&
+    value.updated_at.trim().length > 0
+  );
+}
+
+export function isWorkflowStateRef(value: unknown): value is WorkflowStateRef {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    value.version === 1 &&
+    value.kind === "workflow_state_ref" &&
+    typeof value.session_id === "string" &&
+    value.session_id.trim().length > 0 &&
+    typeof value.session_state_ref === "string" &&
+    value.session_state_ref.trim().length > 0 &&
+    typeof value.active === "boolean" &&
+    (value.status === "active" || value.status === "inactive") &&
+    typeof value.last_event === "string" &&
+    value.last_event.trim().length > 0 &&
+    typeof value.updated_at === "string" &&
+    value.updated_at.trim().length > 0
+  );
+}
+
+async function readJsonStateFile(path: string): Promise<unknown | null> {
   const content = await readTextFileIfExists(path);
   if (!content) {
     return null;
   }
 
   try {
-    return JSON.parse(content) as SessionState;
+    return JSON.parse(content) as unknown;
   } catch {
     return null;
   }
+}
+
+async function readSessionStateFile(path: string): Promise<SessionState | null> {
+  const parsed = await readJsonStateFile(path);
+  return isSessionState(parsed) ? parsed : null;
+}
+
+async function readWorkflowStateFile(
+  path: string
+): Promise<SessionState | WorkflowStateRef | null> {
+  const parsed = await readJsonStateFile(path);
+  if (isSessionState(parsed) || isWorkflowStateRef(parsed)) {
+    return parsed;
+  }
+
+  return null;
 }
 
 async function readExistingSessionState(
@@ -180,15 +278,44 @@ async function readExistingSessionState(
   sessionId: string
 ): Promise<SessionState | null> {
   const { sessionsStateDir } = resolveInstallPaths("project", cwd);
-  return await readStateFile(join(sessionsStateDir, `${safeFileStem(sessionId)}.json`));
+  return await readSessionStateFile(join(sessionsStateDir, `${safeFileStem(sessionId)}.json`));
 }
 
 async function readExistingWorkflowState(
   cwd: string,
   sessionId: string
-): Promise<SessionState | null> {
+): Promise<SessionState | WorkflowStateRef | null> {
   const { workflowsStateDir } = resolveInstallPaths("project", cwd);
-  return await readStateFile(join(workflowsStateDir, `${safeFileStem(sessionId)}.json`));
+  return await readWorkflowStateFile(join(workflowsStateDir, `${safeFileStem(sessionId)}.json`));
+}
+
+function parseUpdatedAt(state: SessionState): number | null {
+  const parsed = Date.parse(state.updated_at);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function chooseNewestSessionState(args: {
+  session: SessionState | null;
+  workflow: SessionState | null;
+}): SessionState | null {
+  const { session, workflow } = args;
+  if (!session) {
+    return workflow;
+  }
+  if (!workflow) {
+    return session;
+  }
+
+  const sessionUpdatedAt = parseUpdatedAt(session);
+  const workflowUpdatedAt = parseUpdatedAt(workflow);
+  if (sessionUpdatedAt !== null && workflowUpdatedAt !== null) {
+    return workflowUpdatedAt > sessionUpdatedAt ? workflow : session;
+  }
+  if (workflowUpdatedAt !== null) {
+    return workflow;
+  }
+
+  return session;
 }
 
 export async function readPersistedSessionState(args: {
@@ -201,7 +328,10 @@ export async function readPersistedSessionState(args: {
     readExistingWorkflowState(args.cwd, sessionId)
   ]);
 
-  return existingWorkflow ?? existingSession;
+  return chooseNewestSessionState({
+    session: existingSession,
+    workflow: isSessionState(existingWorkflow) ? existingWorkflow : null
+  });
 }
 
 function mergeAutosaveState(
@@ -291,11 +421,10 @@ export async function writeWorkflowActivation(args: {
   const turnId = readTurnId(args.payload);
   const prompt = readPromptText(args.payload);
   const updatedAt = nowIso();
-  const [existingSession, existingWorkflow] = await Promise.all([
-    readExistingSessionState(args.cwd, sessionId),
-    readExistingWorkflowState(args.cwd, sessionId)
-  ]);
-  const base = existingWorkflow ?? existingSession;
+  const base = await readPersistedSessionState({
+    cwd: args.cwd,
+    payload: args.payload
+  });
 
   const state: SessionState = {
     version: 1,
@@ -315,10 +444,7 @@ export async function writeWorkflowActivation(args: {
     started_at: updatedAt
   };
 
-  await Promise.all([
-    writeSessionState(args.cwd, sessionId, state),
-    writeWorkflowState(args.cwd, sessionId, state)
-  ]);
+  await persistSessionState({ cwd: args.cwd, sessionId, state });
 
   return {
     sessionId,
@@ -358,10 +484,7 @@ export async function markSessionStopped(args: {
     completed_at: updatedAt
   };
 
-  await Promise.all([
-    writeSessionState(args.cwd, sessionId, state),
-    writeWorkflowState(args.cwd, sessionId, state)
-  ]);
+  await persistSessionState({ cwd: args.cwd, sessionId, state });
 
   return {
     sessionId,
@@ -381,11 +504,10 @@ export async function recordSessionActivity(args: {
   const threadId = readThreadId(args.payload);
   const turnId = readTurnId(args.payload);
   const updatedAt = nowIso();
-  const [existingSession, existingWorkflow] = await Promise.all([
-    readExistingSessionState(args.cwd, sessionId),
-    readExistingWorkflowState(args.cwd, sessionId)
-  ]);
-  const base = existingWorkflow ?? existingSession;
+  const base = await readPersistedSessionState({
+    cwd: args.cwd,
+    payload: args.payload
+  });
   const verificationHistory = nextVerificationHistory({
     base,
     lastEvent: args.lastEvent,
@@ -428,10 +550,7 @@ export async function recordSessionActivity(args: {
     ...(base?.started_at ? { started_at: base.started_at } : { started_at: updatedAt })
   };
 
-  await Promise.all([
-    writeSessionState(args.cwd, sessionId, nextState),
-    writeWorkflowState(args.cwd, sessionId, nextState)
-  ]);
+  await persistSessionState({ cwd: args.cwd, sessionId, state: nextState });
 
   return {
     sessionId,
@@ -452,11 +571,10 @@ export async function recordSessionAutosave(args: {
   const threadId = readThreadId(args.payload);
   const turnId = readTurnId(args.payload);
   const updatedAt = nowIso();
-  const [existingSession, existingWorkflow] = await Promise.all([
-    readExistingSessionState(args.cwd, sessionId),
-    readExistingWorkflowState(args.cwd, sessionId)
-  ]);
-  const base = existingWorkflow ?? existingSession;
+  const base = await readPersistedSessionState({
+    cwd: args.cwd,
+    payload: args.payload
+  });
 
   const nextState: SessionState = {
     version: 1,
@@ -484,6 +602,7 @@ export async function recordSessionAutosave(args: {
           }
         }
       : {}),
+    ...(base?.artifact_notes ? { artifact_notes: base.artifact_notes } : {}),
     ...mergeVerificationState(base),
     ...mergeWisdomPersistenceState(base),
     updated_at: updatedAt,
@@ -491,10 +610,7 @@ export async function recordSessionAutosave(args: {
     ...(base?.completed_at ? { completed_at: base.completed_at } : {})
   };
 
-  await Promise.all([
-    writeSessionState(args.cwd, sessionId, nextState),
-    writeWorkflowState(args.cwd, sessionId, nextState)
-  ]);
+  await persistSessionState({ cwd: args.cwd, sessionId, state: nextState });
 
   return {
     sessionId,
@@ -513,11 +629,10 @@ export async function recordSessionArtifact(args: {
   const threadId = readThreadId(args.payload);
   const turnId = readTurnId(args.payload);
   const updatedAt = nowIso();
-  const [existingSession, existingWorkflow] = await Promise.all([
-    readExistingSessionState(args.cwd, sessionId),
-    readExistingWorkflowState(args.cwd, sessionId)
-  ]);
-  const base = existingWorkflow ?? existingSession;
+  const base = await readPersistedSessionState({
+    cwd: args.cwd,
+    payload: args.payload
+  });
 
   const nextState: SessionState = {
     version: 1,
@@ -545,10 +660,7 @@ export async function recordSessionArtifact(args: {
     ...(base?.completed_at ? { completed_at: base.completed_at } : {})
   };
 
-  await Promise.all([
-    writeSessionState(args.cwd, sessionId, nextState),
-    writeWorkflowState(args.cwd, sessionId, nextState)
-  ]);
+  await persistSessionState({ cwd: args.cwd, sessionId, state: nextState });
 
   return {
     sessionId,
@@ -566,11 +678,10 @@ export async function recordSessionWisdomPersistence(args: {
   const threadId = readThreadId(args.payload);
   const turnId = readTurnId(args.payload);
   const updatedAt = nowIso();
-  const [existingSession, existingWorkflow] = await Promise.all([
-    readExistingSessionState(args.cwd, sessionId),
-    readExistingWorkflowState(args.cwd, sessionId)
-  ]);
-  const base = existingWorkflow ?? existingSession;
+  const base = await readPersistedSessionState({
+    cwd: args.cwd,
+    payload: args.payload
+  });
 
   const nextState: SessionState = {
     version: 1,
@@ -595,10 +706,7 @@ export async function recordSessionWisdomPersistence(args: {
     ...(base?.completed_at ? { completed_at: base.completed_at } : {})
   };
 
-  await Promise.all([
-    writeSessionState(args.cwd, sessionId, nextState),
-    writeWorkflowState(args.cwd, sessionId, nextState)
-  ]);
+  await persistSessionState({ cwd: args.cwd, sessionId, state: nextState });
 
   return {
     sessionId,
