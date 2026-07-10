@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,8 +9,11 @@ import { readWisdomStore } from "../wisdom/store.js";
 
 async function withTempHome<T>(fn: () => Promise<T>): Promise<T> {
   const originalHome = process.env.HOME;
+  const originalCodexHome = process.env.CODEX_HOME;
   const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-stop-home-"));
+  const tempCodexHome = await mkdtemp(join(os.tmpdir(), "agmo-stop-codex-"));
   process.env.HOME = tempHome;
+  process.env.CODEX_HOME = tempCodexHome;
 
   try {
     return await fn();
@@ -19,6 +22,11 @@ async function withTempHome<T>(fn: () => Promise<T>): Promise<T> {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = originalCodexHome;
     }
   }
 }
@@ -65,5 +73,24 @@ test("handleStop persists a wisdom outcome once for wisdom workflow", async () =
     await handleStop({ cwd: tempRoot, payload });
     store = await readWisdomStore("project", tempRoot);
     assert.equal(store.entries.length, 1);
+  });
+});
+
+test("handleStop ignores malformed session ids during session AGENTS cleanup", async () => {
+  await withTempHome(async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-stop-invalid-session-"));
+    const sentinel = join(tempRoot, ".agmo", "cache", "outside-sentinel");
+    await mkdir(join(tempRoot, ".agmo", "cache"), { recursive: true });
+    await writeFile(sentinel, "keep\n", "utf-8");
+
+    const output = await handleStop({
+      cwd: tempRoot,
+      payload: {
+        session_id: "../outside-sentinel"
+      }
+    });
+
+    assert.equal(output, null);
+    assert.equal(await readFile(sentinel, "utf-8"), "keep\n");
   });
 });

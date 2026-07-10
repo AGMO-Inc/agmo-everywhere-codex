@@ -455,6 +455,10 @@ async function formatSessionInstructionsLine(args: {
   const sourceSummary =
     sourceLabels.length > 0 ? `${sourceLabels.join(" + ")} composed` : "overlay-only";
 
+  if (result.kind === "empty") {
+    return `- Session AGENTS: no composed session AGENTS.md (${result.removed}; no composable instructions).`;
+  }
+
   return `- Session AGENTS: ${formatPath(result.path, args.runtimeRoot)} (${sourceSummary}, ${result.status}).`;
 }
 

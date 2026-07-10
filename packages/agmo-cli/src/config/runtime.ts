@@ -21,6 +21,22 @@ export type AgmoWikiContextPolicyConfig = {
   manifest_health?: boolean;
 };
 
+export type AgmoCleanupPolicyConfig = {
+  enabled?: boolean;
+  dry_run_default?: boolean;
+  state_ttl_days?: number;
+  workflow_state_ttl_days?: number;
+  session_instructions_ttl_days?: number;
+  handoff_ttl_days?: number;
+  launch_workspace_ttl_hours?: number;
+  cache_ttl_days?: number;
+  max_project_agmo_bytes?: number;
+  max_launch_workspace_bytes?: number;
+  max_state_files?: number;
+  all_project_scan_max_depth?: number;
+  safe_auto_cleanup_on_launch?: boolean;
+};
+
 export type AgmoVaultAutosaveUpdateMode = "overwrite" | "append-section";
 
 export type AgmoVaultAutosavePolicyConfig = {
@@ -48,6 +64,7 @@ export type AgmoRuntimeConfig = {
   launch?: AgmoLaunchPolicyConfig;
   session_start?: AgmoSessionStartPolicyConfig;
   wiki?: AgmoWikiContextPolicyConfig;
+  cleanup?: AgmoCleanupPolicyConfig;
   vault_autosave?: AgmoVaultAutosavePolicyConfig;
   [key: string]: unknown;
 };
@@ -69,6 +86,22 @@ export const DEFAULT_AGMO_WIKI_CONTEXT_POLICY: Required<AgmoWikiContextPolicyCon
   context_budget_chars: 6000,
   manifest_budget_chars: 800,
   manifest_health: false
+};
+
+export const DEFAULT_AGMO_CLEANUP_POLICY: Required<AgmoCleanupPolicyConfig> = {
+  enabled: true,
+  dry_run_default: true,
+  state_ttl_days: 30,
+  workflow_state_ttl_days: 30,
+  session_instructions_ttl_days: 7,
+  handoff_ttl_days: 30,
+  launch_workspace_ttl_hours: 24,
+  cache_ttl_days: 7,
+  max_project_agmo_bytes: 1_000_000_000,
+  max_launch_workspace_bytes: 500_000_000,
+  max_state_files: 1000,
+  all_project_scan_max_depth: 5,
+  safe_auto_cleanup_on_launch: false
 };
 
 export const DEFAULT_AGMO_VAULT_AUTOSAVE_POLICY: Required<
@@ -477,6 +510,64 @@ export async function resolveWikiContextPolicy(
                 ? "user"
                 : "default"
       }
+    }
+  };
+}
+
+export type AgmoCleanupPolicyKey = keyof Required<AgmoCleanupPolicyConfig>;
+
+function normalizeCleanupPolicyValue(
+  key: AgmoCleanupPolicyKey,
+  value: unknown
+): boolean | number | undefined {
+  if (
+    key === "enabled" ||
+    key === "dry_run_default" ||
+    key === "safe_auto_cleanup_on_launch"
+  ) {
+    return normalizeBoolean(value);
+  }
+
+  return normalizeNonNegativeNumber(value);
+}
+
+export async function resolveCleanupPolicy(cwd = process.cwd()): Promise<{
+  policy: Required<AgmoCleanupPolicyConfig>;
+  sources: {
+    project_config_path: string;
+    user_config_path: string;
+    effective: Record<AgmoCleanupPolicyKey, "project" | "user" | "default">;
+  };
+}> {
+  const projectConfigPath = resolveInstallPaths("project", cwd).agmoConfigFile;
+  const userConfigPath = resolveInstallPaths("user", cwd).agmoConfigFile;
+  const userConfig = await readAgmoConfig(userConfigPath);
+  const projectConfig = await readAgmoConfig(projectConfigPath);
+  const userCleanup = userConfig.cleanup ?? {};
+  const projectCleanup = projectConfig.cleanup ?? {};
+  const policy = { ...DEFAULT_AGMO_CLEANUP_POLICY };
+  const effective = {} as Record<AgmoCleanupPolicyKey, "project" | "user" | "default">;
+
+  for (const key of Object.keys(DEFAULT_AGMO_CLEANUP_POLICY) as AgmoCleanupPolicyKey[]) {
+    const projectValue = normalizeCleanupPolicyValue(key, projectCleanup[key]);
+    const userValue = normalizeCleanupPolicyValue(key, userCleanup[key]);
+    if (projectValue !== undefined) {
+      policy[key] = projectValue as never;
+      effective[key] = "project";
+    } else if (userValue !== undefined) {
+      policy[key] = userValue as never;
+      effective[key] = "user";
+    } else {
+      effective[key] = "default";
+    }
+  }
+
+  return {
+    policy,
+    sources: {
+      project_config_path: projectConfigPath,
+      user_config_path: userConfigPath,
+      effective
     }
   };
 }
@@ -926,6 +1017,95 @@ export async function resetSessionStartPolicy(args: {
   };
 
   delete nextConfig.session_start;
+
+  await writeJsonFile(scoped.config_path, nextConfig);
+
+  return {
+    scope: args.scope,
+    config_path: scoped.config_path
+  };
+}
+
+export async function setCleanupPolicyValue(args: {
+  key: AgmoCleanupPolicyKey;
+  value: boolean | number;
+  scope: InstallScope;
+  cwd?: string;
+}): Promise<{
+  scope: InstallScope;
+  key: AgmoCleanupPolicyKey;
+  value: boolean | number;
+  config_path: string;
+}> {
+  const cwd = args.cwd ?? process.cwd();
+  const scoped = await readScopedAgmoConfig(args.scope, cwd);
+
+  await writeJsonFile(scoped.config_path, {
+    ...scoped.config,
+    cleanup: {
+      ...(scoped.config.cleanup ?? {}),
+      [args.key]: args.value
+    },
+    updated_at: new Date().toISOString()
+  });
+
+  return {
+    scope: args.scope,
+    key: args.key,
+    value: args.value,
+    config_path: scoped.config_path
+  };
+}
+
+export async function unsetCleanupPolicyValue(args: {
+  key: AgmoCleanupPolicyKey;
+  scope: InstallScope;
+  cwd?: string;
+}): Promise<{
+  scope: InstallScope;
+  key: AgmoCleanupPolicyKey;
+  config_path: string;
+}> {
+  const cwd = args.cwd ?? process.cwd();
+  const scoped = await readScopedAgmoConfig(args.scope, cwd);
+  const nextCleanup = { ...(scoped.config.cleanup ?? {}) };
+  delete nextCleanup[args.key];
+
+  const nextConfig: AgmoRuntimeConfig = {
+    ...scoped.config,
+    updated_at: new Date().toISOString()
+  };
+
+  if (Object.keys(nextCleanup).length > 0) {
+    nextConfig.cleanup = nextCleanup;
+  } else {
+    delete nextConfig.cleanup;
+  }
+
+  await writeJsonFile(scoped.config_path, nextConfig);
+
+  return {
+    scope: args.scope,
+    key: args.key,
+    config_path: scoped.config_path
+  };
+}
+
+export async function resetCleanupPolicy(args: {
+  scope: InstallScope;
+  cwd?: string;
+}): Promise<{
+  scope: InstallScope;
+  config_path: string;
+}> {
+  const cwd = args.cwd ?? process.cwd();
+  const scoped = await readScopedAgmoConfig(args.scope, cwd);
+  const nextConfig: AgmoRuntimeConfig = {
+    ...scoped.config,
+    updated_at: new Date().toISOString()
+  };
+
+  delete nextConfig.cleanup;
 
   await writeJsonFile(scoped.config_path, nextConfig);
 

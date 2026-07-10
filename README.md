@@ -9,7 +9,7 @@
 
 Codex-native Agmo runtime and plugin for planning, execution, verification, GitHub workflows, vault persistence, and tmux-backed team orchestration.
 
-[![Version](https://img.shields.io/badge/version-0.1.4-1f2937.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.1.5-1f2937.svg)](package.json)
 [![CLI](https://img.shields.io/badge/runtime-agmo%20CLI-0f766e.svg)](packages/agmo-cli)
 [![Plugin](https://img.shields.io/badge/plugin-Codex%20native-1d4ed8.svg)](packages/agmo-plugin)
 [![Agents](https://img.shields.io/badge/agents-7-14532d.svg)](#managed-native-agent-roster)
@@ -352,7 +352,45 @@ missing or dead HUD panes, while rebalance applies an `auto`, `main-vertical`, o
 Machine-oriented JSON commands keep existing `command` fields and add a stable envelope:
 `schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
 Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo team` commands,
-and JSON-producing `agmo vault` commands.
+JSON-producing `agmo cleanup` commands, and JSON-producing `agmo vault` commands.
+
+`agmo doctor` includes a nested `disk_usage` section for the current project's `.agmo` directory. This section is
+info-only: it measures usage with the cleanup inventory, reports cleanup candidates from retention policy plus
+effective cleanup caps, and keeps its recommendations separate from top-level doctor `ok` status. `disk_usage`
+uses `candidate_basis: "retention_policy_and_effective_caps"` and includes compact `effective_caps` and `pressure`
+metadata from the cleanup plan. `agmo doctor --scope user` still measures the current project's `.agmo` footprint;
+`--scope user` only changes setup/config diagnostics. Moving or relocating global/user Agmo state does not resolve
+current-project disk pressure because project runtime artifacts remain under the project root.
+
+Use the cleanup flow in order:
+
+```bash
+agmo cleanup inspect --json --verbose
+agmo cleanup plan --json --verbose
+agmo cleanup run --confirm --json
+```
+
+`inspect` and `plan` are non-mutating. `run` deletes only after `--confirm` and follows the cleanup plan. Cleanup
+selection is deterministic: retention TTL candidates are selected first, configured category caps run second, and
+the effective project byte cap runs last. Configured cap value `0` disables that configured cap. Explicit
+`--max-bytes 0` is strict, and any explicit `--max-bytes` overrides only `max_project_agmo_bytes`; configured
+`max_launch_workspace_bytes` and `max_state_files` still apply. Nonzero configured defaults are enforced for plain
+cleanup plans, so a plan can include cap-selected candidates even without CLI cap flags.
+
+Cleanup JSON keeps existing fields and additively includes `effective_caps` plus `pressure`. Pressure reports
+before/after values, selected entries/bytes, protected or ineligible skipped entries/bytes, and
+`reachable: false` with `unreachable_reason: "no eligible entries remain before cap target"` when protected entries
+prevent a cap target from being reached. Launch workspace deletion is revalidated at delete time: metadata,
+session identity, launch state, path kind, realpath containment, and Git dirty state must still match the safe
+planned facts, or the entry is skipped instead of removed.
+
+Launch can also opt in to safe automatic cleanup of old clean launch TTL candidates and paired session instructions
+under the existing cleanup policy. Cap-selected cleanup reasons are not eligible for launch auto-cleanup:
+
+```bash
+agmo config cleanup set safe_auto_cleanup_on_launch true --scope project
+```
+
 For machine interop, `agmo team api <send-message|broadcast|mailbox-list|mailbox-mark-delivered|mailbox-mark-notified|create-task|update-task|release-task-claim|read-config|read-manifest|read-worker-status|read-worker-heartbeat|update-worker-heartbeat|write-worker-inbox|write-worker-identity|append-event|read-events|await-event|read-monitor-snapshot|write-monitor-snapshot|write-shutdown-request|read-shutdown-ack|read-idle-state|read-stall-state|read-task-approval|write-task-approval|read-task|list-tasks|get-summary|cleanup|orphan-cleanup|claim-task|transition-task-status> --input '<json>' --json`
 returns an OMC-style envelope with either `data` or `error`; lifecycle mutation is limited to claim-safe
 claim/release and `in_progress -> completed|failed` terminal transitions. Mailbox operations expose durable
@@ -362,7 +400,7 @@ snapshot APIs expose the durable `monitor-snapshot.json` file without requiring 
 Shutdown handshake APIs write durable request state and read worker acknowledgements without finalizing the
 team or closing panes. Idle/stall APIs derive leader-facing state from durable worker status, heartbeats,
 tasks, dispatch, and events. Task approval APIs persist reviewer decisions and append approval events.
-Cleanup APIs are dry-run by default and require `confirm_cleanup: true` or `force: true` before shutdown.
+Team cleanup APIs are dry-run by default and require `confirm_cleanup: true` or `force: true` before shutdown.
 Task creation uses durable numeric IDs and `list-tasks`/`read-task` include dynamically created task files.
 
 ### Operational features

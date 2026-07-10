@@ -10,8 +10,11 @@ import { addWisdomEntry } from "../wisdom/store.js";
 
 async function withTempHome<T>(fn: () => Promise<T>): Promise<T> {
   const originalHome = process.env.HOME;
+  const originalCodexHome = process.env.CODEX_HOME;
   const tempHome = await mkdtemp(join(os.tmpdir(), "agmo-session-start-home-"));
+  const tempCodexHome = await mkdtemp(join(os.tmpdir(), "agmo-session-start-codex-"));
   process.env.HOME = tempHome;
+  process.env.CODEX_HOME = tempCodexHome;
 
   try {
     return await fn();
@@ -20,6 +23,11 @@ async function withTempHome<T>(fn: () => Promise<T>): Promise<T> {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = originalCodexHome;
     }
   }
 }
@@ -66,6 +74,39 @@ test("buildSessionStartContext prioritizes current-session teams and hides unrel
     assert.match(context, /current-session-team-b \[active, workers=1\]/);
     assert.match(context, /1 (?:other|unrelated) active team snapshot[s]? hidden/);
     assert.doesNotMatch(context, /older-session-team \[active, workers=1\]/);
+  });
+});
+
+test("buildSessionStartContext reports empty session AGENTS without printing a cache path", async () => {
+  await withTempHome(async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-session-start-empty-agents-"));
+    const context = await buildSessionStartContext(tempRoot, {}, { session_id: "empty-session" });
+
+    assert.match(
+      context,
+      /Session AGENTS: no composed session AGENTS\.md \(absent; no composable instructions\)\./
+    );
+    assert.doesNotMatch(
+      context,
+      /\.agmo\/cache\/session-instructions\/empty-session\/AGENTS\.md/
+    );
+  });
+});
+
+test("buildSessionStartContext keeps launch workspace AGENTS path reporting unchanged", async () => {
+  await withTempHome(async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-session-start-launch-agents-"));
+    const launchWorkspace = join(tempRoot, ".agmo", "cache", "launch-workspaces", "s", "workspace");
+    const context = await buildSessionStartContext(
+      tempRoot,
+      { AGMO_LAUNCH_WORKSPACE_ROOT: launchWorkspace },
+      { session_id: "empty-session" }
+    );
+
+    assert.match(
+      context,
+      /\.agmo\/cache\/launch-workspaces\/s\/workspace\/AGENTS\.md \(launch workspace root\)/
+    );
   });
 });
 
@@ -222,8 +263,11 @@ test("buildSessionStartContext hides stale older workflow snapshots using launch
       `${JSON.stringify(
         {
           version: 1,
+          kind: "workflow_state_ref",
           session_id: "fresh-session",
+          session_state_ref: "../sessions/fresh-session.json",
           active: true,
+          status: "active",
           workflow: "fresh-workflow",
           last_event: "PostToolUse",
           updated_at: new Date(now - 5_000).toISOString()
@@ -237,8 +281,11 @@ test("buildSessionStartContext hides stale older workflow snapshots using launch
       `${JSON.stringify(
         {
           version: 1,
+          kind: "workflow_state_ref",
           session_id: "stale-session",
+          session_state_ref: "../sessions/stale-session.json",
           active: true,
+          status: "active",
           workflow: "stale-workflow",
           last_event: "PostToolUse",
           updated_at: new Date(now - 5 * 60_000).toISOString()

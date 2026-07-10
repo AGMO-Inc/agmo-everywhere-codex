@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { basename } from "node:path";
+import { createCleanupPlan, type CleanupPlanEntry, type CleanupPlanSummary } from "../cleanup/plan.js";
+import { runCleanupPlan, type CleanupRunSummary } from "../cleanup/run.js";
 import {
   readScopedAgmoConfig,
+  resolveCleanupPolicy,
   resetLaunchPolicy,
   resolveLaunchPolicy,
   setLaunchPolicyValue,
@@ -22,6 +25,28 @@ import { ensureCodexCliArgs, normalizeCodexAutonomyMode, type CodexAutonomyMode 
 
 const AGMO_TMUX_BOOTSTRAPPED_ENV = "AGMO_TMUX_BOOTSTRAPPED";
 const AGMO_CODEX_AUTONOMY_MODE_ENV = "AGMO_CODEX_AUTONOMY_MODE";
+const AUTO_CLEANUP_LAUNCH_REASON = "inactive clean launch workspace older than retention threshold";
+const AUTO_CLEANUP_SESSION_OLD_REASON = "session instructions older than retention threshold";
+const AUTO_CLEANUP_SESSION_NEW_REASON = "session instructions newer than retention threshold";
+const AUTO_CLEANUP_PAIRED_REASON =
+  "paired with expired clean launch workspace during opt-in launch auto-cleanup";
+
+type CleanupPolicyResult = Awaited<ReturnType<typeof resolveCleanupPolicy>>;
+type CleanupPlanResult = CleanupPlanSummary;
+
+export type LaunchAutoCleanupDeps = {
+  resolveCleanupPolicy?: (projectRoot: string) => Promise<CleanupPolicyResult>;
+  createCleanupPlan?: (projectRoot: string) => Promise<CleanupPlanResult>;
+  runCleanupPlan?: (plan: CleanupPlanResult) => Promise<CleanupRunSummary>;
+  writeStderr?: (message: string) => void;
+};
+
+const defaultLaunchAutoCleanupDeps: Required<LaunchAutoCleanupDeps> = {
+  resolveCleanupPolicy,
+  createCleanupPlan,
+  runCleanupPlan,
+  writeStderr: (message) => process.stderr.write(message)
+};
 
 function printLaunchHelp(): void {
   console.log(`Usage:
@@ -308,6 +333,226 @@ function parseLaunchPolicyValue(
   return parseRequiredNumericValue(raw, "<value>");
 }
 
+function compactErrorMessage(error: unknown, maxLength = 200): string {
+  const raw = error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : String(error);
+  const compact = raw.replace(/\s+/g, " ").trim() || "unknown error";
+  return compact.length > maxLength ? `${compact.slice(0, Math.max(maxLength - 3, 0))}...` : compact;
+}
+
+function compactLine(line: string, maxLength = 240): string {
+  const compact = line.replace(/\s+/g, " ").trim();
+  return compact.length > maxLength ? `${compact.slice(0, Math.max(maxLength - 3, 0))}...` : compact;
+}
+
+function deterministicCleanupEntryCompare(
+  left: CleanupPlanEntry,
+  right: CleanupPlanEntry
+): number {
+  const category = left.category.localeCompare(right.category);
+  if (category !== 0) {
+    return category;
+  }
+
+  const leftTime = left.mtime_ms ?? Number.POSITIVE_INFINITY;
+  const rightTime = right.mtime_ms ?? Number.POSITIVE_INFINITY;
+  if (leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+
+  return left.relative_path.localeCompare(right.relative_path);
+}
+
+function isSafeLaunchSessionId(sessionId: string): boolean {
+  return (
+    sessionId.length > 0 &&
+    sessionId !== "." &&
+    sessionId !== ".." &&
+    basename(sessionId) === sessionId &&
+    !sessionId.includes("/") &&
+    !sessionId.includes("\\")
+  );
+}
+
+function launchSessionIdForAutoCleanup(entry: CleanupPlanEntry): string | null {
+  const sessionId = entry.details?.session_id;
+  if (
+    entry.category !== "cache/launch-workspaces" ||
+    entry.reason !== AUTO_CLEANUP_LAUNCH_REASON ||
+    typeof sessionId !== "string" ||
+    !isSafeLaunchSessionId(sessionId)
+  ) {
+    return null;
+  }
+
+  return sessionId;
+}
+
+function launchIdentityForAutoCleanup(entry: CleanupPlanEntry): string | null {
+  const sessionId = launchSessionIdForAutoCleanup(entry);
+  return sessionId ? `${entry.path}\0${entry.relative_path}\0${sessionId}` : null;
+}
+
+function isExactSessionInstructionEntry(entry: CleanupPlanEntry, sessionId: string): boolean {
+  return (
+    entry.category === "cache/session-instructions" &&
+    basename(entry.path) === sessionId &&
+    entry.relative_path === `.agmo/cache/session-instructions/${sessionId}`
+  );
+}
+
+function sessionInstructionEntryForAutoCleanup(
+  entry: CleanupPlanEntry,
+  selectedSessionIds: Set<string>
+): CleanupPlanEntry | null {
+  for (const sessionId of selectedSessionIds) {
+    if (!isExactSessionInstructionEntry(entry, sessionId)) {
+      continue;
+    }
+
+    if (entry.reason === AUTO_CLEANUP_SESSION_OLD_REASON) {
+      return entry;
+    }
+
+    if (entry.reason === AUTO_CLEANUP_SESSION_NEW_REASON) {
+      return {
+        ...entry,
+        reason: AUTO_CLEANUP_PAIRED_REASON,
+        details: {
+          ...(entry.details ?? {}),
+          auto_cleanup_original_reason: entry.reason
+        }
+      };
+    }
+  }
+
+  return null;
+}
+
+function buildLaunchAutoCleanupPlan(
+  firstPlan: CleanupPlanResult,
+  secondPlan: CleanupPlanResult
+): CleanupPlanResult {
+  const selectedSessionIds = new Set(
+    firstPlan.would_delete
+      .map(launchSessionIdForAutoCleanup)
+      .filter((sessionId): sessionId is string => Boolean(sessionId))
+  );
+  const selectedLaunchIdentities = new Set(
+    firstPlan.would_delete
+      .map(launchIdentityForAutoCleanup)
+      .filter((identity): identity is string => Boolean(identity))
+  );
+
+  if (selectedSessionIds.size === 0) {
+    return {
+      ...secondPlan,
+      totals: {
+        ...secondPlan.totals,
+        would_delete_entries: 0,
+        would_delete_bytes: 0,
+        kept_entries: secondPlan.would_delete.length + secondPlan.kept.length,
+        kept_bytes: [...secondPlan.would_delete, ...secondPlan.kept].reduce(
+          (sum, entry) => sum + entry.bytes,
+          0
+        ),
+        projected_bytes_after_delete: secondPlan.totals.inspected_bytes
+      },
+      would_delete: [],
+      kept: [...secondPlan.would_delete, ...secondPlan.kept].sort(deterministicCleanupEntryCompare)
+    };
+  }
+
+  const executableLaunchEntries: CleanupPlanEntry[] = [];
+  const executableSessionIds = new Set<string>();
+  for (const entry of secondPlan.would_delete) {
+    const sessionId = launchSessionIdForAutoCleanup(entry);
+    const identity = launchIdentityForAutoCleanup(entry);
+    if (!sessionId || !identity || !selectedLaunchIdentities.has(identity)) {
+      continue;
+    }
+
+    executableLaunchEntries.push(entry);
+    executableSessionIds.add(sessionId);
+  }
+
+  const executableSessionEntries = [...secondPlan.would_delete, ...secondPlan.kept]
+    .map((entry) => sessionInstructionEntryForAutoCleanup(entry, executableSessionIds))
+    .filter((entry): entry is CleanupPlanEntry => Boolean(entry));
+
+  const wouldDelete = [...executableLaunchEntries, ...executableSessionEntries]
+    .sort(deterministicCleanupEntryCompare);
+  const executablePaths = new Set(wouldDelete.map((entry) => entry.path));
+  const kept = [...secondPlan.would_delete, ...secondPlan.kept]
+    .filter((entry) => !executablePaths.has(entry.path))
+    .sort(deterministicCleanupEntryCompare);
+
+  const wouldDeleteBytes = wouldDelete.reduce((sum, entry) => sum + entry.bytes, 0);
+  const keptBytes = kept.reduce((sum, entry) => sum + entry.bytes, 0);
+
+  return {
+    ...secondPlan,
+    would_delete: wouldDelete,
+    kept,
+    totals: {
+      inspected_entries: secondPlan.totals.inspected_entries,
+      inspected_bytes: secondPlan.totals.inspected_bytes,
+      would_delete_entries: wouldDelete.length,
+      would_delete_bytes: wouldDeleteBytes,
+      kept_entries: kept.length,
+      kept_bytes: keptBytes,
+      projected_bytes_after_delete: Math.max(secondPlan.totals.inspected_bytes - wouldDeleteBytes, 0)
+    }
+  };
+}
+
+export async function runSafeAutoCleanupBeforeLaunch(
+  projectRoot: string,
+  deps: LaunchAutoCleanupDeps = {}
+): Promise<void> {
+  const cleanupDeps = { ...defaultLaunchAutoCleanupDeps, ...deps };
+
+  try {
+    const policy = await cleanupDeps.resolveCleanupPolicy(projectRoot);
+    if (!policy.policy.enabled || !policy.policy.safe_auto_cleanup_on_launch) {
+      return;
+    }
+
+    const firstPlan = await cleanupDeps.createCleanupPlan(projectRoot);
+    const secondPlan = await cleanupDeps.createCleanupPlan(projectRoot);
+    const filteredPlan = buildLaunchAutoCleanupPlan(firstPlan, secondPlan);
+
+    if (
+      filteredPlan.would_delete.some(
+        (entry) =>
+          entry.category !== "cache/launch-workspaces" &&
+          entry.category !== "cache/session-instructions"
+      )
+    ) {
+      throw new Error("filtered auto-cleanup plan contains a non-launch category");
+    }
+
+    if (filteredPlan.would_delete.length === 0) {
+      return;
+    }
+
+    const result = await cleanupDeps.runCleanupPlan(filteredPlan);
+    if (result.run.failures.length > 0) {
+      const firstFailure = result.run.failures[0];
+      const firstFailureDetails = firstFailure
+        ? ` first=${compactErrorMessage(firstFailure.relative_path, 120)}: ${compactErrorMessage(firstFailure.error, 120)}`
+        : "";
+      const line = `[agmo launch] auto-cleanup incomplete: removed=${result.run.removed.length} skipped=${result.run.skipped.length} failures=${result.run.failures.length}${firstFailureDetails}`;
+      cleanupDeps.writeStderr(`${compactLine(line)}\n`);
+    }
+  } catch (error) {
+    cleanupDeps.writeStderr(
+      `[agmo launch] auto-cleanup skipped: ${compactErrorMessage(error)}\n`
+    );
+  }
+}
+
 export async function runLaunchCommand(args: string[]): Promise<void> {
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
     printLaunchHelp();
@@ -533,6 +778,8 @@ export async function runLaunchCommand(args: string[]): Promise<void> {
     });
     return;
   }
+
+  await runSafeAutoCleanupBeforeLaunch(projectRoot);
 
   const workspace = await prepareSessionWorkspace({
     projectRoot

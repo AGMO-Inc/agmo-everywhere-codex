@@ -461,6 +461,10 @@ export async function runSetupCommand(args: string[]): Promise<void> {
         ...((generatedConfig.session_start as Record<string, unknown> | undefined) ?? {}),
         ...((existingConfig.session_start as Record<string, unknown> | undefined) ?? {})
       },
+      cleanup: {
+        ...((generatedConfig.cleanup as Record<string, unknown> | undefined) ?? {}),
+        ...((existingConfig.cleanup as Record<string, unknown> | undefined) ?? {})
+      },
       vault_autosave: {
         ...((generatedConfig.vault_autosave as Record<string, unknown> | undefined) ?? {}),
         ...((existingConfig.vault_autosave as Record<string, unknown> | undefined) ?? {}),
