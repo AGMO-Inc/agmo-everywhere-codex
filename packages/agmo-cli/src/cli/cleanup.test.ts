@@ -318,11 +318,15 @@ test("runCleanupCommand plan prints non-mutating machine JSON", async () => {
   const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
   const totals = output.totals as { would_delete_entries?: number; would_delete_bytes?: number };
   const wouldDelete = output.would_delete as Array<{ relative_path?: string; reason?: string }>;
+  const effectiveCaps = output.effective_caps as { max_project_agmo_bytes?: { effective?: number | null } };
+  const pressure = output.pressure as { project_bytes?: { target?: number | null } };
 
   assert.equal(output.schema_version, "1.0");
   assert.equal(output.operation, "cleanup.plan");
   assert.equal(output.ok, true);
   assert.equal(output.command, "cleanup plan");
+  assert.equal(typeof effectiveCaps.max_project_agmo_bytes?.effective, "number");
+  assert.equal(typeof pressure.project_bytes?.target, "number");
   assert.equal(totals.would_delete_entries, 1);
   assert.ok((totals.would_delete_bytes ?? 0) > 0);
   assert.deepEqual(wouldDelete.map((entry) => entry.relative_path), [".agmo/logs/old.log"]);
@@ -699,6 +703,113 @@ test("runCleanupPlan skips a planned path that changes to a symlink before delet
   );
   assert.equal(existsSync(logPath), true);
   assert.equal(existsSync(outsidePath), true);
+});
+
+test("runCleanupPlan skips planned launch workspace when it becomes dirty before deletion", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-launch-guard-dirty-"));
+  const workspaceDir = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1");
+  const workspaceRoot = join(workspaceDir, "workspace");
+  const metadataPath = join(workspaceDir, "metadata.json");
+  await mkdir(workspaceRoot, { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  const plan = await createCleanupPlan(tempRoot, { olderThanDays: 1 });
+  assert.ok(plan.would_delete.some((entry) => entry.relative_path === ".agmo/cache/launch-workspaces/session-1"));
+
+  await writeFile(join(workspaceRoot, "dirty.txt"), "changed\n", "utf8");
+  const result = await runCleanupPlan(plan);
+
+  assert.deepEqual(result.run.removed, []);
+  assert.deepEqual(
+    result.run.skipped.map((entry) => ({
+      relative_path: entry.relative_path,
+      skipped_reason: entry.skipped_reason
+    })),
+    [
+      {
+        relative_path: ".agmo/cache/launch-workspaces/session-1",
+        skipped_reason: "launch workspace dirty before deletion"
+      }
+    ]
+  );
+  assert.equal(existsSync(workspaceDir), true);
+});
+
+test("runCleanupPlan keeps planned launch workspace when metadata project root is tampered", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-launch-guard-root-"));
+  const workspaceDir = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1");
+  const workspaceRoot = join(workspaceDir, "workspace");
+  const metadataPath = join(workspaceDir, "metadata.json");
+  await mkdir(workspaceRoot, { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  const plan = await createCleanupPlan(tempRoot, { olderThanDays: 1 });
+  assert.ok(plan.would_delete.some((entry) => entry.relative_path === ".agmo/cache/launch-workspaces/session-1"));
+
+  const tamperedProjectRoot = join(tempRoot, "..", "other-project");
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tamperedProjectRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = await runCleanupPlan(plan);
+
+  assert.deepEqual(result.run.removed, []);
+  assert.deepEqual(
+    result.run.skipped.map((entry) => ({
+      relative_path: entry.relative_path,
+      skipped_reason: entry.skipped_reason
+    })),
+    [
+      {
+        relative_path: ".agmo/cache/launch-workspaces/session-1",
+        skipped_reason: "launch session identity changed before deletion"
+      }
+    ]
+  );
+  assert.equal(existsSync(workspaceDir), true);
 });
 
 test("runCleanupCommand plan keeps dirty launch workspaces", async () => {

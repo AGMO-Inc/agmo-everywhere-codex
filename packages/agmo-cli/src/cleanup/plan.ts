@@ -27,6 +27,8 @@ export type CleanupPlanSummary = {
     older_than_days: number | null;
     max_bytes: number | null;
   };
+  effective_caps: CleanupEffectiveCaps;
+  pressure: CleanupPressure;
   totals: {
     inspected_entries: number;
     inspected_bytes: number;
@@ -38,6 +40,62 @@ export type CleanupPlanSummary = {
   };
   would_delete: CleanupPlanEntry[];
   kept: CleanupPlanEntry[];
+};
+
+export const CLEANUP_CAP_REASONS = {
+  launchWorkspaceBytes: "selected by launch workspace byte cap",
+  stateFileCount: "selected by state file count cap",
+  projectBytes: "selected by project size cap"
+} as const;
+
+export type CleanupCapReason = (typeof CLEANUP_CAP_REASONS)[keyof typeof CLEANUP_CAP_REASONS];
+
+export type CleanupEffectiveCaps = {
+  max_launch_workspace_bytes: {
+    configured: number;
+    enabled: boolean;
+    effective: number | null;
+  };
+  max_state_files: {
+    configured: number;
+    enabled: boolean;
+    effective: number | null;
+  };
+  max_project_agmo_bytes: {
+    configured: number;
+    enabled: boolean;
+    explicit_override: number | null;
+    effective: number | null;
+  };
+};
+
+export type CleanupPressure = {
+  launch_workspace_bytes: ByteCapPressure;
+  state_files: StateFileCapPressure;
+  project_bytes: ByteCapPressure;
+};
+
+export type ByteCapPressure = {
+  target: number | null;
+  before_bytes: number;
+  after_bytes: number;
+  selected_entries: number;
+  selected_bytes: number;
+  skipped_ineligible_entries: number;
+  skipped_ineligible_bytes: number;
+  reachable: boolean;
+  unreachable_reason: string | null;
+};
+
+export type StateFileCapPressure = {
+  target: number | null;
+  before_count: number;
+  after_count: number;
+  selected_entries: number;
+  pairs_selected: number;
+  skipped_ineligible_entries: number;
+  reachable: boolean;
+  unreachable_reason: string | null;
 };
 
 type Decision =
@@ -140,6 +198,22 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | n
   }
 }
 
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function isSafeSessionId(sessionId: unknown): sessionId is string {
+  return (
+    typeof sessionId === "string" &&
+    sessionId.length > 0 &&
+    sessionId !== "." &&
+    sessionId !== ".." &&
+    basename(sessionId) === sessionId &&
+    !sessionId.includes("/") &&
+    !sessionId.includes("\\")
+  );
+}
+
 async function canonicalPathVariants(path: string): Promise<string[]> {
   const resolved = resolve(path);
   try {
@@ -218,6 +292,26 @@ async function stateDecision(entry: CleanupInventoryEntry, eligibleByAge: boolea
     return { action: "keep", reason: "state file newer than retention threshold" };
   }
   return { action: "delete", reason: "inactive state file older than retention threshold" };
+}
+
+type StateFileFacts = {
+  valid_shape: boolean;
+  inactive: boolean;
+  session_id: string | null;
+  mtime_ms: number | null;
+};
+
+async function stateFileFacts(entry: CleanupInventoryEntry): Promise<StateFileFacts> {
+  const record = await readJsonObject(entry.path);
+  if (!record) {
+    return { valid_shape: false, inactive: false, session_id: null, mtime_ms: entry.mtime_ms };
+  }
+  return {
+    valid_shape: hasAgmoStateShape(record),
+    inactive: stateLooksInactive(record),
+    session_id: stringValue(record.session_id),
+    mtime_ms: entry.mtime_ms
+  };
 }
 
 async function isMachineGeneratedHandoff(entry: CleanupInventoryEntry): Promise<boolean> {
@@ -314,7 +408,34 @@ function isProtectedLaunchWorkspace(entry: CleanupInventoryEntry): boolean {
   );
 }
 
-function sizeCapDecision(
+function isLaunchWorkspaceCapEligible(entry: CleanupInventoryEntry, keptEntry: CleanupPlanEntry): boolean {
+  const details = entry.details ?? {};
+  return (
+    entry.category === "cache/launch-workspaces" &&
+    entry.kind === "directory" &&
+    entry.ownership === "agmo-runtime" &&
+    keptEntry.reason === "launch workspace newer than retention threshold" &&
+    (details.derived_state === "inactive" || details.derived_state === "stale") &&
+    details.dirty_state === "clean" &&
+    typeof details.retention_mtime_ms === "number" &&
+    Number.isFinite(details.retention_mtime_ms) &&
+    isSafeSessionId(details.session_id)
+  );
+}
+
+function launchWorkspaceCapCompare(
+  left: { kept: CleanupPlanEntry; original: CleanupInventoryEntry },
+  right: { kept: CleanupPlanEntry; original: CleanupInventoryEntry }
+): number {
+  const leftTime = launchRetentionMtimeMs(left.original) ?? Number.POSITIVE_INFINITY;
+  const rightTime = launchRetentionMtimeMs(right.original) ?? Number.POSITIVE_INFINITY;
+  if (leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+  return left.kept.relative_path.localeCompare(right.kept.relative_path);
+}
+
+function projectCapDecision(
   keptEntry: CleanupPlanEntry,
   original: CleanupInventoryEntry
 ): Decision | null {
@@ -329,19 +450,76 @@ function sizeCapDecision(
   switch (original.category) {
     case "cache/session-instructions":
       return keptEntry.reason === "session instructions newer than retention threshold"
-        ? { action: "delete", reason: "selected by project size cap" }
+        ? { action: "delete", reason: CLEANUP_CAP_REASONS.projectBytes }
+        : null;
+    case "cache/launch-workspaces":
+      return isLaunchWorkspaceCapEligible(original, keptEntry)
+        ? { action: "delete", reason: CLEANUP_CAP_REASONS.projectBytes }
+        : null;
+    case "state/sessions":
+    case "state/workflows":
+      return keptEntry.reason === "state file newer than retention threshold"
+        ? { action: "delete", reason: CLEANUP_CAP_REASONS.projectBytes }
         : null;
     case "logs":
       return keptEntry.reason === "Agmo log newer than retention threshold"
-        ? { action: "delete", reason: "selected by project size cap" }
+        ? { action: "delete", reason: CLEANUP_CAP_REASONS.projectBytes }
         : null;
     case "backups/setup":
       return keptEntry.reason === "Agmo setup backup newer than retention threshold"
-        ? { action: "delete", reason: "selected by project size cap" }
+        ? { action: "delete", reason: CLEANUP_CAP_REASONS.projectBytes }
+        : null;
+    case "handoffs":
+      return keptEntry.reason === "machine-generated handoff newer than retention threshold"
+        ? { action: "delete", reason: CLEANUP_CAP_REASONS.projectBytes }
         : null;
     default:
       return null;
   }
+}
+
+function bytePressure(args: {
+  target: number | null;
+  beforeBytes: number;
+  afterBytes: number;
+  selectedEntries: number;
+  selectedBytes: number;
+  skippedIneligibleEntries: number;
+  skippedIneligibleBytes: number;
+}): ByteCapPressure {
+  const reachable = args.target === null || args.afterBytes <= args.target;
+  return {
+    target: args.target,
+    before_bytes: args.beforeBytes,
+    after_bytes: args.afterBytes,
+    selected_entries: args.selectedEntries,
+    selected_bytes: args.selectedBytes,
+    skipped_ineligible_entries: args.skippedIneligibleEntries,
+    skipped_ineligible_bytes: args.skippedIneligibleBytes,
+    reachable,
+    unreachable_reason: reachable ? null : "no eligible entries remain before cap target"
+  };
+}
+
+function statePressure(args: {
+  target: number | null;
+  beforeCount: number;
+  afterCount: number;
+  selectedEntries: number;
+  pairsSelected: number;
+  skippedIneligibleEntries: number;
+}): StateFileCapPressure {
+  const reachable = args.target === null || args.afterCount <= args.target;
+  return {
+    target: args.target,
+    before_count: args.beforeCount,
+    after_count: args.afterCount,
+    selected_entries: args.selectedEntries,
+    pairs_selected: args.pairsSelected,
+    skipped_ineligible_entries: args.skippedIneligibleEntries,
+    reachable,
+    unreachable_reason: reachable ? null : "no eligible entries remain before cap target"
+  };
 }
 
 export async function createCleanupPlan(
@@ -393,33 +571,215 @@ export async function createCleanupPlan(
     }
   }
 
-  const wouldDelete = [...initialWouldDelete];
-  const maxBytes = options.maxBytes;
-  if (typeof maxBytes === "number") {
-    let projectedBytes =
-      inventory.totals.bytes - wouldDelete.reduce((sum, entry) => sum + entry.bytes, 0);
-    if (projectedBytes > maxBytes) {
-      const sizeCapEligible = [...keptByPath.values()]
-        .map((kept) => ({ kept, original: originalsByPath.get(kept.path) }))
-        .filter((entry): entry is { kept: CleanupPlanEntry; original: CleanupInventoryEntry } =>
-          Boolean(entry.original)
-        )
-        .sort((left, right) => deletionOrder(left.original, right.original));
+  const configuredLaunchCap = inventory.policy.policy.max_launch_workspace_bytes;
+  const configuredStateCap = inventory.policy.policy.max_state_files;
+  const configuredProjectCap = inventory.policy.policy.max_project_agmo_bytes;
+  const effectiveCaps: CleanupEffectiveCaps = {
+    max_launch_workspace_bytes: {
+      configured: configuredLaunchCap,
+      enabled: configuredLaunchCap > 0,
+      effective: configuredLaunchCap > 0 ? configuredLaunchCap : null
+    },
+    max_state_files: {
+      configured: configuredStateCap,
+      enabled: configuredStateCap > 0,
+      effective: configuredStateCap > 0 ? configuredStateCap : null
+    },
+    max_project_agmo_bytes: {
+      configured: configuredProjectCap,
+      enabled: options.maxBytes !== undefined || configuredProjectCap > 0,
+      explicit_override: options.maxBytes ?? null,
+      effective: options.maxBytes ?? (configuredProjectCap > 0 ? configuredProjectCap : null)
+    }
+  };
 
-      for (const { kept, original } of sizeCapEligible) {
-        if (projectedBytes <= maxBytes) {
-          break;
+  const wouldDelete = [...initialWouldDelete];
+  let projectedBytes =
+    inventory.totals.bytes - wouldDelete.reduce((sum, entry) => sum + entry.bytes, 0);
+
+  const launchTarget = effectiveCaps.max_launch_workspace_bytes.effective;
+  const retainedLaunchBytes = () =>
+    [...keptByPath.values()]
+      .filter((entry) => entry.category === "cache/launch-workspaces")
+      .reduce((sum, entry) => sum + entry.bytes, 0);
+  const launchBeforeBytes = retainedLaunchBytes();
+  let launchSelectedEntries = 0;
+  let launchSelectedBytes = 0;
+  if (launchTarget !== null && launchBeforeBytes > launchTarget) {
+    let retainedBytes = launchBeforeBytes;
+    const launchCandidates = [...keptByPath.values()]
+      .map((kept) => ({ kept, original: originalsByPath.get(kept.path) }))
+      .filter((entry): entry is { kept: CleanupPlanEntry; original: CleanupInventoryEntry } => {
+        if (!entry.original) {
+          return false;
         }
-        const decision = sizeCapDecision(kept, original);
-        if (!decision) {
+        return isLaunchWorkspaceCapEligible(entry.original, entry.kept);
+      })
+      .sort(launchWorkspaceCapCompare);
+
+    for (const { kept, original } of launchCandidates) {
+      if (retainedBytes <= launchTarget) {
+        break;
+      }
+      keptByPath.delete(kept.path);
+      wouldDelete.push(planEntry(original, CLEANUP_CAP_REASONS.launchWorkspaceBytes));
+      retainedBytes -= original.bytes;
+      projectedBytes -= original.bytes;
+      launchSelectedEntries += 1;
+      launchSelectedBytes += original.bytes;
+    }
+  }
+  const launchAfterBytes = retainedLaunchBytes();
+  const retainedLaunchIneligible = [...keptByPath.values()]
+    .filter((kept) => kept.category === "cache/launch-workspaces")
+    .map((kept) => ({ kept, original: originalsByPath.get(kept.path) }))
+    .filter((entry) => {
+      if (!entry.original) {
+        return false;
+      }
+      return !isLaunchWorkspaceCapEligible(entry.original, entry.kept);
+    });
+  const launchPressure = bytePressure({
+    target: launchTarget,
+    beforeBytes: launchBeforeBytes,
+    afterBytes: launchAfterBytes,
+    selectedEntries: launchSelectedEntries,
+    selectedBytes: launchSelectedBytes,
+    skippedIneligibleEntries: retainedLaunchIneligible.length,
+    skippedIneligibleBytes: retainedLaunchIneligible.reduce((sum, entry) => sum + entry.kept.bytes, 0)
+  });
+
+  const stateTarget = effectiveCaps.max_state_files.effective;
+  const retainedStateEntries = () =>
+    [...keptByPath.values()].filter(
+      (entry) => entry.category === "state/sessions" || entry.category === "state/workflows"
+    );
+  let stateFactsByPath = new Map<string, StateFileFacts>();
+  async function factsFor(entry: CleanupPlanEntry): Promise<StateFileFacts> {
+    const existing = stateFactsByPath.get(entry.path);
+    if (existing) {
+      return existing;
+    }
+    const original = originalsByPath.get(entry.path);
+    const facts = original
+      ? await stateFileFacts(original)
+      : { valid_shape: false, inactive: false, session_id: null, mtime_ms: entry.mtime_ms };
+    stateFactsByPath.set(entry.path, facts);
+    return facts;
+  }
+  const beforeStateEntries = retainedStateEntries();
+  const beforeStateFacts = await Promise.all(beforeStateEntries.map(async (entry) => ({ entry, facts: await factsFor(entry) })));
+  const validInactiveState = beforeStateFacts.filter(
+    ({ facts }) => facts.valid_shape && facts.inactive && facts.session_id
+  );
+  const stateBeforeCount = validInactiveState.length;
+  let stateSelectedEntries = 0;
+  let statePairsSelected = 0;
+  if (stateTarget !== null && stateBeforeCount > stateTarget) {
+    const groups = new Map<string, Array<{ entry: CleanupPlanEntry; facts: StateFileFacts }>>();
+    for (const item of validInactiveState) {
+      if (item.entry.reason !== "state file newer than retention threshold") {
+        continue;
+      }
+      const key = item.facts.session_id
+        ? `session:${item.facts.session_id}`
+        : `${item.entry.category}:${item.entry.relative_path}`;
+      groups.set(key, [...(groups.get(key) ?? []), item]);
+    }
+    const orderedGroups = [...groups.entries()]
+      .map(([key, members]) => ({ key, members }))
+      .sort((left, right) => {
+        const leftTime = Math.min(...left.members.map((member) => member.facts.mtime_ms ?? Number.POSITIVE_INFINITY));
+        const rightTime = Math.min(...right.members.map((member) => member.facts.mtime_ms ?? Number.POSITIVE_INFINITY));
+        if (leftTime !== rightTime) {
+          return leftTime - rightTime;
+        }
+        const keyCompare = left.key.localeCompare(right.key);
+        if (keyCompare !== 0) {
+          return keyCompare;
+        }
+        return left.members[0]!.entry.relative_path.localeCompare(right.members[0]!.entry.relative_path);
+      });
+    let retainedCount = stateBeforeCount;
+    for (const group of orderedGroups) {
+      if (retainedCount <= stateTarget) {
+        break;
+      }
+      statePairsSelected += 1;
+      for (const member of group.members.sort((left, right) => left.entry.relative_path.localeCompare(right.entry.relative_path))) {
+        if (!keptByPath.has(member.entry.path)) {
           continue;
         }
-        keptByPath.delete(kept.path);
-        wouldDelete.push(planEntry(original, decision.reason));
+        const original = originalsByPath.get(member.entry.path);
+        if (!original) {
+          continue;
+        }
+        keptByPath.delete(member.entry.path);
+        wouldDelete.push(planEntry(original, CLEANUP_CAP_REASONS.stateFileCount));
         projectedBytes -= original.bytes;
+        retainedCount -= 1;
+        stateSelectedEntries += 1;
       }
     }
   }
+  const afterStateEntries = retainedStateEntries();
+  const afterStateFacts = await Promise.all(afterStateEntries.map(async (entry) => ({ entry, facts: await factsFor(entry) })));
+  const stateAfterCount = afterStateFacts.filter(
+    ({ facts }) => facts.valid_shape && facts.inactive && facts.session_id
+  ).length;
+  const statePressureSummary = statePressure({
+    target: stateTarget,
+    beforeCount: stateBeforeCount,
+    afterCount: stateAfterCount,
+    selectedEntries: stateSelectedEntries,
+    pairsSelected: statePairsSelected,
+    skippedIneligibleEntries: afterStateEntries.length - stateAfterCount
+  });
+
+  const projectTarget = effectiveCaps.max_project_agmo_bytes.effective;
+  const projectBeforeBytes = projectedBytes;
+  let projectSelectedEntries = 0;
+  let projectSelectedBytes = 0;
+  if (projectTarget !== null && projectedBytes > projectTarget) {
+    const projectCandidates = [...keptByPath.values()]
+      .map((kept) => ({ kept, original: originalsByPath.get(kept.path) }))
+      .filter((entry): entry is { kept: CleanupPlanEntry; original: CleanupInventoryEntry } =>
+        Boolean(entry.original)
+      )
+      .sort((left, right) => deletionOrder(left.original, right.original));
+
+    for (const { kept, original } of projectCandidates) {
+      if (projectedBytes <= projectTarget) {
+        break;
+      }
+      const decision = projectCapDecision(kept, original);
+      if (!decision) {
+        continue;
+      }
+      keptByPath.delete(kept.path);
+      wouldDelete.push(planEntry(original, decision.reason));
+      projectedBytes -= original.bytes;
+      projectSelectedEntries += 1;
+      projectSelectedBytes += original.bytes;
+    }
+  }
+  const projectAfterBytes = projectedBytes;
+  const retainedProjectIneligible = [...keptByPath.values()]
+    .map((kept) => ({ kept, original: originalsByPath.get(kept.path) }))
+    .filter((entry) => !entry.original || projectCapDecision(entry.kept, entry.original) === null);
+  const pressure: CleanupPressure = {
+    launch_workspace_bytes: launchPressure,
+    state_files: statePressureSummary,
+    project_bytes: bytePressure({
+      target: projectTarget,
+      beforeBytes: projectBeforeBytes,
+      afterBytes: projectAfterBytes,
+      selectedEntries: projectSelectedEntries,
+      selectedBytes: projectSelectedBytes,
+      skippedIneligibleEntries: retainedProjectIneligible.length,
+      skippedIneligibleBytes: retainedProjectIneligible.reduce((sum, entry) => sum + entry.kept.bytes, 0)
+    })
+  };
 
   const kept = [...keptByPath.values()].sort(deterministicCompare);
   const sortedWouldDelete = wouldDelete.sort(deterministicCompare);
@@ -434,6 +794,8 @@ export async function createCleanupPlan(
       older_than_days: options.olderThanDays ?? null,
       max_bytes: options.maxBytes ?? null
     },
+    effective_caps: effectiveCaps,
+    pressure,
     totals: {
       inspected_entries: inventory.totals.entries,
       inspected_bytes: inventory.totals.bytes,

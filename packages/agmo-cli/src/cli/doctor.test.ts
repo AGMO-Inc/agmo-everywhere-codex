@@ -152,7 +152,9 @@ test("buildDoctorDiskUsage reports retention-policy candidates and deterministic
   assert.equal(diskUsage.scope, "current_project");
   assert.equal(diskUsage.project_root, tempProject);
   assert.equal(diskUsage.agmo_dir, join(tempProject, ".agmo"));
-  assert.equal(diskUsage.candidate_basis, "retention_policy");
+  assert.equal(diskUsage.candidate_basis, "retention_policy_and_effective_caps");
+  assert.equal(typeof diskUsage.effective_caps?.max_project_agmo_bytes.effective, "number");
+  assert.equal(typeof diskUsage.pressure?.project_bytes.target, "number");
   assert.ok(diskUsage.note.includes("--scope"));
   assert.ok(diskUsage.totals.bytes > 0);
   assert.ok(diskUsage.totals.entries >= 5);
@@ -198,7 +200,7 @@ test("runDoctorCommand user scope still reports current project disk usage", asy
   assert.equal(diskUsage.scope, "current_project");
   assert.equal(diskUsage.project_root, realTempProject);
   assert.equal(diskUsage.agmo_dir, join(realTempProject, ".agmo"));
-  assert.equal(diskUsage.candidate_basis, "retention_policy");
+  assert.equal(diskUsage.candidate_basis, "retention_policy_and_effective_caps");
 });
 
 test("buildDoctorDiskUsage returns zero ok shape when .agmo is missing", async () => {
@@ -234,7 +236,7 @@ test("buildDoctorDiskUsage returns nonfatal error shape when cleanup deps fail",
   assert.equal(diskUsage.scope, "current_project");
   assert.equal(diskUsage.project_root, tempProject);
   assert.equal(diskUsage.agmo_dir, join(tempProject, ".agmo"));
-  assert.equal(diskUsage.candidate_basis, "retention_policy");
+  assert.equal(diskUsage.candidate_basis, "retention_policy_and_effective_caps");
   assert.deepEqual(diskUsage.error, { message: "inventory failed with details" });
   assert.equal(diskUsage.totals, null);
   assert.deepEqual(diskUsage.categories, []);

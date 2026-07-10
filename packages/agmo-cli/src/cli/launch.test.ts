@@ -86,6 +86,17 @@ function plan(
   const inspectedBytes = [...wouldDelete, ...kept].reduce((sum, item) => sum + item.bytes, 0);
   const wouldDeleteBytes = wouldDelete.reduce((sum, item) => sum + item.bytes, 0);
   const keptBytes = kept.reduce((sum, item) => sum + item.bytes, 0);
+  const bytePressure = {
+    target: null,
+    before_bytes: inspectedBytes,
+    after_bytes: inspectedBytes - wouldDeleteBytes,
+    selected_entries: 0,
+    selected_bytes: 0,
+    skipped_ineligible_entries: kept.length,
+    skipped_ineligible_bytes: keptBytes,
+    reachable: true,
+    unreachable_reason: null
+  };
 
   return {
     project_root: projectRoot,
@@ -94,6 +105,38 @@ function plan(
     options: {
       older_than_days: null,
       max_bytes: null
+    },
+    effective_caps: {
+      max_launch_workspace_bytes: {
+        configured: 0,
+        enabled: false,
+        effective: null
+      },
+      max_state_files: {
+        configured: 0,
+        enabled: false,
+        effective: null
+      },
+      max_project_agmo_bytes: {
+        configured: 0,
+        enabled: false,
+        explicit_override: null,
+        effective: null
+      }
+    },
+    pressure: {
+      launch_workspace_bytes: bytePressure,
+      state_files: {
+        target: null,
+        before_count: 0,
+        after_count: 0,
+        selected_entries: 0,
+        pairs_selected: 0,
+        skipped_ineligible_entries: 0,
+        reachable: true,
+        unreachable_reason: null
+      },
+      project_bytes: bytePressure
     },
     totals: {
       inspected_entries: inspectedEntries,
@@ -372,6 +415,31 @@ test("runSafeAutoCleanupBeforeLaunch rejects unsafe session ids and size-cap ses
     receivedPlans[0]?.would_delete.map((item) => item.relative_path),
     [".agmo/cache/launch-workspaces/session-1"]
   );
+});
+
+test("runSafeAutoCleanupBeforeLaunch rejects cap-selected launch workspaces", async () => {
+  const projectRoot = "/tmp/project";
+  const capLaunch = entry(
+    projectRoot,
+    ".agmo/cache/launch-workspaces/session-1",
+    "cache/launch-workspaces",
+    "selected by launch workspace byte cap",
+    { details: { session_id: "session-1" } }
+  );
+  const plans = [plan(projectRoot, [capLaunch]), plan(projectRoot, [capLaunch])];
+  let runCalled = false;
+
+  await runSafeAutoCleanupBeforeLaunch(projectRoot, {
+    resolveCleanupPolicy: async () => cleanupPolicy(true, true),
+    createCleanupPlan: async () => plans.shift() ?? assert.fail("unexpected extra planner call"),
+    runCleanupPlan: async (cleanupPlan) => {
+      runCalled = true;
+      return { ...cleanupPlan, run: emptyRun(cleanupPlan) };
+    },
+    writeStderr: () => assert.fail("cap-selected launch cleanup should be silent")
+  });
+
+  assert.equal(runCalled, false);
 });
 
 test("runSafeAutoCleanupBeforeLaunch treats failures as nonfatal bounded stderr", async () => {

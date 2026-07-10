@@ -1,6 +1,7 @@
 import { lstat, realpath, rm, unlink } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { basename, relative, resolve, sep } from "node:path";
 import { createCleanupPlan, type CleanupPlanEntry, type CleanupPlanOptions } from "./plan.js";
+import { checkLaunchWorkspaceDeletionSafety } from "../launch/workspace-safety.js";
 
 export type CleanupRunOptions = CleanupPlanOptions;
 
@@ -114,6 +115,7 @@ function failure(entry: CleanupPlanEntry, error: unknown): CleanupRunFailureEntr
 async function deletePlannedEntry(
   agmoDir: string,
   realAgmoDir: string,
+  projectRoot: string,
   entry: CleanupPlanEntry
 ): Promise<
   | { status: "removed"; entry: CleanupRunRemovedEntry }
@@ -169,6 +171,20 @@ async function deletePlannedEntry(
     return { status: "skipped", entry: skip(entry, "planned path realpath is outside project .agmo directory") };
   }
 
+  if (entry.category === "cache/launch-workspaces") {
+    const plannedSessionId =
+      typeof entry.details?.session_id === "string" ? entry.details.session_id : basename(entry.path);
+    const safety = await checkLaunchWorkspaceDeletionSafety({
+      workspaceDir: entry.path,
+      plannedSessionId,
+      projectRoot,
+      mode: "safe"
+    });
+    if (!safety.ok) {
+      return { status: "skipped", entry: skip(entry, safety.skip_reason) };
+    }
+  }
+
   try {
     if (currentKind === "directory") {
       await rm(entry.path, { recursive: true, force: false });
@@ -202,7 +218,7 @@ export async function runCleanupPlan(
   const failures: CleanupRunFailureEntry[] = [];
 
   for (const plannedEntry of plan.would_delete) {
-    const result = await deletePlannedEntry(plan.agmo_dir, realAgmoDir, plannedEntry);
+    const result = await deletePlannedEntry(plan.agmo_dir, realAgmoDir, plan.project_root, plannedEntry);
     if (result.status === "removed") {
       removed.push(result.entry);
     } else if (result.status === "skipped") {

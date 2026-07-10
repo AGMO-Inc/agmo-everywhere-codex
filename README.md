@@ -355,11 +355,12 @@ Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo tea
 JSON-producing `agmo cleanup` commands, and JSON-producing `agmo vault` commands.
 
 `agmo doctor` includes a nested `disk_usage` section for the current project's `.agmo` directory. This section is
-info-only: it measures usage with the cleanup inventory, reports retention-policy cleanup candidates from the normal
-cleanup plan, and keeps its recommendations separate from top-level doctor `ok` status. `agmo doctor --scope user`
-still measures the current project's `.agmo` footprint; `--scope user` only changes setup/config diagnostics. Moving
-or relocating global/user Agmo state does not resolve current-project disk pressure because project runtime artifacts
-remain under the project root.
+info-only: it measures usage with the cleanup inventory, reports cleanup candidates from retention policy plus
+effective cleanup caps, and keeps its recommendations separate from top-level doctor `ok` status. `disk_usage`
+uses `candidate_basis: "retention_policy_and_effective_caps"` and includes compact `effective_caps` and `pressure`
+metadata from the cleanup plan. `agmo doctor --scope user` still measures the current project's `.agmo` footprint;
+`--scope user` only changes setup/config diagnostics. Moving or relocating global/user Agmo state does not resolve
+current-project disk pressure because project runtime artifacts remain under the project root.
 
 Use the cleanup flow in order:
 
@@ -369,8 +370,22 @@ agmo cleanup plan --json --verbose
 agmo cleanup run --confirm --json
 ```
 
-`inspect` and `plan` are non-mutating. `run` deletes only after `--confirm` and follows the cleanup plan. Launch can
-also opt in to safe automatic cleanup of launch/session-instruction candidates under the existing cleanup policy:
+`inspect` and `plan` are non-mutating. `run` deletes only after `--confirm` and follows the cleanup plan. Cleanup
+selection is deterministic: retention TTL candidates are selected first, configured category caps run second, and
+the effective project byte cap runs last. Configured cap value `0` disables that configured cap. Explicit
+`--max-bytes 0` is strict, and any explicit `--max-bytes` overrides only `max_project_agmo_bytes`; configured
+`max_launch_workspace_bytes` and `max_state_files` still apply. Nonzero configured defaults are enforced for plain
+cleanup plans, so a plan can include cap-selected candidates even without CLI cap flags.
+
+Cleanup JSON keeps existing fields and additively includes `effective_caps` plus `pressure`. Pressure reports
+before/after values, selected entries/bytes, protected or ineligible skipped entries/bytes, and
+`reachable: false` with `unreachable_reason: "no eligible entries remain before cap target"` when protected entries
+prevent a cap target from being reached. Launch workspace deletion is revalidated at delete time: metadata,
+session identity, launch state, path kind, realpath containment, and Git dirty state must still match the safe
+planned facts, or the entry is skipped instead of removed.
+
+Launch can also opt in to safe automatic cleanup of old clean launch TTL candidates and paired session instructions
+under the existing cleanup policy. Cap-selected cleanup reasons are not eligible for launch auto-cleanup:
 
 ```bash
 agmo config cleanup set safe_auto_cleanup_on_launch true --scope project

@@ -11,7 +11,6 @@ import {
 } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
-  DEFAULT_AGMO_LAUNCH_POLICY,
   resolveLaunchPolicy
 } from "../config/runtime.js";
 import { readTextFileIfExists, writeTextFile } from "../utils/fs.js";
@@ -20,23 +19,16 @@ import {
   removeSessionComposedAgentsFile,
   writeSessionComposedAgentsFile
 } from "../agents/agents-md.js";
+import {
+  checkLaunchWorkspaceDeletionSafety,
+  deriveLaunchWorkspaceState,
+  readLaunchWorkspaceMetadata,
+  type LaunchWorkspaceDerivedState,
+  type LaunchWorkspaceMetadata
+} from "./workspace-safety.js";
 
 const WORKSPACE_CACHE_DIR = "launch-workspaces";
 const WORKSPACE_SKIPPED_DIRS = new Set(["node_modules"]);
-
-export type LaunchWorkspaceMetadata = {
-  session_id: string;
-  project_root: string;
-  workspace_root: string;
-  composed_agents_path: string;
-  created_at: string;
-  active?: boolean;
-  launcher_pid?: number;
-  codex_pid?: number;
-  last_seen_at?: string;
-  last_exit_at?: string;
-  last_exit_code?: number;
-};
 
 export type LaunchWorkspaceRecord = {
   session_id: string;
@@ -44,18 +36,6 @@ export type LaunchWorkspaceRecord = {
   metadata_path: string;
   metadata: LaunchWorkspaceMetadata | null;
   derived: LaunchWorkspaceDerivedState;
-};
-
-export type LaunchWorkspaceDerivedState = {
-  state: "active" | "stale" | "inactive" | "unknown";
-  active: boolean;
-  stale: boolean;
-  codex_pid_alive: boolean;
-  launcher_pid_alive: boolean;
-  heartbeat_fresh: boolean;
-  created_age_hours: number | null;
-  reference_at: string | null;
-  reference_age_hours: number | null;
 };
 
 function createLaunchSessionId(): string {
@@ -145,93 +125,11 @@ function isTrackedInGit(path: string, cwd = process.cwd()): boolean {
   }
 }
 
-function isPidAlive(pid: number | undefined): boolean {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === "EPERM";
-  }
-}
-
-async function readLaunchWorkspaceMetadata(
-  metadataPath: string
-): Promise<LaunchWorkspaceMetadata | null> {
-  const content = await readTextFileIfExists(metadataPath);
-  if (!content) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(content) as LaunchWorkspaceMetadata;
-  } catch {
-    return null;
-  }
-}
-
 async function writeLaunchWorkspaceMetadata(
   metadataPath: string,
   metadata: LaunchWorkspaceMetadata
 ): Promise<void> {
   await writeTextFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
-}
-
-export function deriveLaunchWorkspaceState(
-  metadata: LaunchWorkspaceMetadata | null | undefined,
-  options: {
-    heartbeatStaleAfterMs?: number;
-  } = {}
-): LaunchWorkspaceDerivedState {
-  if (!metadata) {
-    return {
-      state: "unknown",
-      active: false,
-      stale: false,
-      codex_pid_alive: false,
-      launcher_pid_alive: false,
-      heartbeat_fresh: false,
-      created_age_hours: null,
-      reference_at: null,
-      reference_age_hours: null
-    };
-  }
-
-  const codexPidAlive = isPidAlive(metadata.codex_pid);
-  const launcherPidAlive = isPidAlive(metadata.launcher_pid);
-  const now = Date.now();
-  const lastSeenAtMs = parseIsoTimestamp(metadata.last_seen_at);
-  const heartbeatStaleAfterMs =
-    options.heartbeatStaleAfterMs ??
-    DEFAULT_AGMO_LAUNCH_POLICY.heartbeat_stale_after_ms;
-  const heartbeatFresh =
-    lastSeenAtMs !== null && now - lastSeenAtMs <= heartbeatStaleAfterMs;
-  const active =
-    metadata.active === true &&
-    (codexPidAlive || launcherPidAlive || heartbeatFresh);
-  const stale = metadata.active === true && !active;
-  const createdAtMs = parseIsoTimestamp(metadata.created_at);
-  const referenceAt =
-    metadata.last_seen_at ?? metadata.last_exit_at ?? metadata.created_at ?? null;
-  const referenceAtMs = parseIsoTimestamp(referenceAt ?? undefined);
-
-  return {
-    state: active ? "active" : stale ? "stale" : "inactive",
-    active,
-    stale,
-    codex_pid_alive: codexPidAlive,
-    launcher_pid_alive: launcherPidAlive,
-    heartbeat_fresh: heartbeatFresh,
-    created_age_hours:
-      createdAtMs === null ? null : Number(((now - createdAtMs) / 36e5).toFixed(2)),
-    reference_at: referenceAt,
-    reference_age_hours:
-      referenceAtMs === null ? null : Number(((now - referenceAtMs) / 36e5).toFixed(2))
-  };
 }
 
 async function linkEntry(args: {
@@ -596,6 +494,21 @@ export async function cleanupLaunchWorkspaces(args: {
           staleOnly && record.derived.stale
             ? "stale but newer than prune threshold"
             : "newer than prune threshold"
+      });
+      continue;
+    }
+
+    const safety = await checkLaunchWorkspaceDeletionSafety({
+      workspaceDir: record.workspace_dir,
+      plannedSessionId: record.session_id,
+      projectRoot,
+      mode: args.all === true && args.includeActive === true ? "allow-active" : "safe"
+    });
+    if (!safety.ok) {
+      kept.push({
+        session_id: record.session_id,
+        workspace_dir: record.workspace_dir,
+        reason: safety.skip_reason
       });
       continue;
     }

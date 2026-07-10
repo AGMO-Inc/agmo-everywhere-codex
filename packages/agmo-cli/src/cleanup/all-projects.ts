@@ -133,6 +133,8 @@ function flattenRunProject(result: CleanupRunSummary): AllProjectsCleanupRunProj
     agmo_dir: result.agmo_dir,
     policy: result.policy,
     options: result.options,
+    effective_caps: result.effective_caps,
+    pressure: result.pressure,
     totals: result.totals,
     would_delete: result.would_delete,
     kept: result.kept,

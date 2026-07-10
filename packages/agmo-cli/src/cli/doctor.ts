@@ -47,10 +47,12 @@ type DoctorDiskUsageLargestCategory = {
 
 type DoctorDiskUsageBase = {
   scope: "current_project";
-  candidate_basis: "retention_policy";
+  candidate_basis: "retention_policy_and_effective_caps";
   project_root: string;
   agmo_dir: string;
   note: string;
+  effective_caps?: CleanupPlanSummary["effective_caps"];
+  pressure?: CleanupPlanSummary["pressure"];
   categories: DoctorDiskUsageCategory[];
   largest_nonzero_categories: DoctorDiskUsageLargestCategory[];
   recommendations: DoctorRecommendation[];
@@ -157,7 +159,7 @@ function errorDiskUsage(projectRoot: string, error: unknown): DoctorDiskUsage {
     scope: "current_project",
     project_root: projectRoot,
     agmo_dir: agmoDir,
-    candidate_basis: "retention_policy",
+    candidate_basis: "retention_policy_and_effective_caps",
     note: DOCTOR_DISK_USAGE_SCOPE_NOTE,
     error: {
       message: compactErrorMessage(error)
@@ -206,8 +208,10 @@ export async function buildDoctorDiskUsage(
       scope: "current_project",
       project_root: inventory.project_root,
       agmo_dir: inventory.agmo_dir,
-      candidate_basis: "retention_policy",
+      candidate_basis: "retention_policy_and_effective_caps",
       note: DOCTOR_DISK_USAGE_SCOPE_NOTE,
+      effective_caps: plan.effective_caps,
+      pressure: plan.pressure,
       totals: {
         bytes: inventory.totals.bytes,
         entries: inventory.totals.entries,

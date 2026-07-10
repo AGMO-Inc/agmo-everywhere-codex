@@ -293,6 +293,8 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
           agmo_dir: result.agmo_dir,
           policy: result.policy,
           options: result.options,
+          effective_caps: result.effective_caps,
+          pressure: result.pressure,
           totals: result.totals,
           would_delete: result.would_delete,
           kept: result.kept,
@@ -347,6 +349,8 @@ export async function runCleanupCommand(args: string[]): Promise<void> {
           agmo_dir: plan.agmo_dir,
           policy: plan.policy,
           options: plan.options,
+          effective_caps: plan.effective_caps,
+          pressure: plan.pressure,
           totals: plan.totals,
           would_delete: plan.would_delete,
           kept: plan.kept

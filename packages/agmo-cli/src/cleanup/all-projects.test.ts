@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import {
   chmod,
@@ -131,6 +132,9 @@ test("createAllProjectsCleanupPlan reads only registry entries and does not muta
   assert.equal(plan.totals.projects, 1);
   assert.deepEqual(plan.projects.map((project) => project.project_root), [registered.realRoot]);
   assert.equal(plan.projects[0]?.would_delete[0]?.relative_path, ".agmo/logs/old.log");
+  assert.equal(typeof plan.projects[0]?.effective_caps.max_project_agmo_bytes.effective, "number");
+  assert.equal(typeof plan.projects[0]?.pressure.project_bytes.target, "number");
+  assert.equal("pressure" in plan, false);
   assert.equal(existsSync(unregistered.logPath), true);
   assert.deepEqual(await fileSnapshot(registryPath), beforeRegistry);
   assert.deepEqual(await fileSnapshot(registered.logPath), beforeCandidate);
@@ -332,6 +336,9 @@ test("runAllProjectsCleanup preserves local category parity, ordering, totals, a
     [first.realRoot, second.realRoot]
   );
   assert.equal(firstRun.totals.failure_entries, 0);
+  assert.equal(typeof firstRun.projects[0]?.effective_caps.max_project_agmo_bytes.effective, "number");
+  assert.equal(typeof firstRun.projects[0]?.pressure.project_bytes.target, "number");
+  assert.equal("pressure" in firstRun, false);
   assert.equal(firstRun.totals.removed_entries, 2);
   assert.deepEqual(
     firstRun.projects.flatMap((project) => project.removed.map((entry) => entry.category)),
@@ -364,6 +371,59 @@ test("entry-level symlink replacement is a per-project skip and leaves ok semant
   assert.equal(run.projects[0]?.skipped[0]?.skipped_reason, "planned path is now a symlink");
   assert.equal(run.totals.failure_entries, 0);
   assert.equal(existsSync(outside), true);
+});
+
+test("runAllProjectsCleanupPlan inherits launch workspace delete-time guard skips", async () => {
+  const parent = await mkdtemp(join(os.tmpdir(), "agmo-all-projects-launch-guard-"));
+  const home = await mkdtemp(join(os.tmpdir(), "agmo-all-projects-launch-guard-home-"));
+  const project = await createProject({ parent, name: "project" });
+  const workspaceDir = join(project.root, ".agmo", "cache", "launch-workspaces", "session-1");
+  const workspaceRoot = join(workspaceDir, "workspace");
+  await mkdir(workspaceRoot, { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(
+    join(workspaceDir, "metadata.json"),
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: project.root,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(project.root, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: new Date(Date.now() - 10 * DAY_MS).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeRegistry(home, [project.root]);
+  const plan = await withHome(home, () =>
+    createAllProjectsCleanupPlan({ cwd: parent, olderThanDays: 1, nowMs: Date.now() })
+  );
+  assert.ok(
+    plan.projects[0]?.would_delete.some(
+      (entry) => entry.relative_path === ".agmo/cache/launch-workspaces/session-1"
+    )
+  );
+
+  await writeFile(join(workspaceRoot, "dirty.txt"), "changed\n", "utf8");
+  const run = await runAllProjectsCleanupPlan(plan);
+
+  assert.deepEqual(run.projects[0]?.removed, []);
+  assert.deepEqual(
+    run.projects[0]?.skipped.map((entry) => ({
+      relative_path: entry.relative_path,
+      skipped_reason: entry.skipped_reason
+    })),
+    [
+      {
+        relative_path: ".agmo/cache/launch-workspaces/session-1",
+        skipped_reason: "launch workspace dirty before deletion"
+      }
+    ]
+  );
+  assert.equal(existsSync(workspaceDir), true);
 });
 
 test("deletion failure marks ok semantics through failure_entries and later projects continue", async (t) => {
