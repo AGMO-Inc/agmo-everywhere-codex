@@ -417,6 +417,109 @@ test("runCleanupCommand run deletes a planned clean inactive launch workspace", 
   assert.equal(existsSync(workspaceDir), false);
 });
 
+test("createCleanupPlan uses stable launch retention timestamp across repeated plans", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-plan-launch-stable-"));
+  const workspaceDir = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1");
+  const workspaceRoot = join(workspaceDir, "workspace");
+  const metadataPath = join(workspaceDir, "metadata.json");
+  await mkdir(workspaceRoot, { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+        last_exit_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const nowMs = Date.now();
+  const first = await createCleanupPlan(tempRoot, { nowMs });
+  const second = await createCleanupPlan(tempRoot, { nowMs });
+
+  assert.deepEqual(
+    first.would_delete.map((entry) => ({
+      relative_path: entry.relative_path,
+      reason: entry.reason
+    })),
+    [
+      {
+        relative_path: ".agmo/cache/launch-workspaces/session-1",
+        reason: "inactive clean launch workspace older than retention threshold"
+      }
+    ]
+  );
+  assert.deepEqual(
+    second.would_delete.map((entry) => ({
+      relative_path: entry.relative_path,
+      reason: entry.reason,
+      retention_mtime_ms: entry.details?.retention_mtime_ms
+    })),
+    first.would_delete.map((entry) => ({
+      relative_path: entry.relative_path,
+      reason: entry.reason,
+      retention_mtime_ms: entry.details?.retention_mtime_ms
+    }))
+  );
+  assert.equal(existsSync(workspaceDir), true);
+});
+
+test("createCleanupPlan keeps launch workspace with invalid retention timestamps even when physical mtime is old", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-plan-launch-invalid-time-"));
+  const workspaceDir = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1");
+  const workspaceRoot = join(workspaceDir, "workspace");
+  const metadataPath = join(workspaceDir, "metadata.json");
+  await mkdir(workspaceRoot, { recursive: true });
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        composed_agents_path: join(tempRoot, ".agmo", "cache", "session-instructions", "session-1", "AGENTS.md"),
+        created_at: "not-a-date",
+        last_exit_at: "also-not-a-date",
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+  await utimes(metadataPath, oldDate, oldDate);
+  await utimes(workspaceRoot, oldDate, oldDate);
+  await utimes(workspaceDir, oldDate, oldDate);
+
+  const output = await captureCleanupCommand(["plan", "--json", "--older-than-days", "1"], tempRoot);
+  const wouldDelete = output.would_delete as Array<{ relative_path?: string }>;
+  const kept = output.kept as Array<{ relative_path?: string; reason?: string }>;
+
+  assert.equal(
+    wouldDelete.some((entry) => entry.relative_path === ".agmo/cache/launch-workspaces/session-1"),
+    false
+  );
+  assert.ok(
+    kept.some(
+      (entry) =>
+        entry.relative_path === ".agmo/cache/launch-workspaces/session-1" &&
+        entry.reason === "launch workspace newer than retention threshold"
+    )
+  );
+  assert.equal(existsSync(workspaceDir), true);
+});
+
 test("runCleanupCommand run deletes a planned old inactive Agmo state file", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-cli-run-state-"));
   const statePath = join(tempRoot, ".agmo", "state", "sessions", "session-1.json");

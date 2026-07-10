@@ -46,12 +46,22 @@ type Decision =
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-function ageMs(entry: CleanupInventoryEntry, nowMs: number): number | null {
-  return entry.mtime_ms === null ? null : Math.max(nowMs - entry.mtime_ms, 0);
+function launchRetentionMtimeMs(entry: CleanupInventoryEntry): number | null {
+  const value = entry.details?.retention_mtime_ms;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function isOlderThan(entry: CleanupInventoryEntry, olderThanDays: number, nowMs: number): boolean {
-  const age = ageMs(entry, nowMs);
+function ageMs(entry: CleanupInventoryEntry, nowMs: number, mtimeMs = entry.mtime_ms): number | null {
+  return mtimeMs === null ? null : Math.max(nowMs - mtimeMs, 0);
+}
+
+function isOlderThan(
+  entry: CleanupInventoryEntry,
+  olderThanDays: number,
+  nowMs: number,
+  mtimeMs = entry.mtime_ms
+): boolean {
+  const age = ageMs(entry, nowMs, mtimeMs);
   return age !== null && age >= olderThanDays * DAY_MS;
 }
 
@@ -235,7 +245,11 @@ async function baseDecision(
   }
 
   const ttlDays = olderThanDays ?? ttlDaysForEntry(entry, policy);
-  const eligibleByAge = ttlDays !== null && isOlderThan(entry, ttlDays, nowMs);
+  const ageReferenceMs =
+    entry.category === "cache/launch-workspaces"
+      ? launchRetentionMtimeMs(entry)
+      : entry.mtime_ms;
+  const eligibleByAge = ttlDays !== null && isOlderThan(entry, ttlDays, nowMs, ageReferenceMs);
 
   switch (entry.category) {
     case "cache/session-instructions":

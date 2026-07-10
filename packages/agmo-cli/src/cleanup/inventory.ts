@@ -147,6 +147,19 @@ async function readJsonFile(path: string): Promise<Record<string, unknown> | nul
   }
 }
 
+function validTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function launchRetentionMtimeMs(metadata: Record<string, unknown> | null): number | null {
+  return validTimestampMs(metadata?.last_exit_at) ?? validTimestampMs(metadata?.created_at);
+}
+
 function gitStatus(path: string): { status: "clean" | "dirty" | "unknown"; entries: string[] } {
   try {
     const output = execFileSync("git", ["-C", path, "status", "--short"], {
@@ -194,6 +207,7 @@ async function launchWorkspaceDetails(
       session_id: metadata?.session_id ?? basename(entryPath),
       derived_state: derivedState,
       workspace_root: workspaceRoot,
+      retention_mtime_ms: launchRetentionMtimeMs(metadata),
       dirty_state: dirty.status,
       dirty_entries: dirty.entries.slice(0, 20)
     }

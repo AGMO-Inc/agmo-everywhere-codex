@@ -71,6 +71,70 @@ test("collectCleanupInventory keeps dirty launch workspaces with an explicit rea
   assert.equal(existsSync(join(workspaceRoot, "draft.txt")), true);
 });
 
+test("collectCleanupInventory records stable launch retention timestamp separately from physical mtime", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-launch-retention-"));
+  const workspaceRoot = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "workspace");
+  const metadataPath = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "metadata.json");
+  const lastExitAt = "2026-01-02T03:04:05.000Z";
+  await mkdir(workspaceRoot, { recursive: true });
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        created_at: "2026-01-01T00:00:00.000Z",
+        last_exit_at: lastExitAt,
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const inventory = await collectCleanupInventory(tempRoot);
+  const launchEntry = inventory.entries.find(
+    (entry) => entry.category === "cache/launch-workspaces"
+  );
+
+  assert.equal(launchEntry?.details?.retention_mtime_ms, Date.parse(lastExitAt));
+  assert.equal(typeof launchEntry?.mtime_ms, "number");
+  assert.notEqual(launchEntry?.mtime_ms, launchEntry?.details?.retention_mtime_ms);
+});
+
+test("collectCleanupInventory reports null launch retention timestamp for invalid metadata dates", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-launch-invalid-retention-"));
+  const workspaceRoot = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "workspace");
+  const metadataPath = join(tempRoot, ".agmo", "cache", "launch-workspaces", "session-1", "metadata.json");
+  await mkdir(workspaceRoot, { recursive: true });
+  await writeFile(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        session_id: "session-1",
+        project_root: tempRoot,
+        workspace_root: workspaceRoot,
+        created_at: "not-a-date",
+        last_exit_at: "also-not-a-date",
+        active: false
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const inventory = await collectCleanupInventory(tempRoot);
+  const launchEntry = inventory.entries.find(
+    (entry) => entry.category === "cache/launch-workspaces"
+  );
+
+  assert.equal(launchEntry?.details?.retention_mtime_ms, null);
+  assert.equal(typeof launchEntry?.mtime_ms, "number");
+});
+
 test("collectCleanupInventory reports symlinks without following them", async () => {
   const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-symlink-"));
   const outside = await mkdtemp(join(os.tmpdir(), "agmo-cleanup-outside-"));
