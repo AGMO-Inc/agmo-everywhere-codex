@@ -352,7 +352,30 @@ missing or dead HUD panes, while rebalance applies an `auto`, `main-vertical`, o
 Machine-oriented JSON commands keep existing `command` fields and add a stable envelope:
 `schema_version`, `operation`, and `ok`, plus `recommended_actions` when actionable guidance is available.
 Current envelope-backed surfaces include `agmo doctor`, JSON-producing `agmo team` commands,
-and JSON-producing `agmo vault` commands.
+JSON-producing `agmo cleanup` commands, and JSON-producing `agmo vault` commands.
+
+`agmo doctor` includes a nested `disk_usage` section for the current project's `.agmo` directory. This section is
+info-only: it measures usage with the cleanup inventory, reports retention-policy cleanup candidates from the normal
+cleanup plan, and keeps its recommendations separate from top-level doctor `ok` status. `agmo doctor --scope user`
+still measures the current project's `.agmo` footprint; `--scope user` only changes setup/config diagnostics. Moving
+or relocating global/user Agmo state does not resolve current-project disk pressure because project runtime artifacts
+remain under the project root.
+
+Use the cleanup flow in order:
+
+```bash
+agmo cleanup inspect --json --verbose
+agmo cleanup plan --json --verbose
+agmo cleanup run --confirm --json
+```
+
+`inspect` and `plan` are non-mutating. `run` deletes only after `--confirm` and follows the cleanup plan. Launch can
+also opt in to safe automatic cleanup of launch/session-instruction candidates under the existing cleanup policy:
+
+```bash
+agmo config cleanup set safe_auto_cleanup_on_launch true --scope project
+```
+
 For machine interop, `agmo team api <send-message|broadcast|mailbox-list|mailbox-mark-delivered|mailbox-mark-notified|create-task|update-task|release-task-claim|read-config|read-manifest|read-worker-status|read-worker-heartbeat|update-worker-heartbeat|write-worker-inbox|write-worker-identity|append-event|read-events|await-event|read-monitor-snapshot|write-monitor-snapshot|write-shutdown-request|read-shutdown-ack|read-idle-state|read-stall-state|read-task-approval|write-task-approval|read-task|list-tasks|get-summary|cleanup|orphan-cleanup|claim-task|transition-task-status> --input '<json>' --json`
 returns an OMC-style envelope with either `data` or `error`; lifecycle mutation is limited to claim-safe
 claim/release and `in_progress -> completed|failed` terminal transitions. Mailbox operations expose durable
@@ -362,7 +385,7 @@ snapshot APIs expose the durable `monitor-snapshot.json` file without requiring 
 Shutdown handshake APIs write durable request state and read worker acknowledgements without finalizing the
 team or closing panes. Idle/stall APIs derive leader-facing state from durable worker status, heartbeats,
 tasks, dispatch, and events. Task approval APIs persist reviewer decisions and append approval events.
-Cleanup APIs are dry-run by default and require `confirm_cleanup: true` or `force: true` before shutdown.
+Team cleanup APIs are dry-run by default and require `confirm_cleanup: true` or `force: true` before shutdown.
 Task creation uses durable numeric IDs and `list-tasks`/`read-task` include dynamically created task files.
 
 ### Operational features

@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { inspectAgentsContent } from "../agents/agents-md.js";
+import {
+  collectCleanupInventory,
+  type CleanupInventorySummary
+} from "../cleanup/inventory.js";
+import { createCleanupPlan, type CleanupPlanSummary } from "../cleanup/plan.js";
 import { resolveLaunchPolicy } from "../config/runtime.js";
 import { listLaunchWorkspaces } from "../launch/session-workspace.js";
 import { inspectTeamWorktrees } from "../team/worktree.js";
@@ -26,10 +31,210 @@ type DoctorRecommendation = {
   command?: string;
 };
 
+type DoctorDiskUsageCategory = {
+  category: CleanupInventorySummary["categories"][number]["category"];
+  bytes: number;
+  entries: number;
+  safe_cleanup_candidate_bytes: number;
+  safe_cleanup_candidate_entries: number;
+};
+
+type DoctorDiskUsageLargestCategory = {
+  category: CleanupInventorySummary["categories"][number]["category"];
+  bytes: number;
+  safe_cleanup_candidate_bytes: number;
+};
+
+type DoctorDiskUsageBase = {
+  scope: "current_project";
+  candidate_basis: "retention_policy";
+  project_root: string;
+  agmo_dir: string;
+  note: string;
+  categories: DoctorDiskUsageCategory[];
+  largest_nonzero_categories: DoctorDiskUsageLargestCategory[];
+  recommendations: DoctorRecommendation[];
+  recommended_actions: string[];
+};
+
+export type DoctorDiskUsage =
+  | (DoctorDiskUsageBase & {
+      status: "ok";
+      totals: {
+        bytes: number;
+        entries: number;
+        safe_cleanup_candidate_bytes: number;
+        safe_cleanup_candidate_entries: number;
+        projected_bytes_after_safe_cleanup: number;
+      };
+    })
+  | (DoctorDiskUsageBase & {
+      status: "error";
+      error: {
+        message: string;
+      };
+      totals: null;
+    });
+
+export type DoctorDiskUsageDeps = {
+  collectCleanupInventory(projectRoot: string): Promise<CleanupInventorySummary>;
+  createCleanupPlan(projectRoot: string): Promise<CleanupPlanSummary>;
+};
+
+export const defaultDoctorDiskUsageDeps: DoctorDiskUsageDeps = {
+  collectCleanupInventory,
+  createCleanupPlan: (projectRoot) => createCleanupPlan(projectRoot)
+};
+
+const DOCTOR_DISK_USAGE_SCOPE_NOTE =
+  "Doctor disk usage always measures the current project's .agmo directory; --scope changes setup/config diagnostics only.";
+
+function compactErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.trim().split(/\s+/).join(" ") || "unknown error";
+}
+
+function groupPlanCandidatesByCategory(
+  plan: CleanupPlanSummary
+): Map<CleanupInventorySummary["categories"][number]["category"], { bytes: number; entries: number }> {
+  const groups = new Map<
+    CleanupInventorySummary["categories"][number]["category"],
+    { bytes: number; entries: number }
+  >();
+
+  for (const entry of plan.would_delete) {
+    const current = groups.get(entry.category) ?? { bytes: 0, entries: 0 };
+    current.bytes += entry.bytes;
+    current.entries += 1;
+    groups.set(entry.category, current);
+  }
+
+  return groups;
+}
+
+function diskUsageRecommendations(safeCleanupCandidateBytes: number): DoctorRecommendation[] {
+  return [
+    {
+      severity: "info",
+      message: "Inspect current project Agmo disk usage before cleanup.",
+      command: "agmo cleanup inspect --json --verbose"
+    },
+    {
+      severity: "info",
+      message: "Plan safe retention-policy cleanup without deleting files.",
+      command: "agmo cleanup plan --json --verbose"
+    },
+    ...(safeCleanupCandidateBytes > 0
+      ? [
+          {
+            severity: "info" as const,
+            message: "Run safe cleanup only after reviewing the plan; this command requires confirmation.",
+            command: "agmo cleanup run --confirm --json"
+          }
+        ]
+      : []),
+    {
+      severity: "info",
+      message: "Optionally enable safe launch auto-cleanup for future launches.",
+      command: "agmo config cleanup set safe_auto_cleanup_on_launch true --scope project"
+    }
+  ];
+}
+
+function errorDiskUsage(projectRoot: string, error: unknown): DoctorDiskUsage {
+  const agmoDir = resolveInstallPaths("project", projectRoot).agmoDir;
+  const recommendations: DoctorRecommendation[] = [
+    {
+      severity: "info",
+      message:
+        "Agmo disk usage could not be measured; other doctor checks still ran. Run cleanup inspect directly for details.",
+      command: "agmo cleanup inspect --json --verbose"
+    }
+  ];
+
+  return {
+    status: "error",
+    scope: "current_project",
+    project_root: projectRoot,
+    agmo_dir: agmoDir,
+    candidate_basis: "retention_policy",
+    note: DOCTOR_DISK_USAGE_SCOPE_NOTE,
+    error: {
+      message: compactErrorMessage(error)
+    },
+    totals: null,
+    categories: [],
+    largest_nonzero_categories: [],
+    recommendations,
+    recommended_actions: uniqueRecommendedActions(
+      recommendations.map((recommendation) => recommendation.command)
+    )
+  };
+}
+
+export async function buildDoctorDiskUsage(
+  projectRoot: string,
+  deps: DoctorDiskUsageDeps = defaultDoctorDiskUsageDeps
+): Promise<DoctorDiskUsage> {
+  try {
+    const inventory = await deps.collectCleanupInventory(projectRoot);
+    const plan = await deps.createCleanupPlan(projectRoot);
+    const candidatesByCategory = groupPlanCandidatesByCategory(plan);
+    const categories = inventory.categories.map((category) => {
+      const candidate = candidatesByCategory.get(category.category) ?? { bytes: 0, entries: 0 };
+      return {
+        category: category.category,
+        bytes: category.bytes,
+        entries: category.entries,
+        safe_cleanup_candidate_bytes: candidate.bytes,
+        safe_cleanup_candidate_entries: candidate.entries
+      };
+    });
+    const largestNonzeroCategories = [...categories]
+      .filter((category) => category.bytes > 0)
+      .sort((left, right) => right.bytes - left.bytes || left.category.localeCompare(right.category))
+      .slice(0, 5)
+      .map((category) => ({
+        category: category.category,
+        bytes: category.bytes,
+        safe_cleanup_candidate_bytes: category.safe_cleanup_candidate_bytes
+      }));
+    const recommendations = diskUsageRecommendations(plan.totals.would_delete_bytes);
+
+    return {
+      status: "ok",
+      scope: "current_project",
+      project_root: inventory.project_root,
+      agmo_dir: inventory.agmo_dir,
+      candidate_basis: "retention_policy",
+      note: DOCTOR_DISK_USAGE_SCOPE_NOTE,
+      totals: {
+        bytes: inventory.totals.bytes,
+        entries: inventory.totals.entries,
+        safe_cleanup_candidate_bytes: plan.totals.would_delete_bytes,
+        safe_cleanup_candidate_entries: plan.totals.would_delete_entries,
+        projected_bytes_after_safe_cleanup: Math.max(
+          inventory.totals.bytes - plan.totals.would_delete_bytes,
+          0
+        )
+      },
+      categories,
+      largest_nonzero_categories: largestNonzeroCategories,
+      recommendations,
+      recommended_actions: uniqueRecommendedActions(
+        recommendations.map((recommendation) => recommendation.command)
+      )
+    };
+  } catch (error) {
+    return errorDiskUsage(projectRoot, error);
+  }
+}
+
 export async function runDoctorCommand(args: string[]): Promise<void> {
   const scope = parseScopeFlag(args);
   const paths = resolveInstallPaths(scope);
   const projectRoot = resolveRuntimeRoot();
+  const diskUsage = await buildDoctorDiskUsage(projectRoot);
   const tmuxAvailable = detectTmux();
   const agentsMdContent = await readTextFileIfExists(paths.agentsMdFile);
   const scopedAgentsInspection = inspectAgentsContent(agentsMdContent);
@@ -240,6 +445,7 @@ export async function runDoctorCommand(args: string[]): Promise<void> {
         },
         launch_workspaces: launchWorkspaceSummary,
         team_worktrees: teamWorktrees,
+        disk_usage: diskUsage,
         recommendations,
         recommended_actions: recommendedActions,
         paths: {
