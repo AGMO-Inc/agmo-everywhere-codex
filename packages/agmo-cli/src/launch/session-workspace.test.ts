@@ -4,7 +4,12 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { cloneGitWorkspace, prepareSessionWorkspace } from "./session-workspace.js";
+import {
+  cleanupLaunchWorkspaces,
+  cloneGitWorkspace,
+  prepareSessionWorkspace
+} from "./session-workspace.js";
+import { resolveInstallPaths } from "../utils/paths.js";
 
 function runGit(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -85,10 +90,70 @@ test("prepareSessionWorkspace builds an isolated git sandbox from the current tr
     const workspaceAgents = await readFile(join(workspace.workspaceRoot, "AGENTS.md"), "utf-8");
     const sourceAgents = await readFile(join(projectRoot, "AGENTS.md"), "utf-8");
     assert.notEqual(workspaceAgents, sourceAgents);
+    assert.equal(
+      workspace.composedAgentsPath,
+      join(
+        resolveInstallPaths("project", projectRoot).sessionInstructionsDir,
+        "test-session",
+        "AGENTS.md"
+      )
+    );
+    assert.equal(await readFile(workspace.composedAgentsPath, "utf-8"), workspaceAgents);
+    const metadata = JSON.parse(await readFile(workspace.metadataPath, "utf-8")) as {
+      composed_agents_path: string;
+    };
+    assert.equal(metadata.composed_agents_path, workspace.composedAgentsPath);
 
     await writeFile(join(workspace.workspaceRoot, "tracked.txt"), "workspace-only\n", "utf-8");
     const sourceTracked = await readFile(join(projectRoot, "tracked.txt"), "utf-8");
     assert.equal(sourceTracked, "tracked-v2\n");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("cleanupLaunchWorkspaces tolerates malformed historical session ids without escaping session cleanup", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "agmo-session-workspace-cleanup-"));
+
+  try {
+    const paths = resolveInstallPaths("project", projectRoot);
+    const workspaceDir = join(paths.cacheDir, "launch-workspaces", "bad-workspace");
+    const workspaceRoot = join(workspaceDir, "workspace");
+    const sentinel = join(paths.cacheDir, "outside-sentinel");
+    await mkdir(workspaceRoot, { recursive: true });
+    await writeFile(join(workspaceRoot, "draft.txt"), "workspace\n", "utf-8");
+    await writeFile(sentinel, "keep\n", "utf-8");
+    await writeFile(
+      join(workspaceDir, "metadata.json"),
+      `${JSON.stringify(
+        {
+          session_id: "../outside-sentinel",
+          project_root: projectRoot,
+          workspace_root: workspaceRoot,
+          composed_agents_path: join(paths.sessionInstructionsDir, "../outside-sentinel", "AGENTS.md"),
+          created_at: "2026-01-01T00:00:00.000Z",
+          active: false
+        },
+        null,
+        2
+      )}\n`,
+      "utf-8"
+    );
+
+    const result = await cleanupLaunchWorkspaces({
+      projectRoot,
+      all: true
+    });
+
+    assert.deepEqual(result.removed, [
+      {
+        session_id: "bad-workspace",
+        workspace_dir: workspaceDir,
+        removed_session_agents: false
+      }
+    ]);
+    assert.equal(result.kept.length, 0);
+    assert.equal(await readFile(sentinel, "utf-8"), "keep\n");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

@@ -59,10 +59,14 @@ export async function handleStop(args: {
   }
 
   if (sessionId) {
-    await removeSessionComposedAgentsFile({
-      cwd: args.cwd,
-      sessionId
-    });
+    try {
+      await removeSessionComposedAgentsFile({
+        cwd: args.cwd,
+        sessionId
+      });
+    } catch (error) {
+      void error;
+    }
   }
 
   return null;

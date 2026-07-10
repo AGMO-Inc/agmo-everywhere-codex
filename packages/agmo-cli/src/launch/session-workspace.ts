@@ -382,6 +382,10 @@ export async function prepareSessionWorkspace(args: {
     })
   });
 
+  if (composedAgents.kind !== "written") {
+    throw new Error("failed to compose session AGENTS.md");
+  }
+
   const composedContent = await readTextFileIfExists(composedAgents.path);
   if (!composedContent) {
     throw new Error("failed to compose session AGENTS.md");
@@ -600,11 +604,15 @@ export async function cleanupLaunchWorkspaces(args: {
     let removedSessionAgents = false;
     const sessionId = record.metadata?.session_id ?? record.session_id;
     if (sessionId) {
-      await removeSessionComposedAgentsFile({
-        cwd: projectRoot,
-        sessionId
-      });
-      removedSessionAgents = true;
+      try {
+        await removeSessionComposedAgentsFile({
+          cwd: projectRoot,
+          sessionId
+        });
+        removedSessionAgents = true;
+      } catch (error) {
+        void error;
+      }
     }
 
     removed.push({
