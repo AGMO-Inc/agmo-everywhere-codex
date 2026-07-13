@@ -122,43 +122,43 @@ test("managed native agent TOMLs keep expected defaults and remain parseable", a
 
   const expectedDefaults = {
     "agmo-planner": {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       model_reasoning_effort: "medium",
       posture: "frontier-orchestrator",
       modelClass: "frontier",
     },
     "agmo-executor": {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       model_reasoning_effort: "medium",
       posture: "deep-worker",
       modelClass: "standard",
     },
     "agmo-verifier": {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       model_reasoning_effort: "medium",
       posture: "frontier-orchestrator",
       modelClass: "standard",
     },
     "agmo-wisdom": {
-      model: "gpt-5.4-mini",
+      model: "gpt-5.6-terra",
       model_reasoning_effort: "medium",
       posture: "fast-lane",
       modelClass: "fast",
     },
     "agmo-architect": {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       model_reasoning_effort: "medium",
       posture: "frontier-orchestrator",
       modelClass: "frontier",
     },
     "agmo-critic": {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       model_reasoning_effort: "medium",
       posture: "frontier-orchestrator",
       modelClass: "frontier",
     },
     "agmo-explore": {
-      model: "gpt-5.3-codex-spark",
+      model: "gpt-5.6-luna",
       model_reasoning_effort: "low",
       posture: "fast-lane",
       modelClass: "fast",
