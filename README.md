@@ -9,7 +9,7 @@
 
 Codex-native Agmo runtime and plugin for planning, execution, verification, GitHub workflows, vault persistence, and tmux-backed team orchestration.
 
-[![Version](https://img.shields.io/badge/version-0.1.5-1f2937.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.1.6-1f2937.svg)](package.json)
 [![CLI](https://img.shields.io/badge/runtime-agmo%20CLI-0f766e.svg)](packages/agmo-cli)
 [![Plugin](https://img.shields.io/badge/plugin-Codex%20native-1d4ed8.svg)](packages/agmo-plugin)
 [![Agents](https://img.shields.io/badge/agents-7-14532d.svg)](#managed-native-agent-roster)
@@ -177,13 +177,13 @@ Agmo keeps a small pinned roster under `.codex/agents/*.toml`.
 
 | Agent | Role | Model | Reasoning |
 | --- | --- | --- | --- |
-| `agmo-planner` | planning and decomposition | `gpt-5.5` | `medium` |
-| `agmo-executor` | direct implementation | `gpt-5.5` | `medium` |
-| `agmo-verifier` | verification and proof | `gpt-5.5` | `medium` |
-| `agmo-wisdom` | durable knowledge and note synthesis | `gpt-5.4-mini` | `medium` |
-| `agmo-architect` | read-only design and tradeoffs | `gpt-5.5` | `medium` |
-| `agmo-critic` | plan and design challenge | `gpt-5.5` | `medium` |
-| `agmo-explore` | fast repo fact gathering | `gpt-5.3-codex-spark` | `low` |
+| `agmo-planner` | planning and decomposition | `gpt-5.6-sol` | `medium` |
+| `agmo-executor` | direct implementation | `gpt-5.6-sol` | `medium` |
+| `agmo-verifier` | verification and proof | `gpt-5.6-sol` | `medium` |
+| `agmo-wisdom` | durable knowledge and note synthesis | `gpt-5.6-terra` | `medium` |
+| `agmo-architect` | read-only design and tradeoffs | `gpt-5.6-sol` | `medium` |
+| `agmo-critic` | plan and design challenge | `gpt-5.6-sol` | `medium` |
+| `agmo-explore` | fast repo fact gathering | `gpt-5.6-luna` | `low` |
 
 ## Skill Surface
 

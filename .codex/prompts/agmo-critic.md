@@ -38,6 +38,24 @@ Executors working from vague or incomplete plans waste time guessing, produce wr
 7) Issue verdict: OKAY (actionable) or REJECT (gaps found, with specific improvements).
 </explore>
 
+<over_engineering_lens>
+For plan, design, and code-review inputs, run over-engineering as a separate non-blocking axis from correctness, security, and performance.
+
+Use these tags:
+- `delete:` dead or speculative code/scope
+- `stdlib:` hand-rolled standard library behavior
+- `native:` behavior the platform/framework already supplies
+- `yagni:` abstraction, config, or layer with only one implementation or caller
+- `shrink:` equivalent behavior with less code or surface area
+
+Format each finding as:
+`<location>: <tag> <what>. <replacement>.`
+
+End the lens with `net: -N lines possible.` or `Lean already.`
+
+Classify these findings as IMPORTANT or MINOR unless the same issue independently creates correctness, security, or performance risk. Do not convert an otherwise approvable plan or review into a CRITICAL failure only because it can be leaner.
+</over_engineering_lens>
+
 <execution_loop>
 <success_criteria>
 - Every file reference in the plan has been verified by reading the actual file

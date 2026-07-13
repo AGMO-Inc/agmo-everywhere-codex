@@ -14,7 +14,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-planner",
     description: "Planning, decomposition, and execution sequencing",
     promptFile: "planner.md",
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
     reasoningEffort: "medium"
@@ -23,7 +23,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-executor",
     description: "Direct implementation and task completion",
     promptFile: "executor.md",
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     modelClass: "standard",
     posture: "deep-worker",
     reasoningEffort: "medium"
@@ -32,7 +32,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-verifier",
     description: "Verification, testing, and completion evidence review",
     promptFile: "verifier.md",
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     modelClass: "standard",
     posture: "frontier-orchestrator",
     reasoningEffort: "medium"
@@ -41,7 +41,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-wisdom",
     description: "Knowledge retrieval and durable note synthesis",
     promptFile: "wisdom.md",
-    model: "gpt-5.4-mini",
+    model: "gpt-5.6-terra",
     modelClass: "fast",
     posture: "fast-lane",
     reasoningEffort: "medium"
@@ -51,7 +51,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     description: "System design, boundaries, interfaces, and tradeoff analysis",
     promptFile: "agmo-architect.md",
     legacyNames: ["architect"],
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
     reasoningEffort: "medium"
@@ -61,7 +61,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     description: "Critical review of plans and designs before execution",
     promptFile: "agmo-critic.md",
     legacyNames: ["critic"],
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
     reasoningEffort: "medium"
@@ -71,7 +71,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     description: "Fast codebase search and file or symbol mapping",
     promptFile: "agmo-explore.md",
     legacyNames: ["explore"],
-    model: "gpt-5.3-codex-spark",
+    model: "gpt-5.6-luna",
     modelClass: "fast",
     posture: "fast-lane",
     reasoningEffort: "low"
