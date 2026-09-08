@@ -9,7 +9,7 @@
 
 Codex-native Agmo runtime and plugin for planning, execution, verification, GitHub workflows, vault persistence, and tmux-backed team orchestration.
 
-[![Version](https://img.shields.io/badge/version-0.1.6-1f2937.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.1.7-1f2937.svg)](package.json)
 [![CLI](https://img.shields.io/badge/runtime-agmo%20CLI-0f766e.svg)](packages/agmo-cli)
 [![Plugin](https://img.shields.io/badge/plugin-Codex%20native-1d4ed8.svg)](packages/agmo-plugin)
 [![Agents](https://img.shields.io/badge/agents-7-14532d.svg)](#managed-native-agent-roster)
@@ -177,13 +177,15 @@ Agmo keeps a small pinned roster under `.codex/agents/*.toml`.
 
 | Agent | Role | Model | Reasoning |
 | --- | --- | --- | --- |
-| `agmo-planner` | planning and decomposition | `gpt-5.6-sol` | `medium` |
-| `agmo-executor` | direct implementation | `gpt-5.6-sol` | `medium` |
-| `agmo-verifier` | verification and proof | `gpt-5.6-sol` | `medium` |
+| `agmo-planner` | planning and decomposition | `gpt-6-astra` | `xhigh` |
+| `agmo-executor` | direct implementation | `gpt-6-astra` | `medium` |
+| `agmo-verifier` | verification and proof | `gpt-6-astra` | `medium` |
 | `agmo-wisdom` | durable knowledge and note synthesis | `gpt-5.6-terra` | `medium` |
-| `agmo-architect` | read-only design and tradeoffs | `gpt-5.6-sol` | `medium` |
-| `agmo-critic` | plan and design challenge | `gpt-5.6-sol` | `medium` |
+| `agmo-architect` | read-only design and tradeoffs | `gpt-6-astra` | `xhigh` |
+| `agmo-critic` | plan and design challenge | `gpt-6-astra` | `xhigh` |
 | `agmo-explore` | fast repo fact gathering | `gpt-5.6-luna` | `low` |
+
+Hook execution ownership requires syncing both project and user installations so their managed commands include `--scope`; legacy unscoped direct hook calls continue to execute during migration. Session-state locks fail closed after a bounded timeout when ownership is stale or unreadable, with owner/path diagnostics. Remove such a lock manually only after confirming its owner is no longer active.
 
 ## Skill Surface
 

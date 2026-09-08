@@ -6,7 +6,7 @@ export type AgmoAgentDefinition = {
   model: string;
   modelClass: "frontier" | "standard" | "fast";
   posture: "frontier-orchestrator" | "deep-worker" | "fast-lane";
-  reasoningEffort: "low" | "medium" | "high";
+  reasoningEffort: "low" | "medium" | "high" | "xhigh";
 };
 
 export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
@@ -14,16 +14,16 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-planner",
     description: "Planning, decomposition, and execution sequencing",
     promptFile: "planner.md",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "medium"
+    reasoningEffort: "xhigh"
   },
   {
     name: "agmo-executor",
     description: "Direct implementation and task completion",
     promptFile: "executor.md",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     modelClass: "standard",
     posture: "deep-worker",
     reasoningEffort: "medium"
@@ -32,7 +32,7 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     name: "agmo-verifier",
     description: "Verification, testing, and completion evidence review",
     promptFile: "verifier.md",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     modelClass: "standard",
     posture: "frontier-orchestrator",
     reasoningEffort: "medium"
@@ -51,20 +51,20 @@ export const AGMO_AGENT_DEFINITIONS: AgmoAgentDefinition[] = [
     description: "System design, boundaries, interfaces, and tradeoff analysis",
     promptFile: "agmo-architect.md",
     legacyNames: ["architect"],
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "medium"
+    reasoningEffort: "xhigh"
   },
   {
     name: "agmo-critic",
     description: "Critical review of plans and designs before execution",
     promptFile: "agmo-critic.md",
     legacyNames: ["critic"],
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     modelClass: "frontier",
     posture: "frontier-orchestrator",
-    reasoningEffort: "medium"
+    reasoningEffort: "xhigh"
   },
   {
     name: "agmo-explore",

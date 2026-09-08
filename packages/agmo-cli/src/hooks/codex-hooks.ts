@@ -22,6 +22,8 @@ type HooksConfig = {
   hooks?: Record<string, HookEntry[]>;
 };
 
+type HookPayload = Record<string, unknown>;
+
 function buildEntry(
   command: string,
   options: {
@@ -47,8 +49,11 @@ function buildEntry(
   };
 }
 
-export function buildHookCommand(cliEntryPath: string): string {
-  return `node "${cliEntryPath}" internal hook`;
+export function buildHookCommand(
+  cliEntryPath: string,
+  scope?: "project" | "user"
+): string {
+  return `node "${cliEntryPath}" internal hook${scope ? ` --scope ${scope}` : ""}`;
 }
 
 export function buildManagedHooksConfig(command: string): HooksConfig {
@@ -98,7 +103,9 @@ function parseHooksConfig(content: string | null): HooksConfig {
 }
 
 function isManagedCommand(command: string): boolean {
-  return /\binternal hook\b/.test(command);
+  return /\bnode\s+(?:"[^"]*agmo[^"]*[\\/]dist[\\/]cli[\\/]index\.js"|\S*agmo\S*[\\/]dist[\\/]cli[\\/]index\.js)\s+internal\s+hook\b/i.test(
+    command
+  );
 }
 
 function isLegacyManagedCommand(command: string): boolean {
@@ -130,6 +137,89 @@ function stripManagedHooks(entries: HookEntry[] | undefined): HookEntry[] {
       };
     })
     .filter((entry): entry is HookEntry => entry !== null);
+}
+
+function payloadString(payload: HookPayload, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function matcherApplies(
+  eventName: string,
+  matcher: string | undefined,
+  payload: HookPayload
+): boolean {
+  if (!matcher) {
+    return true;
+  }
+  if (matcher === "*") {
+    return true;
+  }
+
+  const candidate =
+    eventName === "SessionStart"
+      ? payloadString(payload, "source", "session_start_source", "sessionStartSource")
+      : eventName === "PreToolUse" || eventName === "PostToolUse"
+        ? payloadString(payload, "tool_name", "toolName", "tool")
+        : "";
+  if (!candidate) {
+    return false;
+  }
+
+  try {
+    return new RegExp(`^(?:${matcher})$`, "i").test(candidate);
+  } catch {
+    return false;
+  }
+}
+
+export function managedProjectHookApplies(
+  existingContent: string | null,
+  eventName: string,
+  payload: HookPayload
+): boolean {
+  const config = parseHooksConfig(existingContent);
+  const entries = config.hooks?.[eventName];
+  if (!Array.isArray(entries)) {
+    return false;
+  }
+
+  return entries.some((entry: unknown) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return false;
+    }
+    const candidate = entry as { matcher?: unknown; hooks?: unknown };
+    if (
+      candidate.matcher !== undefined &&
+      typeof candidate.matcher !== "string"
+    ) {
+      return false;
+    }
+    if (
+      !matcherApplies(eventName, candidate.matcher as string | undefined, payload) ||
+      !Array.isArray(candidate.hooks)
+    ) {
+      return false;
+    }
+
+    return candidate.hooks.some((hook: unknown) => {
+      if (!hook || typeof hook !== "object" || Array.isArray(hook)) {
+        return false;
+      }
+      const command = hook as { type?: unknown; command?: unknown };
+      return (
+        command.type === "command" &&
+        typeof command.command === "string" &&
+        isManagedCommand(command.command) &&
+        /(?:^|\s)--scope(?:=|\s+)project(?:\s|$)/.test(command.command)
+      );
+    });
+  });
 }
 
 export function mergeManagedHooksConfig(

@@ -7,8 +7,11 @@ import { handlePreToolUse } from "../hooks/pre-tool-use.js";
 import { buildSessionStartContext } from "../hooks/session-start.js";
 import { handleStop } from "../hooks/stop.js";
 import { handleUserPromptSubmit } from "../hooks/user-prompt-submit.js";
+import { managedProjectHookApplies } from "../hooks/codex-hooks.js";
 import { recordWorkerHookActivity } from "../team/runtime.js";
-import { resolveRuntimeRoot } from "../utils/paths.js";
+import { readTextFileIfExists } from "../utils/fs.js";
+import { parseOptionalScopeFlag } from "../utils/args.js";
+import { resolveInstallPaths, resolveRuntimeRoot } from "../utils/paths.js";
 
 type HookPayload = {
   hook_event_name?: string;
@@ -27,8 +30,20 @@ async function readStdin(): Promise<string> {
 }
 
 function resolveHookEvent(args: string[], payload: HookPayload | null): string {
+  const positionalArgs: string[] = [];
+  for (let index = 1; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--scope") {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--scope=")) {
+      continue;
+    }
+    positionalArgs.push(arg);
+  }
   return (
-    args[1] ??
+    positionalArgs[0] ??
     payload?.hook_event_name ??
     payload?.event_name ??
     payload?.eventName ??
@@ -90,12 +105,34 @@ export async function runInternalCommand(args: string[]): Promise<void> {
   }
 
   const eventName = resolveHookEvent(args, payload);
+  const scope = parseOptionalScopeFlag(args.slice(1));
+  const runtimeRoot = resolveRuntimeRoot();
+
+  if (scope === "user" && eventName) {
+    let projectHooks: string | null = null;
+    try {
+      projectHooks = await readTextFileIfExists(
+        resolveInstallPaths("project", runtimeRoot).hooksFile
+      );
+    } catch {
+      projectHooks = null;
+    }
+    if (
+      managedProjectHookApplies(
+        projectHooks,
+        eventName,
+        (payload ?? {}) as Record<string, unknown>
+      )
+    ) {
+      return;
+    }
+  }
 
   const teamName = process.env.AGMO_TEAM_NAME;
   const workerName = process.env.AGMO_WORKER_NAME;
   if (teamName && workerName && eventName) {
     try {
-      await recordWorkerHookActivity(teamName, workerName, eventName, resolveRuntimeRoot());
+      await recordWorkerHookActivity(teamName, workerName, eventName, runtimeRoot);
     } catch (error) {
       console.error(
         `[agmo] failed to record worker hook activity: ${(error as Error).message}`
@@ -106,7 +143,7 @@ export async function runInternalCommand(args: string[]): Promise<void> {
   if (eventName === "SessionStart") {
     process.stdout.write(
       `${await buildSessionStartContext(
-        resolveRuntimeRoot(),
+        runtimeRoot,
         process.env,
         (payload ?? {}) as Record<string, unknown>
       )}\n`
@@ -116,7 +153,7 @@ export async function runInternalCommand(args: string[]): Promise<void> {
 
   if (eventName === "UserPromptSubmit") {
     const output = await handleUserPromptSubmit({
-      cwd: resolveRuntimeRoot(),
+      cwd: runtimeRoot,
       payload: (payload ?? {}) as Record<string, unknown>
     });
 
@@ -128,7 +165,7 @@ export async function runInternalCommand(args: string[]): Promise<void> {
 
   if (eventName === "PreToolUse") {
     const output = await handlePreToolUse({
-      cwd: resolveRuntimeRoot(),
+      cwd: runtimeRoot,
       payload: (payload ?? {}) as Record<string, unknown>
     });
 
@@ -140,7 +177,7 @@ export async function runInternalCommand(args: string[]): Promise<void> {
 
   if (eventName === "PostToolUse") {
     const output = await handlePostToolUse({
-      cwd: resolveRuntimeRoot(),
+      cwd: runtimeRoot,
       payload: (payload ?? {}) as Record<string, unknown>
     });
 
@@ -152,7 +189,7 @@ export async function runInternalCommand(args: string[]): Promise<void> {
 
   if (eventName === "Stop") {
     const output = await handleStop({
-      cwd: resolveRuntimeRoot(),
+      cwd: runtimeRoot,
       payload: (payload ?? {}) as Record<string, unknown>
     });
 

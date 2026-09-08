@@ -28,7 +28,7 @@ function detectToolName(payload: AgmoHookPayload): string | undefined {
   ) || undefined;
 }
 
-function detectToolSummary(payload: AgmoHookPayload): string | undefined {
+function detectToolInputText(payload: AgmoHookPayload): string | undefined {
   const candidates: unknown[] = [
     payload.command,
     payload.input,
@@ -39,25 +39,25 @@ function detectToolSummary(payload: AgmoHookPayload): string | undefined {
 
   for (const candidate of candidates) {
     if (typeof candidate === "string") {
-      const summary = summarizeText(candidate);
-      if (summary) {
-        return summary;
+      const text = safeString(candidate);
+      if (text) {
+        return text;
       }
     }
 
     if (candidate && typeof candidate === "object") {
       const nested = candidate as Record<string, unknown>;
       for (const key of ["command", "cmd", "input", "query", "description"]) {
-        const summary = summarizeText(safeString(nested[key]));
-        if (summary) {
-          return summary;
+        const text = safeString(nested[key]);
+        if (text) {
+          return text;
         }
       }
 
       try {
-        const summary = summarizeText(JSON.stringify(candidate));
-        if (summary) {
-          return summary;
+        const text = JSON.stringify(candidate);
+        if (text) {
+          return text;
         }
       } catch {
         // ignore
@@ -68,8 +68,8 @@ function detectToolSummary(payload: AgmoHookPayload): string | undefined {
   return undefined;
 }
 
-function detectRiskReason(summary: string | undefined): string | undefined {
-  if (!summary) {
+function detectRiskReason(toolInput: string | undefined): string | undefined {
+  if (!toolInput) {
     return undefined;
   }
 
@@ -80,17 +80,18 @@ function detectRiskReason(summary: string | undefined): string | undefined {
     { pattern: /\bmkfs\b|\bdd\s+if=/i, reason: "low-level disk write command detected" }
   ];
 
-  return patterns.find((entry) => entry.pattern.test(summary))?.reason;
+  return patterns.find((entry) => entry.pattern.test(toolInput))?.reason;
 }
 
 function buildContext(payload: AgmoHookPayload): PreToolContext {
   const toolName = detectToolName(payload);
-  const toolSummary = detectToolSummary(payload);
+  const toolInput = detectToolInputText(payload);
+  const toolSummary = toolInput ? summarizeText(toolInput) : undefined;
 
   return {
     toolName,
     toolSummary,
-    riskReason: detectRiskReason(toolSummary)
+    riskReason: detectRiskReason(toolInput)
   };
 }
 

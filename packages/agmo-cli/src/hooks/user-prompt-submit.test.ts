@@ -7,6 +7,7 @@ import { readPersistedSessionState } from "./runtime-state.js";
 import type { SessionState } from "./runtime-state.js";
 import { detectWorkflowRoute, handleUserPromptSubmit } from "./user-prompt-submit.js";
 import { metadataForWorkflowRoute } from "./workflow-route-metadata.js";
+import { AGMO_AGENT_DEFINITIONS } from "../agents/definitions.js";
 
 function previousWorkflow(workflow: string): SessionState {
   return {
@@ -116,11 +117,12 @@ const GOLDEN_ROUTE_MATRIX: GoldenRouteCase[] = [
     name: "English verification review",
     prompt: "review the implementation and test coverage",
     expected: {
-      skill: "verify",
+      skill: "code-review",
       label: "verify",
       source: "pattern",
       confidence: "high",
-      score: 8
+      score: 9,
+      alternatives: ["verify"]
     }
   },
   {
@@ -221,9 +223,37 @@ test("metadataForWorkflowRoute categorizes workflows without changing selected r
   assert.deepEqual(metadataForWorkflowRoute({ skill: "plan-review", label: "plan" }), {
     operational_category: "planning",
     recommended_agent: "agmo-critic",
-    recommended_effort: "high",
+    recommended_effort: "xhigh",
     verification_strategy: "produce an approve, revise, or reject verdict grounded in plan evidence"
   });
+});
+
+test("every workflow route derives effort from its recommended agent definition", () => {
+  const routes = [
+    ["brainstorming", "brainstorming"],
+    ["plan", "plan"],
+    ["ralplan", "plan"],
+    ["plan-review", "plan"],
+    ["code-review", "verify"],
+    ["execute", "execute"],
+    ["ralph", "execute"],
+    ["verify", "verify"],
+    ["wisdom", "wisdom"],
+    ["vault-search", "vault-search"],
+    ["save-note", "save-note"],
+    ["git-workflow", "git-workflow"],
+    ["create-issue", "create-issue"],
+    ["note-to-issue", "note-to-issue"]
+  ] as const;
+
+  for (const [skill, label] of routes) {
+    const metadata = metadataForWorkflowRoute({ skill, label });
+    const agent = AGMO_AGENT_DEFINITIONS.find(
+      (definition) => definition.name === metadata.recommended_agent
+    );
+    assert.ok(agent, skill);
+    assert.equal(metadata.recommended_effort, agent.reasoningEffort, skill);
+  }
 });
 
 test("detectWorkflowRoute marks explicit routes as high confidence", () => {
@@ -232,6 +262,94 @@ test("detectWorkflowRoute marks explicit routes as high confidence", () => {
   assert.equal(route.skill, "execute");
   assert.equal(route.source, "explicit");
   assert.equal(route.confidence, "high");
+});
+
+test("detectWorkflowRoute separates code inspection from requests to apply fixes", () => {
+  const cases = [
+    {
+      name: "reported Korean inspection prompt",
+      prompt: "그리고 해당 플러그인 사용 시 hook에 수정해야 할 사항이나 개선할 점이 없는지 검토해줘.",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "explicit code-review with implementation nouns",
+      prompt: "$code-review 수정이 필요한 구현 부분을 검토해줘",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "ordinary English code review",
+      prompt: "review the code changes for potential fixes",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "actual Korean fix request",
+      prompt: "이 버그를 수정해줘",
+      expectedSkill: "execute"
+    },
+    {
+      name: "review then fix request",
+      prompt: "코드를 검토하고 수정해줘",
+      expectedSkill: "execute"
+    },
+    {
+      name: "review then fix a named object",
+      prompt: "코드를 검토하고 버그를 수정해줘",
+      expectedSkill: "execute"
+    },
+    {
+      name: "review then politely fix relevant parts",
+      prompt: "코드를 검토한 뒤 필요한 부분을 수정해주세요",
+      expectedSkill: "execute"
+    },
+    {
+      name: "English review and fix request",
+      prompt: "review the code and fix the bugs",
+      expectedSkill: "execute"
+    },
+    {
+      name: "negated implementation inspection",
+      prompt: "수정하지 말고 코드만 검토해줘",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "Korean trailing negated mutation",
+      prompt: "코드를 검토하고 수정하지 마",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "English trailing negated mutation",
+      prompt: "review the code and do not fix anything",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "Korean findings-only request",
+      prompt: "코드를 검토하고 수정할 사항만 알려줘",
+      expectedSkill: "code-review"
+    },
+    {
+      name: "inspection overrides prior execute state",
+      prompt: "수정할 부분이 있는지 코드 검토해줘",
+      previousState: previousWorkflow("execute"),
+      expectedSkill: "code-review"
+    },
+    {
+      name: "plan review remains plan review",
+      prompt: "구현 계획을 검토해줘",
+      expectedSkill: "plan-review"
+    }
+  ];
+
+  for (const routeCase of cases) {
+    const route = detectWorkflowRoute(
+      routeCase.prompt,
+      routeCase.previousState ?? null
+    );
+    assert.equal(route?.skill, routeCase.expectedSkill, routeCase.name);
+    if (routeCase.expectedSkill === "code-review") {
+      assert.equal(route?.label, "verify", routeCase.name);
+      assert.equal(route?.recommended_agent, "agmo-critic", routeCase.name);
+    }
+  }
 });
 
 test("detectWorkflowRoute prefers vault-search for prior note retrieval asks", () => {
@@ -403,6 +521,24 @@ test("handleUserPromptSubmit keeps plan-review metadata aligned with enforcement
   assert.match(context, /IntentGate evidence: .*skill=plan-review .*agent=agmo-critic/);
   assert.match(context, /Hand the critique\/approval pass to agmo-critic/);
   assert.doesNotMatch(context, /Hand the critique\/approval pass to agmo-verifier/);
+});
+
+test("handleUserPromptSubmit enforces code-review through critic and verifier without execute", async () => {
+  const tempRoot = await mkdtemp(join(os.tmpdir(), "agmo-user-prompt-code-review-"));
+  const result = await handleUserPromptSubmit({
+    cwd: tempRoot,
+    payload: {
+      session_id: "code-review-context-session",
+      prompt: "$code-review inspect implementation fixes"
+    }
+  });
+
+  assert.ok(result);
+  const context = result.hookSpecificOutput.additionalContext;
+  assert.match(context, /skill=code-review .*agent=agmo-critic/);
+  assert.match(context, /agmo-critic/);
+  assert.match(context, /agmo-verifier/);
+  assert.doesNotMatch(context, /Delegate the primary coding lane to agmo-executor/);
 });
 
 test("handleUserPromptSubmit persists route metadata and emits compact IntentGate evidence", async () => {

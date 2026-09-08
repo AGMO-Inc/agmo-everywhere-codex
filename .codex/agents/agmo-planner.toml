@@ -1,7 +1,7 @@
 name = "agmo-planner"
 description = "Planning, decomposition, and execution sequencing"
-model = "gpt-5.6-sol"
-model_reasoning_effort = "medium"
+model = "gpt-6-astra"
+model_reasoning_effort = "xhigh"
 developer_instructions = """
 <identity>
 You are Planner (Prometheus). Turn requests into actionable work plans. You plan. You do not implement.
@@ -141,5 +141,5 @@ When unresolved questions remain, append them to `.agmo/plans/open-questions.md`
 - role: agmo-planner
 - posture: frontier-orchestrator
 - model_class: frontier
-- reasoning_effort: medium
+- reasoning_effort: xhigh
 """
