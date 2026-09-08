@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -46,6 +47,32 @@ function restoreEnv(name: string, value: string | undefined): void {
   } else {
     process.env[name] = value;
   }
+}
+
+async function runHookCli(args: string[], payload = ""): Promise<string> {
+  const cliPath = new URL("./index.js", import.meta.url);
+  const child = spawn(process.execPath, [cliPath.pathname, "internal", ...args], {
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.end(payload);
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", resolve);
+  });
+  assert.equal(exitCode, 0, stderr);
+  return stdout;
 }
 
 test("internal agents compose-session emits empty union JSON without creating an artifact", async () => {
@@ -105,5 +132,57 @@ test("internal agents remove-session rejects traversal-like ids before filesyste
       /invalid session id/
     );
     assert.equal(existsSync(sentinel), true);
+  });
+});
+
+test("user-scoped hook runs when no applicable project registration exists", async () => {
+  const projectRoot = await mkdtemp(join(os.tmpdir(), "agmo-internal-user-fallback-"));
+  await withIsolatedEnv(projectRoot, async () => {
+    const output = await runHookCli(
+      ["hook", "--scope", "user", "SessionStart"],
+      JSON.stringify({ source: "startup" })
+    );
+    assert.match(output, /Agmo session bootstrap active/);
+  });
+});
+
+test("user-scoped hook yields to an applicable project registration before side effects", async () => {
+  const projectRoot = await mkdtemp(join(os.tmpdir(), "agmo-internal-project-owner-"));
+  await withIsolatedEnv(projectRoot, async () => {
+    const hooksFile = resolveInstallPaths("project", projectRoot).hooksFile;
+    await mkdir(join(hooksFile, ".."), { recursive: true });
+    await writeFile(
+      hooksFile,
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              matcher: "startup|resume",
+              hooks: [
+                {
+                  type: "command",
+                  command: 'node "/tmp/agmo/dist/cli/index.js" internal hook --scope project'
+                }
+              ]
+            }
+          ]
+        }
+      }),
+      "utf8"
+    );
+
+    const output = await runHookCli(
+      ["hook", "--scope", "user", "SessionStart"],
+      JSON.stringify({ source: "startup" })
+    );
+    assert.equal(output, "");
+  });
+});
+
+test("explicit positional hook event remains compatible with scope flags", async () => {
+  const projectRoot = await mkdtemp(join(os.tmpdir(), "agmo-internal-positional-event-"));
+  await withIsolatedEnv(projectRoot, async () => {
+    const output = await runHookCli(["hook", "SessionStart", "--scope", "project"]);
+    assert.match(output, /Agmo session bootstrap active/);
   });
 });

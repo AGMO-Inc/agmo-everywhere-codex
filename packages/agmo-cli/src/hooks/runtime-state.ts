@@ -1,6 +1,9 @@
-import { join } from "node:path";
-import { readTextFileIfExists, writeJsonFile } from "../utils/fs.js";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { readTextFileIfExists } from "../utils/fs.js";
 import { resolveInstallPaths } from "../utils/paths.js";
+import type { AgmoAgentDefinition } from "../agents/definitions.js";
 
 export type AgmoHookPayload = Record<string, unknown>;
 
@@ -42,7 +45,7 @@ export type WorkflowRouteRecord = {
     | "agmo-architect"
     | "agmo-critic"
     | "agmo-explore";
-  recommended_effort?: "low" | "medium" | "high";
+  recommended_effort?: AgmoAgentDefinition["reasoningEffort"];
   verification_strategy?: string;
   score?: number;
   fallback?: string;
@@ -157,6 +160,147 @@ function promptExcerpt(prompt: string): string | undefined {
 }
 
 const MAX_VERIFICATION_HISTORY = 10;
+const SESSION_LOCK_TIMEOUT_MS = 5_000;
+const SESSION_LOCK_RETRY_MS = 20;
+const SESSION_LOCK_METADATA_FILE = "owner.json";
+
+type SessionStateLockMetadata = {
+  owner_id: string;
+  pid: number;
+  acquired_at: string;
+};
+
+export type SessionStateLockHandle = {
+  lockPath: string;
+  ownerId: string;
+  release: () => Promise<void>;
+};
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sessionStateLockPath(cwd: string, sessionId: string): string {
+  const { sessionsStateDir } = resolveInstallPaths("project", cwd);
+  return join(dirname(sessionsStateDir), ".session-locks", `${safeFileStem(sessionId)}.lock`);
+}
+
+async function readLockOwner(lockPath: string): Promise<string> {
+  const metadataPath = join(lockPath, SESSION_LOCK_METADATA_FILE);
+  try {
+    const raw = await readFile(metadataPath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<SessionStateLockMetadata>;
+    if (
+      typeof parsed.owner_id === "string" &&
+      typeof parsed.pid === "number" &&
+      typeof parsed.acquired_at === "string"
+    ) {
+      return `owner=${parsed.owner_id} pid=${parsed.pid} acquired_at=${parsed.acquired_at}`;
+    }
+    return `malformed_metadata=${JSON.stringify(parsed)}`;
+  } catch (error) {
+    return `unreadable_metadata=${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+export async function acquireSessionStateLock(
+  cwd: string,
+  sessionId: string,
+  options: { timeoutMs?: number; retryMs?: number; ownerId?: string } = {}
+): Promise<SessionStateLockHandle> {
+  const lockPath = sessionStateLockPath(cwd, sessionId);
+  const metadataPath = join(lockPath, SESSION_LOCK_METADATA_FILE);
+  const ownerId = options.ownerId ?? randomUUID();
+  const timeoutMs = Math.max(options.timeoutMs ?? SESSION_LOCK_TIMEOUT_MS, 0);
+  const retryMs = Math.max(options.retryMs ?? SESSION_LOCK_RETRY_MS, 1);
+  const deadline = Date.now() + timeoutMs;
+  await mkdir(dirname(lockPath), { recursive: true });
+
+  while (true) {
+    try {
+      await mkdir(lockPath);
+      const metadata: SessionStateLockMetadata = {
+        owner_id: ownerId,
+        pid: process.pid,
+        acquired_at: new Date().toISOString()
+      };
+      try {
+        await writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+      } catch (error) {
+        await rm(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+
+      return {
+        lockPath,
+        ownerId,
+        release: async () => {
+          let currentOwner: string | undefined;
+          try {
+            const parsed = JSON.parse(await readFile(metadataPath, "utf8")) as {
+              owner_id?: unknown;
+            };
+            currentOwner = typeof parsed.owner_id === "string" ? parsed.owner_id : undefined;
+          } catch (error) {
+            throw new Error(
+              `refusing to release session state lock ${lockPath}: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          }
+          if (currentOwner !== ownerId) {
+            throw new Error(
+              `refusing to release session state lock ${lockPath}: owner=${
+                currentOwner ?? "unknown"
+              } current_owner=${ownerId}`
+            );
+          }
+          await rm(lockPath, { recursive: true });
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      const owner = await readLockOwner(lockPath);
+      throw new Error(
+        `timed out waiting for session state lock ${lockPath} for session ${sessionId}; ${owner}. ` +
+          "The lock is not reclaimed automatically; inspect and remove it only after confirming its owner is no longer active."
+      );
+    }
+    await sleepMs(Math.min(retryMs, Math.max(1, deadline - Date.now())));
+  }
+}
+
+async function withSessionStateLock<T>(
+  cwd: string,
+  sessionId: string,
+  callback: () => Promise<T>
+): Promise<T> {
+  const lock = await acquireSessionStateLock(cwd, sessionId);
+  try {
+    return await callback();
+  } finally {
+    await lock.release();
+  }
+}
+
+async function writeJsonFileAtomically(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporaryPath = join(dirname(path), `.${safeFileStem(basename(path))}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx"
+    });
+    await rename(temporaryPath, path);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}
 
 async function writeSessionState(
   cwd: string,
@@ -164,7 +308,7 @@ async function writeSessionState(
   state: SessionState
 ): Promise<void> {
   const { sessionsStateDir } = resolveInstallPaths("project", cwd);
-  await writeJsonFile(join(sessionsStateDir, `${safeFileStem(sessionId)}.json`), state);
+  await writeJsonFileAtomically(join(sessionsStateDir, `${safeFileStem(sessionId)}.json`), state);
 }
 
 function renderWorkflowStateRef(sessionId: string, state: SessionState): WorkflowStateRef {
@@ -189,7 +333,7 @@ async function writeWorkflowState(
   state: WorkflowStateRef
 ): Promise<void> {
   const { workflowsStateDir } = resolveInstallPaths("project", cwd);
-  await writeJsonFile(join(workflowsStateDir, `${safeFileStem(sessionId)}.json`), state);
+  await writeJsonFileAtomically(join(workflowsStateDir, `${safeFileStem(sessionId)}.json`), state);
 }
 
 async function persistSessionState(args: {
@@ -409,7 +553,7 @@ function nextVerificationHistory(args: {
   return [...(base?.verification_history ?? []), entry].slice(-MAX_VERIFICATION_HISTORY);
 }
 
-export async function writeWorkflowActivation(args: {
+async function writeWorkflowActivationUnlocked(args: {
   cwd: string;
   payload: AgmoHookPayload;
   workflow: string;
@@ -452,7 +596,7 @@ export async function writeWorkflowActivation(args: {
   };
 }
 
-export async function markSessionStopped(args: {
+async function markSessionStoppedUnlocked(args: {
   cwd: string;
   payload: AgmoHookPayload;
 }): Promise<{ sessionId: string; workflowStatePathStem: string }> {
@@ -492,7 +636,7 @@ export async function markSessionStopped(args: {
   };
 }
 
-export async function recordSessionActivity(args: {
+async function recordSessionActivityUnlocked(args: {
   cwd: string;
   payload: AgmoHookPayload;
   lastEvent: "PreToolUse" | "PostToolUse";
@@ -558,7 +702,7 @@ export async function recordSessionActivity(args: {
   };
 }
 
-export async function recordSessionAutosave(args: {
+async function recordSessionAutosaveUnlocked(args: {
   cwd: string;
   payload: AgmoHookPayload;
   autosaveAt: string;
@@ -618,7 +762,7 @@ export async function recordSessionAutosave(args: {
   };
 }
 
-export async function recordSessionArtifact(args: {
+async function recordSessionArtifactUnlocked(args: {
   cwd: string;
   payload: AgmoHookPayload;
   artifactAt: string;
@@ -668,7 +812,7 @@ export async function recordSessionArtifact(args: {
   };
 }
 
-export async function recordSessionWisdomPersistence(args: {
+async function recordSessionWisdomPersistenceUnlocked(args: {
   cwd: string;
   payload: AgmoHookPayload;
   savedAt: string;
@@ -712,4 +856,58 @@ export async function recordSessionWisdomPersistence(args: {
     sessionId,
     workflowStatePathStem: safeFileStem(sessionId)
   };
+}
+
+export async function writeWorkflowActivation(
+  args: Parameters<typeof writeWorkflowActivationUnlocked>[0]
+): Promise<Awaited<ReturnType<typeof writeWorkflowActivationUnlocked>>> {
+  const sessionId = readSessionId(args.payload);
+  return await withSessionStateLock(args.cwd, sessionId, async () =>
+    await writeWorkflowActivationUnlocked(args)
+  );
+}
+
+export async function markSessionStopped(
+  args: Parameters<typeof markSessionStoppedUnlocked>[0]
+): Promise<Awaited<ReturnType<typeof markSessionStoppedUnlocked>>> {
+  const sessionId = readSessionId(args.payload);
+  return await withSessionStateLock(args.cwd, sessionId, async () =>
+    await markSessionStoppedUnlocked(args)
+  );
+}
+
+export async function recordSessionActivity(
+  args: Parameters<typeof recordSessionActivityUnlocked>[0]
+): Promise<Awaited<ReturnType<typeof recordSessionActivityUnlocked>>> {
+  const sessionId = readSessionId(args.payload);
+  return await withSessionStateLock(args.cwd, sessionId, async () =>
+    await recordSessionActivityUnlocked(args)
+  );
+}
+
+export async function recordSessionAutosave(
+  args: Parameters<typeof recordSessionAutosaveUnlocked>[0]
+): Promise<Awaited<ReturnType<typeof recordSessionAutosaveUnlocked>>> {
+  const sessionId = readSessionId(args.payload);
+  return await withSessionStateLock(args.cwd, sessionId, async () =>
+    await recordSessionAutosaveUnlocked(args)
+  );
+}
+
+export async function recordSessionArtifact(
+  args: Parameters<typeof recordSessionArtifactUnlocked>[0]
+): Promise<Awaited<ReturnType<typeof recordSessionArtifactUnlocked>>> {
+  const sessionId = readSessionId(args.payload);
+  return await withSessionStateLock(args.cwd, sessionId, async () =>
+    await recordSessionArtifactUnlocked(args)
+  );
+}
+
+export async function recordSessionWisdomPersistence(
+  args: Parameters<typeof recordSessionWisdomPersistenceUnlocked>[0]
+): Promise<Awaited<ReturnType<typeof recordSessionWisdomPersistenceUnlocked>>> {
+  const sessionId = readSessionId(args.payload);
+  return await withSessionStateLock(args.cwd, sessionId, async () =>
+    await recordSessionWisdomPersistenceUnlocked(args)
+  );
 }

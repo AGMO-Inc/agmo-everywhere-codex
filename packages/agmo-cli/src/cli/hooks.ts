@@ -17,7 +17,7 @@ export async function syncHooks(
 ): Promise<Record<string, unknown>> {
   const paths = resolveInstallPaths(scope, cwd);
   const existingContent = await readTextFileIfExists(paths.hooksFile);
-  const hookCommand = buildHookCommand(agmoCliDistEntryPath());
+  const hookCommand = buildHookCommand(agmoCliDistEntryPath(), scope);
   const merged = mergeManagedHooksConfig(existingContent, hookCommand);
   const write = await writeTextFile(paths.hooksFile, merged);
 

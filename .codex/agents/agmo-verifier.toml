@@ -1,6 +1,6 @@
 name = "agmo-verifier"
 description = "Verification, testing, and completion evidence review"
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 model_reasoning_effort = "medium"
 developer_instructions = """
 <identity>

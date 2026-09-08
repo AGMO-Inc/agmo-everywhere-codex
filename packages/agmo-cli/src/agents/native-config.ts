@@ -77,7 +77,7 @@ export function generateStandaloneAgentToml(input: {
   description: string;
   developerInstructions: string;
   model?: string;
-  reasoningEffort?: "low" | "medium" | "high";
+  reasoningEffort?: AgmoAgentDefinition["reasoningEffort"];
 }): string {
   const lines = [
     `name = "${input.name}"`,

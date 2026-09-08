@@ -37,10 +37,23 @@ const CONTINUATION_PATTERNS: RegExp[] = [
   /\bkeep going\b/i
 ];
 
+const REVIEW_AND_IMPLEMENT_PATTERNS: RegExp[] = [
+  /\breview\b.*\b(?:and|then)\s+(?:please\s+)?(?:fix|implement|apply|change)\b/i,
+  /(?:검토|리뷰)\s*(?:하고|한 뒤|후|해서).*?(?:수정해\s*줘|수정해주세요|수정해라|고쳐\s*줘|고쳐주세요|적용해\s*줘|적용해주세요|구현해\s*줘|구현해주세요)/u
+];
+
 const EXPLICIT_ROUTE_OVERRIDES: Array<{
   pattern: RegExp;
   route: BaseWorkflowRoute;
 }> = [
+  {
+    pattern: /^\$code-review\b/i,
+    route: {
+      skill: "code-review",
+      label: "verify",
+      reason: "explicit $code-review invocation"
+    }
+  },
   {
     pattern: /^\$git-workflow\b/i,
     route: {
@@ -259,6 +272,22 @@ const ROUTES: Array<{
   },
   {
     route: {
+      skill: "code-review",
+      label: "verify",
+      reason: "read-only code inspection request"
+    },
+    patterns: [
+      { pattern: /\$?code-review\b/i, score: 10 },
+      { pattern: /\bcode review\b/i, score: 9 },
+      { pattern: /^(?!.*\bplan\b).*\breview\b.*\b(?:code|implementation|changes?|diff|fix(?:es)?)\b/i, score: 9 },
+      { pattern: /^(?!.*\bplan\b).*\b(?:code|implementation|changes?|diff|fix(?:es)?)\b.*\breview\b/i, score: 9 },
+      { pattern: /^(?!.*(?:계획|플랜)).*(?:코드|구현|변경|수정할 부분).*(?:검토|리뷰)/u, score: 8 },
+      { pattern: /^(?!.*(?:계획|플랜)).*(?:검토|리뷰).*(?:코드|구현|변경|잠재적으로? 수정)/u, score: 8 },
+      { pattern: /^(?!.*(?:계획|플랜)).*(?:수정해야 할|개선할|문제|사항).*(?:검토|리뷰)/u, score: 8 }
+    ]
+  },
+  {
+    route: {
       skill: "verify",
       label: "verify",
       reason: "verification/test/review-oriented request"
@@ -268,7 +297,7 @@ const ROUTES: Array<{
       { pattern: /\bverify\b/i, score: 5 },
       { pattern: /\btest\b/i, score: 4 },
       { pattern: /\breview\b/i, score: 4 },
-      { pattern: /검증|테스트|확인|리뷰/u, score: 4 }
+      { pattern: /검증|테스트|확인|리뷰|검토/u, score: 4 }
     ]
   },
   {
@@ -412,6 +441,17 @@ export function detectWorkflowRoute(
       source: "explicit",
       confidence: "high"
     });
+  }
+
+  if (REVIEW_AND_IMPLEMENT_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    const executeRoute = ROUTES.find((candidate) => candidate.route.skill === "execute")?.route;
+    if (executeRoute) {
+      return withRouteMetadata(executeRoute, {
+        source: "pattern",
+        confidence: "high",
+        score: 10
+      });
+    }
   }
 
   if (
@@ -558,6 +598,11 @@ function buildWorkflowEnforcementContext(args: {
         return [
           "Agmo runtime enforcement: plan-review must not self-approve the leader's own plan.",
           "Hand the critique/approval pass to agmo-critic (optionally with agmo-planner for revisions or agmo-verifier for acceptance criteria evidence) and keep the result as a planning-lane verdict: approve, revise, or reject."
+        ];
+      case "code-review":
+        return [
+          "Agmo runtime enforcement: code-review is a read-only inspection lane.",
+          "Delegate the primary findings pass to agmo-critic, use agmo-verifier for concrete proof where needed, and report findings without editing source code unless the user separately requests implementation."
         ];
       case "execute":
       case "ralph":

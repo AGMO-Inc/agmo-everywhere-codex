@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  acquireSessionStateLock,
   isSessionState,
   isWorkflowStateRef,
   markSessionStopped,
@@ -81,6 +83,99 @@ function readJson(path: string): Record<string, unknown> {
 
 async function readState(root: string, sessionId: string): Promise<SessionState | null> {
   return await readPersistedSessionState({ cwd: root, payload: { session_id: sessionId } });
+}
+
+type ChildMutation =
+  | { kind: "activity"; id: string }
+  | { kind: "artifact"; id: string }
+  | { kind: "wisdom"; id: string };
+
+async function runConcurrentMutations(args: {
+  root: string;
+  sessionId: string;
+  mutations: ChildMutation[];
+}): Promise<void> {
+  const gatePath = join(args.root, "start-gate");
+  const moduleUrl = new URL("./runtime-state.js", import.meta.url).href;
+  const readyPaths = args.mutations.map((_, index) => join(args.root, `ready-${index}`));
+  const children = args.mutations.map((mutation, index) => {
+    const script = `
+      import { access, writeFile } from "node:fs/promises";
+      import {
+        recordSessionActivity,
+        recordSessionArtifact,
+        recordSessionWisdomPersistence
+      } from ${JSON.stringify(moduleUrl)};
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      await writeFile(${JSON.stringify(readyPaths[index])}, "ready\\n", "utf8");
+      while (true) {
+        try { await access(${JSON.stringify(gatePath)}); break; } catch { await sleep(5); }
+      }
+      const cwd = ${JSON.stringify(args.root)};
+      const payload = { session_id: ${JSON.stringify(args.sessionId)} };
+      const mutation = ${JSON.stringify(mutation)};
+      if (mutation.kind === "activity") {
+        await recordSessionActivity({
+          cwd,
+          payload,
+          lastEvent: "PostToolUse",
+          toolName: mutation.id,
+          toolSummary: mutation.id,
+          toolStatus: "succeeded"
+        });
+      } else if (mutation.kind === "artifact") {
+        await recordSessionArtifact({
+          cwd,
+          payload,
+          artifactAt: "2026-01-01T00:00:00.000Z",
+          workflow: mutation.id,
+          noteRef: {
+            workflow: mutation.id,
+            type: "artifact",
+            title: mutation.id,
+            relative_path: "notes/" + mutation.id + ".md",
+            wikilink: "[[" + mutation.id + "]]",
+            saved_at: "2026-01-01T00:00:00.000Z"
+          }
+        });
+      } else {
+        await recordSessionWisdomPersistence({
+          cwd,
+          payload,
+          savedAt: "2026-01-01T00:00:00.000Z",
+          signature: mutation.id
+        });
+      }
+    `;
+    return spawn(process.execPath, ["--input-type=module", "--eval", script], {
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+  });
+  const completions = children.map(
+    (child) =>
+      new Promise<string | null>((resolve) => {
+        let stderr = "";
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", (chunk: string) => {
+          stderr += chunk;
+        });
+        child.on("error", (error) => resolve(error.message));
+        child.on("exit", (code, signal) =>
+          resolve(code === 0 ? null : `code=${code} signal=${signal ?? "none"} ${stderr}`)
+        );
+      })
+  );
+
+  const readyDeadline = Date.now() + 5_000;
+  while (!readyPaths.every((path) => existsSync(path)) && Date.now() < readyDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(readyPaths.every((path) => existsSync(path)), true, "child mutation readiness");
+  await writeFile(gatePath, "go\n", "utf8");
+  const failures = await Promise.all(completions);
+  await unlink(gatePath);
+  await Promise.all(readyPaths.map(async (path) => await unlink(path)));
+  assert.deepEqual(failures.filter(Boolean), []);
 }
 
 test("runtime-state type guards distinguish full session states from compact workflow refs", () => {
@@ -399,6 +494,188 @@ test("subsequent writes merge from full canonical state and preserve full-only f
   assert.equal(state?.autosave_notes?.plan?.workflow, "plan");
   assert.equal(state?.artifact_notes?.verify?.workflow, "verify");
   assert.equal(state?.verification_history?.[0]?.tool_summary, "previous");
+});
+
+test("concurrent processes retain all eight PostToolUse verification records", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-concurrent-activity-"));
+  const sessionId = "shared-activity";
+  const ids = Array.from({ length: 8 }, (_, index) => `activity-${index}`);
+
+  await runConcurrentMutations({
+    root,
+    sessionId,
+    mutations: ids.map((id) => ({ kind: "activity", id }))
+  });
+
+  const state = await readState(root, sessionId);
+  assert.deepEqual(
+    new Set(state?.verification_history?.map((entry) => entry.tool_summary)),
+    new Set(ids)
+  );
+});
+
+test("concurrent activity, artifact, and wisdom mutations preserve every field class", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-concurrent-mixed-"));
+  const sessionId = "shared-mixed";
+
+  await runConcurrentMutations({
+    root,
+    sessionId,
+    mutations: [
+      { kind: "activity", id: "mixed-activity" },
+      { kind: "artifact", id: "mixed-artifact" },
+      { kind: "wisdom", id: "mixed-wisdom" }
+    ]
+  });
+
+  const state = await readState(root, sessionId);
+  assert.equal(state?.verification_history?.[0]?.tool_summary, "mixed-activity");
+  assert.equal(state?.artifact_notes?.["mixed-artifact"]?.title, "mixed-artifact");
+  assert.equal(state?.last_wisdom_entry_signature, "mixed-wisdom");
+});
+
+test("verification history remains capped at ten records", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-history-cap-"));
+  const sessionId = "history-cap";
+  for (let index = 0; index < 12; index += 1) {
+    await recordSessionActivity({
+      cwd: root,
+      payload: { session_id: sessionId },
+      lastEvent: "PostToolUse",
+      toolName: `tool-${index}`,
+      toolSummary: `summary-${index}`,
+      toolStatus: "succeeded"
+    });
+  }
+
+  const state = await readState(root, sessionId);
+  assert.equal(state?.verification_history?.length, 10);
+  assert.equal(state?.verification_history?.[0]?.tool_summary, "summary-2");
+  assert.equal(state?.verification_history?.[9]?.tool_summary, "summary-11");
+});
+
+test("a held session lock cannot be stolen and reports owner diagnostics", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-live-lock-"));
+  const holder = await acquireSessionStateLock(root, "locked-session", {
+    ownerId: "active-owner"
+  });
+
+  await assert.rejects(
+    acquireSessionStateLock(root, "locked-session", {
+      timeoutMs: 40,
+      retryMs: 5,
+      ownerId: "contender"
+    }),
+    (error: Error) =>
+      error.message.includes(holder.lockPath) &&
+      error.message.includes("owner=active-owner") &&
+      error.message.includes("not reclaimed automatically")
+  );
+
+  await holder.release();
+  const successor = await acquireSessionStateLock(root, "locked-session", {
+    timeoutMs: 40,
+    ownerId: "successor"
+  });
+  await successor.release();
+});
+
+test("malformed session lock metadata fails closed within a bounded timeout", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-malformed-lock-"));
+  const holder = await acquireSessionStateLock(root, "malformed-session", {
+    ownerId: "original-owner"
+  });
+  await writeFile(join(holder.lockPath, "owner.json"), "not-json\n", "utf8");
+
+  await assert.rejects(
+    acquireSessionStateLock(root, "malformed-session", {
+      timeoutMs: 40,
+      retryMs: 5,
+      ownerId: "contender"
+    }),
+    (error: Error) =>
+      error.message.includes("unreadable_metadata=") &&
+      error.message.includes("not reclaimed automatically")
+  );
+
+  await rm(holder.lockPath, { recursive: true });
+});
+
+test("failed session mutation releases its lock for a later writer", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-failed-lock-"));
+  const { workflowsStateDir } = resolveInstallPaths("project", root);
+  await mkdir(join(root, ".agmo", "state"), { recursive: true });
+  await writeFile(workflowsStateDir, "not a directory", "utf8");
+
+  await assert.rejects(
+    writeWorkflowActivation({
+      cwd: root,
+      payload: { session_id: "retry-after-failure" },
+      workflow: "execute",
+      reason: "expected failure"
+    })
+  );
+  await rm(workflowsStateDir);
+
+  await writeWorkflowActivation({
+    cwd: root,
+    payload: { session_id: "retry-after-failure" },
+    workflow: "verify",
+    reason: "retry"
+  });
+  assert.equal((await readState(root, "retry-after-failure"))?.workflow, "verify");
+});
+
+test("different session locks can be held independently", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-independent-locks-"));
+  const [first, second] = await Promise.all([
+    acquireSessionStateLock(root, "session-one", { timeoutMs: 40 }),
+    acquireSessionStateLock(root, "session-two", { timeoutMs: 40 })
+  ]);
+
+  assert.notEqual(first.lockPath, second.lockPath);
+  await Promise.all([first.release(), second.release()]);
+});
+
+test("lock-free readers always observe parseable session and workflow JSON during replacement", async () => {
+  const root = await mkdtemp(join(os.tmpdir(), "agmo-runtime-state-atomic-read-"));
+  const sessionId = "atomic-read";
+  const { sessionsStateDir, workflowsStateDir } = resolveInstallPaths("project", root);
+  const paths = [
+    join(sessionsStateDir, `${sessionId}.json`),
+    join(workflowsStateDir, `${sessionId}.json`)
+  ];
+  let writing = true;
+  let parsedFiles = 0;
+  const reader = (async () => {
+    while (writing) {
+      for (const path of paths) {
+        if (existsSync(path)) {
+          JSON.parse(readFileSync(path, "utf8"));
+          parsedFiles += 1;
+        }
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  })();
+
+  for (let index = 0; index < 40; index += 1) {
+    await recordSessionActivity({
+      cwd: root,
+      payload: { session_id: sessionId },
+      lastEvent: "PostToolUse",
+      toolName: `tool-${index}`,
+      toolSummary: `${index}-${"x".repeat(20_000)}`,
+      toolStatus: "succeeded"
+    });
+  }
+  writing = false;
+  await reader;
+
+  assert.ok(parsedFiles > 0);
+  for (const path of paths) {
+    assert.doesNotThrow(() => JSON.parse(readFileSync(path, "utf8")));
+  }
 });
 
 test("compact workflow indexes omit full-only fields and remain less than half the canonical session bytes", async () => {
